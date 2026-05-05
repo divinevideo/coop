@@ -2131,7 +2131,7 @@ export type GQLManualReviewJob = {
 
 export type GQLManualReviewJobComment = {
   readonly __typename?: 'ManualReviewJobComment';
-  readonly author: GQLUser;
+  readonly author?: Maybe<GQLUser>;
   readonly commentText: Scalars['String']['output'];
   readonly createdAt: Scalars['DateTime']['output'];
   readonly id: Scalars['ID']['output'];
@@ -9860,7 +9860,7 @@ export type GQLManualReviewJobCommentResolvers<
   ParentType extends GQLResolversParentTypes['ManualReviewJobComment'] =
     GQLResolversParentTypes['ManualReviewJobComment'],
 > = {
-  author?: Resolver<GQLResolversTypes['User'], ParentType, ContextType>;
+  author?: Resolver<Maybe<GQLResolversTypes['User']>, ParentType, ContextType>;
   commentText?: Resolver<GQLResolversTypes['String'], ParentType, ContextType>;
   createdAt?: Resolver<GQLResolversTypes['DateTime'], ParentType, ContextType>;
   id?: Resolver<GQLResolversTypes['ID'], ParentType, ContextType>;

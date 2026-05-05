@@ -1484,7 +1484,7 @@ export async function getBullWorker<JobData = unknown>(
     },
     {
       connection: redisConnection,
-      lockDuration: 600000,
+      lockDuration: 5000,
       prefix: getPrefix(orgId),
       autorun: false,
       // A job is put into stalled when a user claims it and then doesn't action

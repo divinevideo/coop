@@ -828,7 +828,7 @@ const typeDefs = /* GraphQL */ `
 
   type ManualReviewJobComment {
     id: ID!
-    author: User!
+    author: User
     commentText: String!
     createdAt: DateTime!
   }
@@ -1703,10 +1703,14 @@ const ManualReviewJobComment: GQLManualReviewJobCommentResolvers = {
       throw new Error('No user found on context');
     }
 
-    return context.dataSources.userAPI.getGraphQLUserFromId({
-      id: comment.authorId,
-      orgId: user.orgId,
-    });
+    try {
+      return await context.dataSources.userAPI.getGraphQLUserFromId({
+        id: comment.authorId,
+        orgId: user.orgId,
+      });
+    } catch {
+      return null;
+    }
   },
 };
 
