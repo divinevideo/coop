@@ -2,6 +2,7 @@ import { createClient, type ClickHouseClient } from '@clickhouse/client';
 
 import type SafeTracer from '../../../utils/SafeTracer.js';
 import { jsonStringify, tryJsonParse } from '../../../utils/encoding.js';
+import { logErrorJson } from '../../../utils/logging.js';
 import type { IAnalyticsAdapter } from '../IAnalyticsAdapter.js';
 import {
   type AnalyticsEventInput,
@@ -9,6 +10,7 @@ import {
   type AnalyticsWriteOptions,
 } from '../types.js';
 import { formatClickhouseQuery } from '../../warehouse/utils/clickhouseSql.js';
+import { withClickhouseInsertRetries } from './clickhouseRetry.js';
 
 export interface ClickhouseAnalyticsConnection {
   host: string;
@@ -94,6 +96,10 @@ export class ClickhouseAnalyticsAdapter implements IAnalyticsAdapter {
   private readonly tracer?: SafeTracer;
   private readonly client: ClickHouseClient;
   private readonly defaultBatchSize: number;
+  private readonly insertWithRetries: (params: {
+    table: string;
+    values: AnalyticsEventInput[];
+  }) => Promise<void>;
 
   constructor(options: ClickhouseAnalyticsAdapterOptions) {
     this.tracer = options.tracer;
@@ -112,6 +118,12 @@ export class ClickhouseAnalyticsAdapter implements IAnalyticsAdapter {
       ...(password ? { password } : {}),
       database: options.connection.database,
     });
+
+    this.insertWithRetries = withClickhouseInsertRetries(
+      async ({ table, values }: { table: string; values: AnalyticsEventInput[] }) => {
+        await this.client.insert({ table, values, format: 'JSONEachRow' });
+      },
+    );
   }
 
   async writeEvents(
@@ -130,11 +142,16 @@ export class ClickhouseAnalyticsAdapter implements IAnalyticsAdapter {
         this.normalizeRecord(row, table),
       );
 
-      await this.client.insert({
-        table,
-        values: normalizedBatch,
-        format: 'JSONEachRow',
-      });
+      try {
+        await this.insertWithRetries({ table, values: normalizedBatch });
+      } catch (err) {
+        // Drop on persistent outage so it doesn't crash the request.
+        // eslint-disable-next-line no-restricted-syntax
+        logErrorJson({
+          message: `clickhouse.analytics.insert_failed table=${table} batchSize=${normalizedBatch.length}`,
+          error: err,
+        });
+      }
     }
   }
 

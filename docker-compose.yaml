@@ -72,6 +72,10 @@ services:
 
   scylla:
     image: scylladb/scylla:5.2
+    # Cap Scylla's footprint so it doesn't grab nearly all available RAM
+    # on small hosts (it allocates ~all "available" memory at startup by
+    # default, which starves the rest of the stack on a VPS env).
+    command: --smp 1 --memory 4G --overprovisioned 1 --developer-mode 1
     volumes:
       - scylla_data:/var/lib/scylla
     ports:
