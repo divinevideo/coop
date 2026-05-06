@@ -2066,7 +2066,7 @@ export type GQLManualReviewJob = {
 
 export type GQLManualReviewJobComment = {
   readonly __typename: 'ManualReviewJobComment';
-  readonly author: GQLUser;
+  readonly author?: Maybe<GQLUser>;
   readonly commentText: Scalars['String']['output'];
   readonly createdAt: Scalars['DateTime']['output'];
   readonly id: Scalars['ID']['output'];
@@ -16130,12 +16130,12 @@ export type GQLManualReviewJobCommentFieldsFragment = {
   readonly id: string;
   readonly createdAt: Date | string;
   readonly commentText: string;
-  readonly author: {
+  readonly author?: {
     readonly __typename: 'User';
     readonly id: string;
     readonly firstName: string;
     readonly lastName: string;
-  };
+  } | null;
 };
 
 export type GQLGetCommentsForJobQueryVariables = Exact<{
@@ -16149,12 +16149,12 @@ export type GQLGetCommentsForJobQuery = {
     readonly id: string;
     readonly createdAt: Date | string;
     readonly commentText: string;
-    readonly author: {
+    readonly author?: {
       readonly __typename: 'User';
       readonly id: string;
       readonly firstName: string;
       readonly lastName: string;
-    };
+    } | null;
   }>;
 };
 
@@ -16172,12 +16172,12 @@ export type GQLAddJobCommentMutation = {
           readonly id: string;
           readonly createdAt: Date | string;
           readonly commentText: string;
-          readonly author: {
+          readonly author?: {
             readonly __typename: 'User';
             readonly id: string;
             readonly firstName: string;
             readonly lastName: string;
-          };
+          } | null;
         };
       }
     | { readonly __typename: 'NotFoundError'; readonly title: string };
