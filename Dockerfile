@@ -49,8 +49,10 @@ CMD ["node", "bin/run-worker-or-job.js"]
 # The K8s db-migrate Job provides the command at runtime.
 FROM node:24.14.1-bullseye-slim AS build_migrator
 WORKDIR /app
-COPY ["package.json", "./"]
-COPY ["db/package.json", "db/package-lock.json", "db/"]
+RUN groupadd -r migrator && useradd -r -g migrator -u 1001 migrator
+COPY --chown=migrator:migrator ["package.json", "./"]
+COPY --chown=migrator:migrator ["db/package.json", "db/package-lock.json", "db/"]
 RUN cd db && npm ci
-COPY ["db/src", "db/src/"]
-COPY ["db/tsconfig.json", "db/"]
+COPY --chown=migrator:migrator ["db/src", "db/src/"]
+COPY --chown=migrator:migrator ["db/tsconfig.json", "db/"]
+USER 1001
