@@ -52,7 +52,7 @@ WORKDIR /app
 RUN groupadd -r migrator && useradd -r -g migrator -u 1001 migrator
 COPY --chown=migrator:migrator ["package.json", "./"]
 COPY --chown=migrator:migrator ["db/package.json", "db/package-lock.json", "db/"]
-RUN cd db && npm ci
+RUN cd db && npm ci && chown -R migrator:migrator /app/db/node_modules
 COPY --chown=migrator:migrator ["db/src", "db/src/"]
 COPY --chown=migrator:migrator ["db/tsconfig.json", "db/"]
 USER 1001

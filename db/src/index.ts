@@ -3,18 +3,13 @@ import type { DatabaseConfig } from '@roostorg/db-migrator';
 import { makeCli } from '@roostorg/db-migrator';
 
 import apiServerPostgresConfig from './configs/api-server-pg.js';
+import clickhouseConfig from './configs/clickhouse.js';
 
-// Only load Scylla/ClickHouse configs when their env vars are present.
-// The K8s db-migrate Job only targets api-server-pg and doesn't set
-// SCYLLA_HOSTS or CLICKHOUSE_* vars.
+// Scylla config crashes at module load without SCYLLA_HOSTS, so gate it.
 const configs: Record<string, DatabaseConfig<any, any, any>> = {
   'api-server-pg': apiServerPostgresConfig,
+  clickhouse: clickhouseConfig,
 };
-
-if (process.env.CLICKHOUSE_HOST || process.env.CLICKHOUSE_DATABASE) {
-  const { default: clickhouseConfig } = await import('./configs/clickhouse.js');
-  configs.clickhouse = clickhouseConfig;
-}
 
 if (process.env.SCYLLA_HOSTS) {
   const { default: scyllaConfig } = await import('./configs/scylla.js');
