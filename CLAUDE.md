@@ -47,7 +47,7 @@ docker compose run migrations
 
 ## Release Tagging
 
-Use `divine-v<semver>` tags (e.g., `divine-v0.1.0`). The `divine-` prefix avoids collisions with upstream roostorg tags when syncing. Do NOT use plain `v*` tags — those belong to upstream's namespace.
+Use `divine-v<semver>` tags for stable releases only (e.g., `divine-v0.1.0`). The `divine-` prefix avoids collisions with upstream roostorg tags when syncing. Do NOT use plain `v*` tags — those belong to upstream's namespace. Do NOT use pre-release tags (`divine-v0.1.0-rc1`) — use branch builds (`divine/*`) for pre-release testing instead.
 
 Pushing a `divine-v*` tag triggers CI, which produces Docker image tags `<version>` and `<major>.<minor>` (e.g., `0.1.0` and `0.1`). Pin these in iac-coreconfig kustomization overlays.
 
