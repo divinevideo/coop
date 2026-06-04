@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Configure COOP CUSTOM_ACTION webhooks to point at staging relay-manager
-# Usage: source .env.demo && ./scripts/coop-configure-webhooks.sh
+# Configure COOP CUSTOM_ACTION webhooks to point at the enforcement adapter.
+# The adapter runs locally (http://localhost:3456) and translates COOP's webhook
+# format to relay-manager NIP-86 RPC — see the comment by the ADAPTER_URL below.
+# Usage: source .env.demo && ./divine/coop-configure-webhooks.sh
 set -euo pipefail
 
 : "${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env.demo}"
 : "${CF_ACCESS_CLIENT_ID:?Set CF_ACCESS_CLIENT_ID in .env.demo}"
 : "${CF_ACCESS_CLIENT_SECRET:?Set CF_ACCESS_CLIENT_SECRET in .env.demo}"
-: "${RELAY_MANAGER_STAGING_URL:?Set RELAY_MANAGER_STAGING_URL in .env.demo}"
 : "${COOP_API_URL:?Set COOP_API_URL in .env.demo}"
 
 # We need a session cookie from COOP for GraphQL

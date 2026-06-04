@@ -11,7 +11,7 @@
 #   export COOP_API_URL=https://coop.staging.dvines.org
 #   export COOP_LOGIN_EMAIL=matt@divine.video
 #   export COOP_LOGIN_PASSWORD=...        # the org admin password
-#   ./scripts/coop-setup-org.sh
+#   ./divine/coop-setup-org.sh
 #
 # Requires: curl, python3. The login user must be an org ADMIN (admin GraphQL
 # mutations need a user session — the org API key is NOT sufficient).
@@ -47,7 +47,13 @@ if echo "$TYPES" | grep -q '"name": "nostr_event"' || echo "$TYPES" | grep -q '"
   echo "    exists, skipping"
 else
   CT_VARS='{"input":{"name":"nostr_event","description":"Divine Nostr event flagged by Osprey for moderator review","fields":[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false}],"fieldRoles":{"displayName":"text"}}}'
-  gql 'mutation C($input: CreateContentItemTypeInput!){ createContentItemType(input:$input){ __typename } }' "$CT_VARS" | grep -q Success && echo "    created" || echo "    (create returned non-success; check manually)"
+  RESP=$(gql 'mutation C($input: CreateContentItemTypeInput!){ createContentItemType(input:$input){ __typename } }' "$CT_VARS")
+  # Decide from the typed response: success typename present AND no error typename / GraphQL errors.
+  if echo "$RESP" | grep -q '"__typename":"MutateContentTypeSuccessResponse"' && ! echo "$RESP" | grep -q '"errors"'; then
+    echo "    created"
+  else
+    echo "    ERROR: content type create failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -85,12 +91,28 @@ done
 #    conditionSet per queue and is left as a documented follow-up; it also
 #    requires the ItemProcessingWorker to be running (Scylla — see migration doc).
 # ---------------------------------------------------------------------------
-echo "==> Ensuring default routing rule (nostr_event -> General Review)"
-TID=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }' | python3 -c "import json,sys;ts=json.load(sys.stdin)['data']['myOrg']['itemTypes'];print(next((t['id'] for t in ts if t.get('name')=='nostr_event'),''))" 2>/dev/null || true)
-GQID=$(gql 'query { myOrg { mrtQueues { id name } } }' | python3 -c "import json,sys;qs=json.load(sys.stdin)['data']['myOrg']['mrtQueues'];print(next((q['id'] for q in qs if q['name']=='General Review'),''))" 2>/dev/null || true)
-if [ -n "$TID" ] && [ -n "$GQID" ]; then
-  RV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":"nostr_event -> General Review","conditionSet":{"conditions":[],"conjunction":"AND"},"destinationQueueId":sys.argv[1],"itemTypeIds":[sys.argv[2]],"status":"LIVE"}}))' "$GQID" "$TID")
-  gql 'mutation R($input: CreateRoutingRuleInput!){ createRoutingRule(input:$input){ __typename } }' "$RV" | grep -q Success && echo "    created/ok" || echo "    (already exists or failed; check)"
+RULE_NAME="nostr_event -> General Review"
+echo "==> Ensuring default routing rule ($RULE_NAME)"
+# Idempotency: skip if the rule already exists (same pattern as steps 1 and 2).
+EXISTING_R=$(gql 'query { myOrg { routingRules { id name } } }')
+if echo "$EXISTING_R" | grep -qF "\"$RULE_NAME\""; then
+  echo "    exists, skipping"
+else
+  TID=$(echo "$TYPES" | python3 -c "import json,sys;ts=json.load(sys.stdin)['data']['myOrg']['itemTypes'];print(next((t['id'] for t in ts if t.get('name')=='nostr_event'),''))" 2>/dev/null || true)
+  [ -z "$TID" ] && TID=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }' | python3 -c "import json,sys;ts=json.load(sys.stdin)['data']['myOrg']['itemTypes'];print(next((t['id'] for t in ts if t.get('name')=='nostr_event'),''))" 2>/dev/null || true)
+  GQID=$(gql 'query { myOrg { mrtQueues { id name } } }' | python3 -c "import json,sys;qs=json.load(sys.stdin)['data']['myOrg']['mrtQueues'];print(next((q['id'] for q in qs if q['name']=='General Review'),''))" 2>/dev/null || true)
+  if [ -z "$TID" ] || [ -z "$GQID" ]; then
+    echo "    ERROR: could not resolve nostr_event type ($TID) or General Review queue ($GQID)"; exit 1
+  fi
+  RV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"conditionSet":{"conditions":[],"conjunction":"AND"},"destinationQueueId":sys.argv[2],"itemTypeIds":[sys.argv[3]],"status":"LIVE"}}))' "$RULE_NAME" "$GQID" "$TID")
+  RESP=$(gql 'mutation R($input: CreateRoutingRuleInput!){ createRoutingRule(input:$input){ __typename } }' "$RV")
+  if echo "$RESP" | grep -q '"__typename":"MutateRoutingRuleSuccessResponse"'; then
+    echo "    created"
+  elif echo "$RESP" | grep -q 'RoutingRuleNameExistsError'; then
+    echo "    exists, skipping"
+  else
+    echo "    ERROR: routing rule create failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+  fi
 fi
 
 echo "==> Done. Queues visible in COOP Review Console. NOTE: items only surface"

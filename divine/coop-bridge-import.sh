@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pull Kind 1984 reports from staging relay-manager and submit to local COOP
-# Usage: source .env.demo && ./scripts/coop-bridge-import.sh
+# Usage: source .env.demo && ./divine/coop-bridge-import.sh
 set -euo pipefail
 
 : "${CF_ACCESS_CLIENT_ID:?Set CF_ACCESS_CLIENT_ID in .env.demo}"
@@ -19,7 +19,10 @@ trap 'rm -f "$REPORTS_FILE" "$RELAY_EVENT_FILE"' EXIT
 # Extracts media URL and thumbnail from imeta tags.
 fetch_event_media() {
   local event_id="$1"
-  if [ -z "$event_id" ] || [ "$event_id" = "unknown" ]; then
+  # event_id comes from a kind-1984 report's e-tag and is attacker-controlled.
+  # Reject anything that is not a 64-char lowercase-hex Nostr id, so report data
+  # can never reach a shell or be re-parsed as a command.
+  if [[ ! "$event_id" =~ ^[0-9a-f]{64}$ ]]; then
     echo ""
     return
   fi
@@ -30,8 +33,9 @@ fetch_event_media() {
     return
   fi
 
+  # Pipe directly into websocat — no nested `bash -c`, so $req is never parsed as shell.
   local req='["REQ","media",{"ids":["'"$event_id"'"],"limit":1}]'
-  timeout 5 bash -c "echo '$req' | websocat -n1 '$RELAY_URL' 2>/dev/null" > "$RELAY_EVENT_FILE" || true
+  echo "$req" | timeout 5 websocat -n1 "$RELAY_URL" 2>/dev/null > "$RELAY_EVENT_FILE" || true
 
   # Extract media URL from imeta tag: look for "url <value>" field
   local media_url=""
@@ -86,8 +90,7 @@ if [ "$TOTAL" -eq 0 ]; then
 fi
 
 SUBMITTED=0
-SKIPPED=0
-ERRORS=0
+REJECTED=0
 
 for i in $(seq 0 $((TOTAL - 1))); do
   EVENT=$(jq -c ".events[$i]" "$REPORTS_FILE")
@@ -120,15 +123,15 @@ for i in $(seq 0 $((TOTAL - 1))); do
     --arg mediaThumb "$MEDIA_THUMB" \
     '{
       contentId: $contentId,
-      contentType: "User Report",
+      contentType: "nostr_event",
       userId: $reporterPubkey,
       content: ({
-        report_event_id: $reportEventId,
-        reporter_pubkey: $reporterPubkey,
+        event_id: $reportEventId,
+        pubkey: $reporterPubkey,
         reported_pubkey: $reportedPubkey,
         reported_event_id: $reportedEvent,
-        reason_category: $reasonCategory,
-        reason_text: $reasonText
+        report_reason: $reasonCategory,
+        text: $reasonText
       } + (if $mediaUrl != "" then { media_url: $mediaUrl } else {} end)
         + (if $mediaThumb != "" then { media_thumbnail: $mediaThumb } else {} end)),
       sync: true
@@ -146,15 +149,19 @@ for i in $(seq 0 $((TOTAL - 1))); do
   if [ "$RESP_CODE" = "200" ] || [ "$RESP_CODE" = "202" ]; then
     SUBMITTED=$((SUBMITTED + 1))
     echo "  [$((i+1))/$TOTAL] Submitted report $EVENT_ID (${REPORT_TYPE:-unknown}) → COOP"
-  elif [ "$RESP_CODE" = "400" ]; then
-    SKIPPED=$((SKIPPED + 1))
-    echo "  [$((i+1))/$TOTAL] Skipped $EVENT_ID (400: likely duplicate or schema mismatch)"
   else
-    ERRORS=$((ERRORS + 1))
-    echo "  [$((i+1))/$TOTAL] ERROR $EVENT_ID: HTTP $RESP_CODE"
-    echo "    $RESP_BODY" | head -3
+    # COOP returns 400 for schema/validation rejections (unknown content type,
+    # field mismatch, invalid data) — these are real failures, NOT benign skips.
+    # Surface the response body so the operator sees the actual reason.
+    REJECTED=$((REJECTED + 1))
+    echo "  [$((i+1))/$TOTAL] REJECTED $EVENT_ID: HTTP $RESP_CODE"
+    echo "    $(echo "$RESP_BODY" | tr '\n' ' ' | head -c 300)"
   fi
 done
 
 echo ""
-echo "==> Done: $SUBMITTED submitted, $SKIPPED skipped, $ERRORS errors (of $TOTAL total)"
+if [ "$REJECTED" -gt 0 ]; then
+  echo "==> FAILED: $SUBMITTED submitted, $REJECTED REJECTED (of $TOTAL). See rejections above."
+  exit 1
+fi
+echo "==> Done: $SUBMITTED submitted, 0 rejected (of $TOTAL total)"
