@@ -27,7 +27,8 @@ export COOP_LOGIN_PASSWORD=...
 ```
 
 `coop-bridge-import.sh` / `coop-configure-webhooks.sh` read additional vars (relay URL,
-CF Access creds, COOP API key) — see each script header.
+CF Access creds, COOP API key, and the adapter URL reachable from COOP) — see
+each script header.
 
 ## Design notes
 

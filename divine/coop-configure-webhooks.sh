@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Configure COOP CUSTOM_ACTION webhooks to point at the enforcement adapter.
-# The adapter runs locally (http://localhost:3456) and translates COOP's webhook
-# format to relay-manager NIP-86 RPC — see the comment by the ADAPTER_URL below.
+# The adapter translates COOP's webhook format to relay-manager NIP-86 RPC.
+# ADAPTER_URL_BASE must be reachable from the COOP server/worker that executes
+# the webhook. For a local COOP instance, http://localhost:3456 is fine.
 # Usage: source .env.demo && ./divine/coop-configure-webhooks.sh
 set -euo pipefail
 
@@ -9,10 +10,12 @@ set -euo pipefail
 : "${CF_ACCESS_CLIENT_ID:?Set CF_ACCESS_CLIENT_ID in .env.demo}"
 : "${CF_ACCESS_CLIENT_SECRET:?Set CF_ACCESS_CLIENT_SECRET in .env.demo}"
 : "${COOP_API_URL:?Set COOP_API_URL in .env.demo}"
+: "${COOP_EMAIL:?Set COOP_EMAIL in .env.demo}"
+: "${COOP_PASSWORD:?Set COOP_PASSWORD in .env.demo}"
+: "${ADAPTER_URL_BASE:?Set ADAPTER_URL_BASE to the adapter URL reachable from COOP (e.g. http://localhost:3456 for local COOP)}"
 
 # We need a session cookie from COOP for GraphQL
-COOP_EMAIL="${COOP_EMAIL:-matt@divine.video}"
-COOP_PASSWORD="${COOP_PASSWORD:-test1234}"
+ADAPTER_URL_BASE="${ADAPTER_URL_BASE%/}"
 COOKIE_JAR=$(mktemp)
 trap 'rm -f "$COOKIE_JAR"' EXIT
 
@@ -68,21 +71,24 @@ echo "==> Updating action webhook URLs..."
 # But relay-manager expects: { method, params }
 # So we can't call /api/relay-rpc directly from COOP's webhook format.
 #
-# Instead, we'll point COOP at a thin adapter endpoint.
-# For the demo, we'll write a local adapter that receives COOP's webhook
-# and translates to relay-manager RPC format.
+# Instead, point COOP at a thin adapter endpoint that receives COOP's webhook
+# and translates it to relay-manager RPC format.
 
 # Filter to only CustomActions (those with callbackUrl)
 ACTIONS=$(echo "$ACTIONS_RESP" | jq -c '[.data.myOrg.actions[] | select(.callbackUrl)]' 2>/dev/null)
 ACTION_COUNT=$(echo "$ACTIONS" | jq 'length')
+
+if [ "$ACTION_COUNT" -eq 0 ]; then
+  echo "  No CUSTOM_ACTION webhooks found."
+  exit 0
+fi
 
 for i in $(seq 0 $((ACTION_COUNT - 1))); do
   action=$(echo "$ACTIONS" | jq -c ".[$i]")
   ACTION_ID=$(echo "$action" | jq -r '.id')
   ACTION_NAME=$(echo "$action" | jq -r '.name')
 
-  # For now, point all webhooks at the local adapter (port 3456)
-  ADAPTER_URL="http://localhost:3456/webhook/${ACTION_NAME// /-}"
+  ADAPTER_URL="${ADAPTER_URL_BASE}/webhook/${ACTION_NAME// /-}"
 
   echo "  Updating '$ACTION_NAME' → $ADAPTER_URL"
   UPDATE_RESP=$(curl -s -b "$COOKIE_JAR" \
@@ -103,9 +109,16 @@ for i in $(seq 0 $((ACTION_COUNT - 1))); do
         }
       }')")
 
-  echo "$UPDATE_RESP" | jq '.data.updateAction.data // .errors[0].message // "unknown error"' 2>/dev/null || echo "  WARNING: $UPDATE_RESP"
+  UPDATED_URL=$(echo "$UPDATE_RESP" | jq -r '.data.updateAction.data.callbackUrl // empty' 2>/dev/null || true)
+  if [ "$UPDATED_URL" = "$ADAPTER_URL" ]; then
+    echo "$UPDATE_RESP" | jq '.data.updateAction.data'
+  else
+    echo "ERROR: failed to update '$ACTION_NAME'"
+    echo "$UPDATE_RESP" | jq . 2>/dev/null || echo "$UPDATE_RESP"
+    exit 1
+  fi
 done
 
 echo ""
-echo "==> Done. Actions now point at local adapter on port 3456."
-echo "    Run the adapter: source .env.demo && node scripts/coop-webhook-adapter.mjs"
+echo "==> Done. Actions now point at ${ADAPTER_URL_BASE}."
+echo "    Run the adapter from support-trust-safety: source .env.demo && node scripts/coop-webhook-adapter.mjs"

@@ -38,8 +38,8 @@ curl -sS -m 15 -c "$CJ" "$GQL" -H "Content-Type: application/json" \
 # ---------------------------------------------------------------------------
 # 1) Content type: nostr_event — fields match osprey COOPSink's POST /api/v1/content
 #    payload exactly (coop_sink.py). pubkeys are STRING (not USER_ID) because
-#    COOPSink sends bare hex; the createdAt role is omitted (it requires a
-#    DATETIME field per the valid_field_role_field_type DB constraint).
+#    COOPSink sends bare hex; createdAt is omitted as a field role because the
+#    bridge sends unix seconds in created_at, not COOP's DATETIME role value.
 # ---------------------------------------------------------------------------
 echo "==> Ensuring content type 'nostr_event'"
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
@@ -82,7 +82,12 @@ for row in "${QUEUES[@]}"; do
   QV=$(python3 -c 'import json,sys; print(json.dumps({"input":{"name":sys.argv[1],"description":sys.argv[2],"autoCloseJobs":False,"isAppealsQueue":sys.argv[3]=="true","hiddenActionIds":[],"userIds":[]}}))' "$NAME" "$DESC" "$APPEALS")
   RESP=$(gql 'mutation Q($input: CreateManualReviewQueueInput!){ createManualReviewQueue(input:$input){ __typename ... on MutateManualReviewQueueSuccessResponse { data { ... on ManualReviewQueue { id } } } } }' "$QV")
   NEWID=$(echo "$RESP" | python3 -c "import json,sys;q=json.load(sys.stdin)['data']['createManualReviewQueue'];print((q.get('data') or {}).get('id',''))" 2>/dev/null || true)
-  echo "    '$NAME' -> ${NEWID:-FAILED ($(echo "$RESP" | head -c 120))}"
+  if [ -n "$NEWID" ]; then
+    echo "    '$NAME' -> $NEWID"
+  else
+    echo "    ERROR: queue create failed for '$NAME': $(echo "$RESP" | tr '\n' ' ' | head -c 300)"
+    exit 1
+  fi
 done
 
 # ---------------------------------------------------------------------------
