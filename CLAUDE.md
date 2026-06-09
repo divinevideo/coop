@@ -20,10 +20,10 @@ Moderator decision → COOP webhook → adapter → relay-manager RPC
 
 ## Divine Integration Points
 
-- **Item Type:** "User Report" with fields for report metadata + media (VIDEO/IMAGE)
+- **Item Type:** `nostr_event` with fields for report metadata + media (VIDEO/IMAGE)
 - **Actions:** CUSTOM_ACTION webhooks to adapter service
 - **Adapter:** `support-trust-safety/scripts/coop-webhook-adapter.mjs` translates webhooks to relay-manager RPC
-- **Bridge import:** `support-trust-safety/scripts/coop-bridge-import.sh` pulls Kind 1984 reports from staging relay
+- **Bridge import:** `divine/coop-bridge-import.sh` pulls Kind 1984 reports from staging relay
 
 ## Deployment
 
