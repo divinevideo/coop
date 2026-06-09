@@ -27,7 +27,8 @@ Moderator decision → COOP webhook → adapter → relay-manager RPC
 
 ## Deployment
 
-Images build via GitHub Actions to `ghcr.io/divinevideo/coop-server`, `coop-worker`, `coop-client`.
+GitHub Actions builds only Divine's nginx-unprivileged client image at `ghcr.io/divinevideo/coop-client`.
+The server and worker images come from Roost's official GHCR images, and migrations run via the official server image.
 K8s manifests live in `divine-iac-coreconfig/k8s/applications/coop/`.
 
 ## Staging Dependencies
@@ -49,7 +50,7 @@ docker compose run migrations
 
 Use `divine-v<semver>` tags for stable releases only (e.g., `divine-v0.1.0`). The `divine-` prefix avoids collisions with upstream roostorg tags when syncing. Do NOT use plain `v*` tags — those belong to upstream's namespace. Do NOT use pre-release tags (`divine-v0.1.0-rc1`) — use branch builds (`divine/*`) for pre-release testing instead.
 
-Pushing a `divine-v*` tag triggers CI, which produces Docker image tags `<version>` and `<major>.<minor>` (e.g., `0.1.0` and `0.1`). Pin these in iac-coreconfig kustomization overlays.
+Pushing a `divine-v*` tag triggers CI for the Divine client image, producing Docker image tags `<version>` and `<major>.<minor>` (e.g., `0.1.0` and `0.1`). Pin these in iac-coreconfig kustomization overlays.
 
 ## Upstream Sync
 
