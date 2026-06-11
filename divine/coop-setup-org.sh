@@ -70,12 +70,19 @@ fi
 #    docs/moderation/coop-osprey-reportwatcher-migration.md.
 # ---------------------------------------------------------------------------
 # name|appeals|description
+# CSAM, Child Safety, and Age Review are deliberately DISTINCT queues (not a
+# combined tier): each gets its own handling. CSAM is sticky/one-way + NCMEC-bound;
+# Child Safety is the broader child-safety triage; Age Review is the underage-user
+# path that feeds the relay-manager age-review case system. Moderators can move a
+# job between queues (transformJobAndRecreateInQueue) when a report needs recategorizing.
 QUEUES=(
-  "CSAM / Child Safety|false|Immediate-tier: sexual_minors, csam, NS-csam, NS-childSafety, NS-underageUser. Route to NCMEC."
-  "Sexual Content|false|NS-sexualContent, adult_nudity, explicit_sex, pornography, nudity, nonconsensual_sexual_content. Age-restrict candidates."
-  "Violence & Extremism|false|NS-violence, graphic_violence_gore, terrorism_extremism, credible_threats, NS-extremism."
-  "Harassment, Threats & Safety|false|NS-harassment, hate_harassment, bullying_abuse, self_harm_suicide, doxxing_pii, credible_threats."
-  "General Review|false|spam, impersonation, copyright, misinformation, AI generated, illegal_goods, malware_scam, NS-other."
+  "CSAM|false|report_reason 'csam'. Sticky/one-way; route to NCMEC. Keep undiluted by ambiguous reports."
+  "Child Safety|false|report_reason 'child_safety' (divine-mobile childSafety). Child-safety concerns distinct from CSAM; a moderator escalates to CSAM/NCMEC if warranted."
+  "Age Review|false|report_reason 'underage_user' (divine-mobile underageUser). Underage-user reports; feeds the relay-manager age-review case system (15-day clock, age tiers, suspension). See docs/moderation/under-16-system-coordination.md."
+  "Sexual Content|false|report_reason 'nudity' (web sexual-content, mobile sexualContent + aliases). Age-restrict candidates."
+  "Violence & Extremism|false|report_reason 'violence'."
+  "Harassment, Threats & Safety|false|report_reason 'harassment'."
+  "General Review|false|Default catch-all: spam, impersonation, copyright, false-info/other, ai_generated, illegal, malware."
   "Appeals|true|User appeals of moderation decisions."
 )
 echo "==> Ensuring review queues"
@@ -175,18 +182,21 @@ fi
 #
 #    The match values are the EXACT canonical report_reason tokens Osprey emits.
 #    The bridge's _normalize_report_reason (divine/nostr-kafka-bridge/main.py) maps
-#    every raw report tag / MOD l-tag to one of: csam, nudity, violence, harassment,
-#    spam, ai_generated, other (plus pass-through NIP-56 types illegal, malware,
-#    impersonation). So the value is always a single token, not free text — match
-#    the token, not fuzzy substrings. Everything not routed below (spam, other,
-#    ai_generated, illegal, malware, impersonation) intentionally falls through to
-#    General Review for human triage. NB 'illegal' is deliberately NOT routed to
-#    CSAM: mobile sends it for CSAM, violence, AND copyright, so it is ambiguous and
-#    must be triaged by a human rather than auto-classified into the CSAM/NCMEC queue.
+#    every raw report tag / MOD l-tag to one of: csam, child_safety, underage_user,
+#    nudity, violence, harassment, spam, ai_generated, other (plus pass-through
+#    NIP-56 types illegal, malware, impersonation). So the value is always a single
+#    token, not free text — match the token, not fuzzy substrings. Everything not
+#    routed below (spam, other, ai_generated, illegal, malware, impersonation)
+#    intentionally falls through to General Review for human triage. NB 'illegal' is
+#    deliberately NOT routed to CSAM: mobile sends it for CSAM, violence, AND
+#    copyright, so it is ambiguous and must be triaged by a human rather than
+#    auto-classified into the CSAM/NCMEC queue.
 # ---------------------------------------------------------------------------
 # queue|comma-separated report_reason tokens (canonical, from _normalize_report_reason)
 CATROUTES=(
-  "CSAM / Child Safety|csam"
+  "CSAM|csam"
+  "Child Safety|child_safety"
+  "Age Review|underage_user"
   "Sexual Content|nudity"
   "Violence & Extremism|violence"
   "Harassment, Threats & Safety|harassment"
@@ -229,7 +239,9 @@ import json,sys
 rules = json.load(sys.stdin)["data"]["myOrg"]["routingRules"]
 by = {r["name"]: r["id"] for r in rules}
 priority = [
-  "report_reason -> CSAM / Child Safety",
+  "report_reason -> CSAM",
+  "report_reason -> Child Safety",
+  "report_reason -> Age Review",
   "report_reason -> Sexual Content",
   "report_reason -> Violence & Extremism",
   "report_reason -> Harassment, Threats & Safety",
