@@ -15,6 +15,28 @@ REPORTS_FILE=$(mktemp)
 RELAY_EVENT_FILE=$(mktemp)
 trap 'rm -f "$REPORTS_FILE" "$RELAY_EVENT_FILE"' EXIT
 
+# Normalize a raw report reason to the canonical token COOP routing rules match.
+# Mirrors the bridge's _REASON_ALIASES (osprey/divine/nostr-kafka-bridge/main.py),
+# which is the source of truth -- keep in sync. Without this, imported reports carry
+# raw tokens (e.g. 'NS-nudity', 'childSafety', 'child-safety') and fall to General
+# Review instead of their category queue.
+normalize_reason() {
+  local r
+  r=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$r" in
+    sexual_minors|ns-csam) echo "csam" ;;
+    child-safety|childsafety|ns-childsafety) echo "child_safety" ;;
+    underage-user|underageuser|ns-underageuser) echo "underage_user" ;;
+    sexual-content|sexualcontent|sexual|explicit|pornography|ns-nudity|ns-sexual-content|ns) echo "nudity" ;;
+    profanity|ns-harassment) echo "harassment" ;;
+    ns-spam) echo "spam" ;;
+    ns-violence|vi) echo "violence" ;;
+    ai-generated|aigenerated|ai) echo "ai_generated" ;;
+    false-information|false-info|falseinformation|ns-other) echo "other" ;;
+    *) echo "$r" ;;
+  esac
+}
+
 # Fetch a Nostr event by ID from the relay via WebSocket.
 # Extracts media URL and thumbnail from imeta tags.
 fetch_event_media() {
@@ -104,6 +126,7 @@ for i in $(seq 0 $((TOTAL - 1))); do
   REPORTED_PUBKEY=$(echo "$EVENT" | jq -r '[.tags[] | select(.[0]=="p")] | .[0][1] // ""')
   REPORTED_EVENT=$(echo "$EVENT" | jq -r '[.tags[] | select(.[0]=="e")] | .[0][1] // ""')
   REPORT_TYPE=$(echo "$EVENT" | jq -r '[.tags[] | select(.[0]=="l")] | .[0][1] // ""')
+  NORM_REASON=$(normalize_reason "${REPORT_TYPE:-other}")
 
   # Fetch media URL from the reported event (if it has imeta tags)
   MEDIA_INFO=$(fetch_event_media "${REPORTED_EVENT:-}")
@@ -117,7 +140,7 @@ for i in $(seq 0 $((TOTAL - 1))); do
     --arg reporterPubkey "$PUBKEY" \
     --arg reportedPubkey "${REPORTED_PUBKEY:-unknown}" \
     --arg reportedEvent "${REPORTED_EVENT:-unknown}" \
-    --arg reasonCategory "${REPORT_TYPE:-other}" \
+    --arg reasonCategory "$NORM_REASON" \
     --arg reasonText "$CONTENT" \
     --arg mediaUrl "$MEDIA_URL" \
     --arg mediaThumb "$MEDIA_THUMB" \
@@ -148,7 +171,7 @@ for i in $(seq 0 $((TOTAL - 1))); do
 
   if [ "$RESP_CODE" = "200" ] || [ "$RESP_CODE" = "202" ]; then
     SUBMITTED=$((SUBMITTED + 1))
-    echo "  [$((i+1))/$TOTAL] Submitted report $EVENT_ID (${REPORT_TYPE:-unknown}) → COOP"
+    echo "  [$((i+1))/$TOTAL] Submitted report $EVENT_ID (${REPORT_TYPE:-unknown} -> $NORM_REASON) → COOP"
   else
     # COOP returns 400 for schema/validation rejections (unknown content type,
     # field mismatch, invalid data) — these are real failures, NOT benign skips.
