@@ -13,9 +13,8 @@ does not travel between environments on its own. These scripts are that missing 
 
 | Script | Purpose |
 |--------|---------|
-| `coop-setup-org.sh` | Idempotently bootstrap an org's moderation config: the `nostr_event` content type (matching osprey's COOPSink payload, incl. media fields), review queues mirroring relay-manager's category tiers, and routing. Needs an **admin user session** (login email/password), not just the org API key. |
+| `coop-setup-org.sh` | Idempotently bootstrap an org's moderation config: the `nostr_event` content type (matching osprey's COOPSink payload, incl. media fields), review queues mirroring relay-manager's category tiers, routing, and (when `WEBHOOK_SECRET` is set) the enforcement CUSTOM_ACTION webhooks pointing at the deployed adapter. Needs an **admin user session** (login email/password), not just the org API key. |
 | `coop-bridge-import.sh` | Pull live kind-1984 reports from relay-manager and submit them to COOP for review (demo bridge). |
-| `coop-configure-webhooks.sh` | Point COOP CUSTOM_ACTION webhooks at the relay-manager enforcement adapter. |
 
 ## Usage
 
@@ -26,9 +25,9 @@ export COOP_LOGIN_PASSWORD=...
 ./divine/coop-setup-org.sh
 ```
 
-`coop-bridge-import.sh` / `coop-configure-webhooks.sh` read additional vars (relay URL,
-CF Access creds, COOP API key, and the adapter URL reachable from COOP) — see
-each script header.
+`coop-bridge-import.sh` reads additional vars (relay URL, CF Access creds, COOP API
+key) — see the script header. The enforcement webhooks are provisioned by
+`coop-setup-org.sh` step 6 (gated on `WEBHOOK_SECRET`), not a separate script.
 
 ## Design notes
 
