@@ -265,7 +265,9 @@ fi
 #    MUST equal the adapter's WEBHOOK_SECRET env (GCP secret
 #    coop-adapter-webhook-secret-ENVIRONMENT). The action NAME is the adapter
 #    route: callbackUrl path /webhook/<name> must match adapter.mjs's switch.
-#    Skipped entirely if WEBHOOK_SECRET is unset.
+#    Idempotent + reconciling: existing actions are UPDATED with the current
+#    callbackUrl + secret on every run, so rotating WEBHOOK_SECRET (or moving
+#    COOP_ADAPTER_URL) is just a re-run. Skipped entirely if WEBHOOK_SECRET is unset.
 # ---------------------------------------------------------------------------
 if [ -z "${WEBHOOK_SECRET:-}" ]; then
   echo "==> WEBHOOK_SECRET unset — skipping enforcement actions (step 6)."
@@ -274,8 +276,20 @@ else
   ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
   EXISTING_A=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }')
   for AN in "${ACTIONS_LIST[@]}"; do
-    if echo "$EXISTING_A" | grep -qF "\"$AN\""; then
-      echo "    '$AN' exists, skipping"
+    AID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); a=(((d.get("data") or {}).get("myOrg") or {}).get("actions") or []); print(next((x["id"] for x in a if x.get("name")==sys.argv[2] and x.get("id")), ""))' "$EXISTING_A" "$AN")
+    if [ -n "$AID" ]; then
+      # Update in place so a rotated WEBHOOK_SECRET (or a changed COOP_ADAPTER_URL)
+      # actually propagates on re-run. Skipping would keep the OLD secret, and COOP
+      # returns 202 to the moderator even when the adapter 401s the stale secret --
+      # so enforcement would fail invisibly. Only the callback fields are sent;
+      # name/description/itemTypeIds are left unchanged.
+      UV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"id":sys.argv[1],"callbackUrl":sys.argv[2],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[3]}}}))' "$AID" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET")
+      RESP=$(gql 'mutation U($input: UpdateActionInput!){ updateAction(input:$input){ __typename } }' "$UV")
+      if echo "$RESP" | grep -q '"__typename":"MutateActionSuccessResponse"'; then
+        echo "    '$AN' updated (callbackUrl + webhook secret refreshed)"
+      else
+        echo "    ERROR: action update failed for '$AN': $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+      fi
       continue
     fi
     AV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Divine enforcement via coop-webhook-adapter","itemTypeIds":[sys.argv[2]],"callbackUrl":sys.argv[3],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[4]}}}))' "$AN" "$TID" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET")
@@ -283,7 +297,7 @@ else
     if echo "$RESP" | grep -q '"__typename":"MutateActionSuccessResponse"'; then
       echo "    '$AN' created"
     elif echo "$RESP" | grep -q 'ActionNameExistsError'; then
-      echo "    '$AN' exists, skipping"
+      echo "    '$AN' exists (created concurrently); re-run to refresh its secret"
     else
       echo "    ERROR: action create failed for '$AN': $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
     fi
