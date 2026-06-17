@@ -149,48 +149,85 @@ qid() { echo "$QUEUES_JSON" | python3 -c "import json,sys;qs=json.load(sys.stdin
 # ---------------------------------------------------------------------------
 CONTENT_RULE_NAME="nostr_event -> review queue"
 echo "==> Ensuring content rule ($CONTENT_RULE_NAME)"
-# Idempotency by TARGET, not name: skip if ANY content rule already targets
-# nostr_event. Matching on our name alone would create a second always-match rule
-# (double-enqueue) when a content rule exists under a different name.
-EXISTING_CR=$(gql 'query { myOrg { rules { id name status ... on ContentRule { itemTypes { __typename ... on ItemTypeBase { name } } } } } }')
-HAS_CR=$(echo "$EXISTING_CR" | python3 -c "import json,sys;rs=json.load(sys.stdin)['data']['myOrg']['rules'];print('yes' if any(any(t.get('name')=='nostr_event' for t in (r.get('itemTypes') or [])) for r in rs) else 'no')" 2>/dev/null || echo no)
-if [ "$HAS_CR" = "yes" ]; then
-  echo "    a content rule already targets nostr_event, skipping"
+# Idempotency by GUARANTEE, not mere existence. A content rule only satisfies #159
+# if it TARGETS nostr_event, is status LIVE, AND fires the built-in EnqueueToMrtAction.
+# A stale, disabled, or differently-actioned rule must NOT let us skip -- that would
+# leave submitted items never becoming MRT jobs, the exact failure this step prevents.
+# So: skip only if a satisfying rule exists; if our own rule exists but is not
+# LIVE+enqueue, reconcile it in place; otherwise create.
+EXISTING_CR=$(gql 'query { myOrg { rules { id name status ... on ContentRule { itemTypes { __typename ... on ItemTypeBase { name } } actions { __typename } } } } }')
+CR_DECISION=$(echo "$EXISTING_CR" | python3 -c "
+import json,sys
+rs = json.load(sys.stdin)['data']['myOrg']['rules']
+def targets(r): return any(t.get('name')=='nostr_event' for t in (r.get('itemTypes') or []))
+def enqueues(r): return any(a.get('__typename')=='EnqueueToMrtAction' for a in (r.get('actions') or []))
+satisfying = any(targets(r) and r.get('status')=='LIVE' and enqueues(r) for r in rs)
+ours = next((r['id'] for r in rs if r.get('name')==sys.argv[1]), '')
+print('satisfied|' if satisfying else ('reconcile|'+ours if ours else 'create|'))
+" "$CONTENT_RULE_NAME" 2>/dev/null || echo 'create|')
+CR_MODE="${CR_DECISION%%|*}"; OURS_ID="${CR_DECISION#*|}"
+if [ "$CR_MODE" = "satisfied" ]; then
+  echo "    a LIVE content rule already enqueues nostr_event to the MRT, skipping"
 else
+  # Both create and reconcile need the built-in enqueue action id.
   ENQUEUE_ID=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }' \
     | python3 -c "import json,sys;a=json.load(sys.stdin)['data']['myOrg']['actions'];print(next((x['id'] for x in a if x.get('__typename')=='EnqueueToMrtAction'),''))" 2>/dev/null || true)
   if [ -z "$ENQUEUE_ID" ]; then
     echo "    ERROR: no built-in ENQUEUE_TO_MRT action found — run create-org-and-user.js first."; exit 1
   fi
-  CRV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Surface every Osprey-flagged nostr_event for moderator review","status":"LIVE","contentTypeIds":[sys.argv[2]],"conditionSet":{"conditions":[],"conjunction":"AND"},"actionIds":[sys.argv[3]],"policyIds":[],"tags":[]}}))' "$CONTENT_RULE_NAME" "$TID" "$ENQUEUE_ID")
-  RESP=$(gql 'mutation CR($input: CreateContentRuleInput!){ createContentRule(input:$input){ __typename } }' "$CRV")
-  if echo "$RESP" | grep -q '"__typename":"MutateContentRuleSuccessResponse"'; then
-    echo "    created"
+  if [ "$CR_MODE" = "reconcile" ]; then
+    # Our rule exists but is stale/disabled/differently-actioned. Restore the
+    # guarantee in place rather than skipping past it or duplicating it.
+    UV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"id":sys.argv[1],"status":"LIVE","contentTypeIds":[sys.argv[2]],"actionIds":[sys.argv[3]],"conditionSet":{"conditions":[],"conjunction":"AND"}}}))' "$OURS_ID" "$TID" "$ENQUEUE_ID")
+    RESP=$(gql 'mutation UCR($input: UpdateContentRuleInput!){ updateContentRule(input:$input){ __typename } }' "$UV")
+    if echo "$RESP" | grep -q '"__typename":"MutateContentRuleSuccessResponse"'; then
+      echo "    reconciled existing '$CONTENT_RULE_NAME' to LIVE + EnqueueToMrtAction"
+    else
+      echo "    ERROR: content rule reconcile failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+    fi
   else
-    echo "    ERROR: content rule create failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+    CRV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Surface every Osprey-flagged nostr_event for moderator review","status":"LIVE","contentTypeIds":[sys.argv[2]],"conditionSet":{"conditions":[],"conjunction":"AND"},"actionIds":[sys.argv[3]],"policyIds":[],"tags":[]}}))' "$CONTENT_RULE_NAME" "$TID" "$ENQUEUE_ID")
+    RESP=$(gql 'mutation CR($input: CreateContentRuleInput!){ createContentRule(input:$input){ __typename } }' "$CRV")
+    if echo "$RESP" | grep -q '"__typename":"MutateContentRuleSuccessResponse"'; then
+      echo "    created"
+    elif echo "$RESP" | grep -q 'RuleNameExistsError'; then
+      echo "    exists (created concurrently); re-run to reconcile it to LIVE+enqueue"
+    else
+      echo "    ERROR: content rule create failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+    fi
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# 5) Category routing rules: report_reason == <canonical value> -> category queue.
+# 5) Category routing rules: report_reason matches <canonical token> -> category queue.
 #    First-match-wins by sequence, so CSAM is ordered FIRST (sticky, one-way, must
-#    reach NCMEC — docs/moderation/moderation-category-handling-principles.md),
-#    then Sexual, Violence, Harassment, with the General Review default last.
-#    Condition is the proven TEXT_MATCHING_CONTAINS_TEXT form (case-insensitive,
-#    boolean passthrough — NO comparator/threshold; signal id is a JSON string per
-#    JsonOf<SignalId>).
+#    reach NCMEC — docs/moderation/moderation-category-handling-principles.md), then
+#    Child Safety, Age Review, Sexual, Violence, Harassment, with General Review
+#    ordered LAST in step 5b.
 #
-#    The match values are the EXACT canonical report_reason tokens Osprey emits.
-#    The bridge's _normalize_report_reason (divine/nostr-kafka-bridge/main.py) maps
-#    every raw report tag / MOD l-tag to one of: csam, child_safety, underage_user,
-#    nudity, violence, harassment, spam, ai_generated, other (plus pass-through
-#    NIP-56 types illegal, malware, impersonation). So the value is always a single
-#    token, not free text — match the token, not fuzzy substrings. Everything not
-#    routed below (spam, other, ai_generated, illegal, malware, impersonation)
-#    intentionally falls through to General Review for human triage. NB 'illegal' is
-#    deliberately NOT routed to CSAM: mobile sends it for CSAM, violence, AND
-#    copyright, so it is ambiguous and must be triaged by a human rather than
-#    auto-classified into the CSAM/NCMEC queue.
+#    EXACT MATCH: report_reason holds a single canonical token, so each rule must
+#    match that token EXACTLY. COOP exposes no equality signal (only CONTAINS_TEXT,
+#    CONTAINS_REGEX, CONTAINS_VARIANT and their NOT forms), and plain CONTAINS_TEXT is
+#    a substring test — 'not_csam' would match the CSAM route into the sticky, one-way,
+#    NCMEC-bound queue. So we use TEXT_MATCHING_CONTAINS_REGEX with an anchored pattern
+#    ^<token>$ (the signal compiles it case-insensitively). Tokens are [a-z_] only
+#    (enforced by the guard below), so no regex escaping is needed.
+#
+#    Tokens are the canonical report_reason values from the bridge's CANONICAL_REASONS
+#    (osprey divine/nostr-kafka-bridge/main.py), the single source of truth. Ownership
+#    there decides what actually FEEDS each queue:
+#      - csam, child_safety, nudity, violence, harassment are 'osprey-rule': Osprey
+#        emits an actionable verdict, COOPSink posts it, so these routes fire on the
+#        live path.
+#      - underage_user is 'relay-manager': the bridge normalizes the token but Osprey
+#        emits NO verdict for it (age review is owned by relay-manager ReportWatcher +
+#        Zendesk, 15-day clock). So the Age Review queue is fed by the DIRECT bridge
+#        import (coop-bridge-import.sh) and by moderators recategorizing, NOT by the
+#        live Osprey path. The route is kept so those imported items land correctly.
+#    Everything not routed below (spam, impersonation, ai_generated, illegal, other)
+#    falls through to General Review for human triage. NB 'illegal' is deliberately NOT
+#    routed to CSAM: mobile overloads it for CSAM, violence, AND copyright, so it is
+#    ambiguous and must be human-triaged, not auto-classified into the CSAM/NCMEC queue.
 # ---------------------------------------------------------------------------
 # queue|comma-separated report_reason tokens (canonical, from _normalize_report_reason)
 CATROUTES=(
@@ -201,6 +238,24 @@ CATROUTES=(
   "Violence & Extremism|violence"
   "Harassment, Threats & Safety|harassment"
 )
+# Guard: every routed token MUST be in the canonical vocabulary -- a subset of osprey's
+# CANONICAL_REASONS (divine/nostr-kafka-bridge/main.py). Vendored here because coop and
+# osprey share no runtime; this fails loud on drift (a typo, or a token Osprey can't
+# emit) instead of silently provisioning a queue nothing can route to. Tokens are also
+# constrained to [a-z_] so the anchored regex above needs no escaping.
+CANONICAL_REASONS=" csam illegal child_safety harassment nudity violence ai_generated underage_user spam impersonation other "
+for row in "${CATROUTES[@]}"; do
+  IFS=',' read -ra _toks <<< "${row#*|}"
+  for tok in "${_toks[@]}"; do
+    if [[ ! "$tok" =~ ^[a-z_]+$ ]]; then
+      echo "ERROR: route token '$tok' is not [a-z_] (regex-unsafe / malformed)"; exit 1
+    fi
+    case "$CANONICAL_REASONS" in
+      *" $tok "*) ;;
+      *) echo "ERROR: route token '$tok' is not in the canonical report_reason vocabulary (drift vs osprey CANONICAL_REASONS)"; exit 1 ;;
+    esac
+  done
+done
 echo "==> Ensuring category routing rules"
 EXISTING_R=$(gql 'query { myOrg { routingRules { id name } } }')
 for row in "${CATROUTES[@]}"; do
@@ -216,9 +271,13 @@ for row in "${CATROUTES[@]}"; do
   fi
   RV=$(python3 -c '
 import json,sys
-tid,qid,name,kw = sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4].split(",")
+tid,qid,name = sys.argv[1],sys.argv[2],sys.argv[3]
+# Anchored regex per token = exact match (COOP has no equality signal). The signal
+# compiles each string case-insensitively, so ^<token>$ matches the token exactly and
+# rejects substrings like not_csam. Tokens are [a-z_] (guarded), so no escaping needed.
+kw = ["^" + t + "$" for t in sys.argv[4].split(",")]
 cond = {"input":{"type":"CONTENT_FIELD","name":"report_reason","contentTypeId":tid},
-        "signal":{"id":json.dumps({"type":"TEXT_MATCHING_CONTAINS_TEXT"}),"type":"TEXT_MATCHING_CONTAINS_TEXT"},
+        "signal":{"id":json.dumps({"type":"TEXT_MATCHING_CONTAINS_REGEX"}),"type":"TEXT_MATCHING_CONTAINS_REGEX"},
         "matchingValues":{"strings":kw}}
 print(json.dumps({"input":{"name":name,"conditionSet":{"conditions":[cond],"conjunction":"AND"},
                            "destinationQueueId":qid,"itemTypeIds":[tid],"status":"LIVE"}}))' "$TID" "$QID" "$CR_NAME" "$KEYWORDS")
@@ -238,6 +297,8 @@ ORDER=$(echo "$RR" | python3 -c '
 import json,sys
 rules = json.load(sys.stdin)["data"]["myOrg"]["routingRules"]
 by = {r["name"]: r["id"] for r in rules}
+GENERAL = "nostr_event -> General Review"
+# Category routes in priority order, WITHOUT the catch-all.
 priority = [
   "report_reason -> CSAM",
   "report_reason -> Child Safety",
@@ -245,10 +306,15 @@ priority = [
   "report_reason -> Sexual Content",
   "report_reason -> Violence & Extremism",
   "report_reason -> Harassment, Threats & Safety",
-  "nostr_event -> General Review",
 ]
+gen = by.get(GENERAL)
 ordered = [by[n] for n in priority if n in by]
-ordered += [r["id"] for r in rules if r["id"] not in ordered]   # any others, tail
+# Then any other rules (manually added / renamed) -- but never after the catch-all.
+ordered += [r["id"] for r in rules if r["id"] not in ordered and r["id"] != gen]
+# General Review LAST: it is a match-all (empty conditionSet) and routing is
+# first-match-wins, so anything ordered after it can never fire.
+if gen:
+    ordered.append(gen)
 print(json.dumps({"input":{"order":ordered}}))')
 RESP=$(gql 'mutation RO($input: ReorderRoutingRulesInput!){ reorderRoutingRules(input:$input){ __typename } }' "$ORDER")
 if echo "$RESP" | grep -q '"__typename":"MutateRoutingRulesOrderSuccessResponse"'; then

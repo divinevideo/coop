@@ -16,10 +16,10 @@ RELAY_EVENT_FILE=$(mktemp)
 trap 'rm -f "$REPORTS_FILE" "$RELAY_EVENT_FILE"' EXIT
 
 # Normalize a raw report reason to the canonical token COOP routing rules match.
-# Mirrors the bridge's _REASON_ALIASES (osprey/divine/nostr-kafka-bridge/main.py),
-# which is the source of truth -- keep in sync. Without this, imported reports carry
-# raw tokens (e.g. 'NS-nudity', 'childSafety', 'child-safety') and fall to General
-# Review instead of their category queue.
+# Mirrors the bridge's _REASON_ALIASES / CANONICAL_REASONS (osprey
+# divine/nostr-kafka-bridge/main.py), the single source of truth -- keep in sync.
+# Without this, imported reports carry raw tokens (e.g. 'NS-nudity', 'childSafety',
+# 'child-safety') and fall to General Review instead of their category queue.
 normalize_reason() {
   local r
   r=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
@@ -133,9 +133,15 @@ for i in $(seq 0 $((TOTAL - 1))); do
   MEDIA_URL="${MEDIA_INFO%%|*}"
   MEDIA_THUMB="${MEDIA_INFO##*|}"
 
+  # userId is the job SUBJECT: the reported (offending) user, NOT the reporter. This
+  # mirrors the Osprey COOPSink (coop_sink.py sets userId = ReportedPubkey, falling
+  # back to the event author only when there is no reported pubkey). Keying it on the
+  # reporter would aim user-level enforcement and the MRT subject at the wrong account.
+  # content.pubkey deliberately stays the report AUTHOR to match coop_sink.py
+  # (content.pubkey = processed-event Pubkey = reporter); the offender travels in
+  # reported_pubkey, which is the field the webhook adapter actually enforces on.
   COOP_BODY=$(jq -n \
     --arg contentId "$EVENT_ID" \
-    --arg userId "$PUBKEY" \
     --arg reportEventId "$EVENT_ID" \
     --arg reporterPubkey "$PUBKEY" \
     --arg reportedPubkey "${REPORTED_PUBKEY:-unknown}" \
@@ -147,7 +153,7 @@ for i in $(seq 0 $((TOTAL - 1))); do
     '{
       contentId: $contentId,
       contentType: "nostr_event",
-      userId: $reporterPubkey,
+      userId: (if $reportedPubkey != "" and $reportedPubkey != "unknown" then $reportedPubkey else $reporterPubkey end),
       content: ({
         event_id: $reportEventId,
         pubkey: $reporterPubkey,
