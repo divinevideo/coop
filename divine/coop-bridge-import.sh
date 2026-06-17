@@ -141,7 +141,8 @@ for i in $(seq 0 $((TOTAL - 1))); do
       ( $t[] | select(.[0]=="report") | .[1] ),
       ( $t[] | select(.[0]=="l" and (.[2]=="social.nos.ontology")) | (.[1] | sub("^NS-";"")) ),
       ( $t[] | select(.[0]=="l" and (.[2]=="MOD")) | .[1] ),
-      ( $t[] | select((.[0]=="e") or (.[0]=="p")) | .[2] ),
+      ( $t[] | select(.[0]=="e") | .[2] ),
+      ( $t[] | select(.[0]=="p") | .[2] ),
       ( (.content | fromjson?) | (if type=="object" then .type else empty end) )
     ])
   ')
@@ -196,7 +197,7 @@ for i in $(seq 0 $((TOTAL - 1))); do
 
   if [ "$RESP_CODE" = "200" ] || [ "$RESP_CODE" = "202" ]; then
     SUBMITTED=$((SUBMITTED + 1))
-    echo "  [$((i+1))/$TOTAL] Submitted report $EVENT_ID (${REPORT_TYPE:-unknown} -> $NORM_REASON) → COOP"
+    echo "  [$((i+1))/$TOTAL] Submitted report $EVENT_ID (${RAW_REASON:-none} -> $NORM_REASON) → COOP"
   else
     # COOP returns 400 for schema/validation rejections (unknown content type,
     # field mismatch, invalid data) — these are real failures, NOT benign skips.
