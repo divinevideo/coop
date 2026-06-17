@@ -164,7 +164,7 @@ def enqueues(r): return any(a.get('__typename')=='EnqueueToMrtAction' for a in (
 satisfying = any(targets(r) and r.get('status')=='LIVE' and enqueues(r) for r in rs)
 ours = next((r['id'] for r in rs if r.get('name')==sys.argv[1]), '')
 print('satisfied|' if satisfying else ('reconcile|'+ours if ours else 'create|'))
-" "$CONTENT_RULE_NAME" 2>/dev/null || echo 'create|')
+" "$CONTENT_RULE_NAME" || echo 'create|')
 CR_MODE="${CR_DECISION%%|*}"; OURS_ID="${CR_DECISION#*|}"
 if [ "$CR_MODE" = "satisfied" ]; then
   echo "    a LIVE content rule already enqueues nostr_event to the MRT, skipping"
@@ -330,7 +330,7 @@ fi
 #    adapter authenticates on the x-webhook-secret header, so WEBHOOK_SECRET here
 #    MUST equal the adapter's WEBHOOK_SECRET env (GCP secret
 #    coop-adapter-webhook-secret-ENVIRONMENT). The action NAME is the adapter
-#    route: callbackUrl path /webhook/<name> must match adapter.mjs's switch.
+#    route: callbackUrl path /webhook/<name> must match the deployed adapter's route switch.
 #    Idempotent + reconciling: existing actions are UPDATED with the current
 #    callbackUrl + secret on every run, so rotating WEBHOOK_SECRET (or moving
 #    COOP_ADAPTER_URL) is just a re-run. Skipped entirely if WEBHOOK_SECRET is unset.

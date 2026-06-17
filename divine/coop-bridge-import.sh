@@ -125,8 +125,27 @@ for i in $(seq 0 $((TOTAL - 1))); do
   # Extract reported pubkey and event from tags
   REPORTED_PUBKEY=$(echo "$EVENT" | jq -r '[.tags[] | select(.[0]=="p")] | .[0][1] // ""')
   REPORTED_EVENT=$(echo "$EVENT" | jq -r '[.tags[] | select(.[0]=="e")] | .[0][1] // ""')
-  REPORT_TYPE=$(echo "$EVENT" | jq -r '[.tags[] | select(.[0]=="l")] | .[0][1] // ""')
-  NORM_REASON=$(normalize_reason "${REPORT_TYPE:-other}")
+  # Extract the raw report reason with the same priority as the live bridge
+  # (osprey/divine/nostr-kafka-bridge/main.py _wrap_nostr_event): 1) explicit 'report'
+  # tag, 2) NIP-32 'l' tag in the social.nos.ontology namespace (strip the NS- prefix),
+  # 3) 'l' tag in the MOD namespace, 4) the 3rd element of the e/p tag (mobile/web
+  # primary format), 5) the moderation-service content JSON "type". Reading only the
+  # first 'l' tag (the old behaviour) silently sent any report whose reason lived in a
+  # 'report' tag or the e/p 3rd element to General Review. The freetext keyword-scan
+  # last resort in main.py is deliberately NOT ported: it is the most error-prone path
+  # and a backfill can safely leave those rare reports to General Review.
+  RAW_REASON=$(echo "$EVENT" | jq -r '
+    def firstne(xs): (xs | map(select(. != null and . != "")) | .[0]) // "";
+    (.tags // []) as $t |
+    firstne([
+      ( $t[] | select(.[0]=="report") | .[1] ),
+      ( $t[] | select(.[0]=="l" and (.[2]=="social.nos.ontology")) | (.[1] | sub("^NS-";"")) ),
+      ( $t[] | select(.[0]=="l" and (.[2]=="MOD")) | .[1] ),
+      ( $t[] | select((.[0]=="e") or (.[0]=="p")) | .[2] ),
+      ( (.content | fromjson?) | (if type=="object" then .type else empty end) )
+    ])
+  ')
+  NORM_REASON=$(normalize_reason "${RAW_REASON:-other}")
 
   # Fetch media URL from the reported event (if it has imeta tags)
   MEDIA_INFO=$(fetch_event_media "${REPORTED_EVENT:-}")
