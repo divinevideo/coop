@@ -258,12 +258,10 @@ for row in "${CATROUTES[@]}"; do
 done
 echo "==> Ensuring category routing rules"
 # Reconcile in place. A rule may already exist under our name but with a stale
-# condition or destination -- e.g. a pre-#10 org that had no category routes at
-# all, or an earlier provisioning -- and skip-by-name would leave those unhealed
-# (everything keeps falling to the General Review catch-all). So updateRoutingRule
-# when the name exists and createRoutingRule when it doesn't, mirroring the
-# content-rule reconcile in step 4. Idempotent: a rule already in the desired
-# state is simply re-set to it.
+# condition or destination from an earlier provisioning, and skip-by-name would
+# leave it unhealed. So updateRoutingRule when the name exists and
+# createRoutingRule when it doesn't, mirroring the content-rule reconcile in step
+# 4. Idempotent: a rule already in the desired state is simply re-set to it.
 EXISTING_R=$(gql 'query { myOrg { routingRules { id name } } }')
 for row in "${CATROUTES[@]}"; do
   QUEUE="${row%%|*}"; KEYWORDS="${row#*|}"
@@ -275,8 +273,13 @@ for row in "${CATROUTES[@]}"; do
   # id of an existing rule with our name (empty if none)
   RID=$(echo "$EXISTING_R" | python3 -c '
 import json,sys
-rs=(json.load(sys.stdin).get("data") or {}).get("myOrg",{}).get("routingRules") or []
-print(next((r["id"] for r in rs if r.get("name")==sys.argv[1]), ""))' "$CR_NAME" 2>/dev/null || true)
+payload=json.load(sys.stdin)
+if payload.get("errors"):
+    raise SystemExit("routingRules query returned errors: " + json.dumps(payload["errors"])[:300])
+org=(payload.get("data") or {}).get("myOrg")
+if not isinstance(org, dict) or not isinstance(org.get("routingRules"), list):
+    raise SystemExit("routingRules query missing data.myOrg.routingRules")
+print(next((r["id"] for r in org["routingRules"] if r.get("name")==sys.argv[1]), ""))' "$CR_NAME")
   # Desired input. Create and Update take the same fields; Update adds the id.
   # Anchored regex per token = exact match (COOP has no equality signal). The signal
   # compiles each string case-insensitively, so ^<token>$ matches the token exactly and
@@ -303,7 +306,11 @@ print(json.dumps({"input":inp}))' "$TID" "$QID" "$CR_NAME" "$KEYWORDS")
   if echo "$RESP" | grep -q '"__typename":"MutateRoutingRuleSuccessResponse"'; then
     echo "    $ACT '$CR_NAME' -> $QID"
   elif echo "$RESP" | grep -q 'RoutingRuleNameExistsError'; then
-    echo "    '$CR_NAME' created concurrently; re-run to reconcile it"
+    if [ "$ACT" = "created" ]; then
+      echo "    '$CR_NAME' created concurrently; re-run to reconcile it"
+    else
+      echo "    ERROR: routing rule reconcile failed for '$CR_NAME': another rule already has that name"; exit 1
+    fi
   else
     echo "    ERROR: routing rule $ACT failed for '$CR_NAME': $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
   fi
