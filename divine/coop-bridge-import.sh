@@ -153,13 +153,22 @@ for i in $(seq 0 $((TOTAL - 1))); do
   MEDIA_URL="${MEDIA_INFO%%|*}"
   MEDIA_THUMB="${MEDIA_INFO##*|}"
 
-  # userId is the job SUBJECT: the reported (offending) user, NOT the reporter. This
-  # mirrors the Osprey COOPSink (coop_sink.py sets userId = ReportedPubkey, falling
-  # back to the event author only when there is no reported pubkey). Keying it on the
-  # reporter would aim user-level enforcement and the MRT subject at the wrong account.
-  # content.pubkey deliberately stays the report AUTHOR to match coop_sink.py
-  # (content.pubkey = processed-event Pubkey = reporter); the offender travels in
-  # reported_pubkey, which is the field the webhook adapter actually enforces on.
+  # userId is the job SUBJECT: the reported (offending) user, NOT the reporter.
+  # Keying it on the reporter would aim user-level enforcement and the MRT subject
+  # at the wrong account.
+  #
+  # NOTE: this no longer mirrors Osprey's COOPSink, and the difference is
+  # deliberate rather than an oversight. COOPSink now keys contentId on the
+  # *reported* event and derives both userId and content.pubkey from the author
+  # resolved from that event, because a report's p-tag is written by the reporter
+  # and nothing verifies it. This script still uses the claimed reported_pubkey,
+  # and keys contentId on the report event itself, so content.pubkey is correctly
+  # the reporter within *this* script's model of an item.
+  #
+  # That is acceptable here only because this is a demo/dev seeder: it pulls from
+  # staging relay-manager into a LOCAL Coop via .env.demo, and is not a production
+  # ingestion path. Do not copy this mapping into one. Anything that enforces must
+  # target a verified author; see divine/plugins/src/reported_author.py in osprey.
   COOP_BODY=$(jq -n \
     --arg contentId "$EVENT_ID" \
     --arg reportEventId "$EVENT_ID" \
