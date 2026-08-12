@@ -49,11 +49,37 @@ curl -sS -m 15 -c "$CJ" "$GQL" -H "Content-Type: application/json" \
 #    bridge sends unix seconds in created_at, not COOP's DATETIME role value.
 # ---------------------------------------------------------------------------
 echo "==> Ensuring content type 'nostr_event'"
+# The Review Console is schema-driven: ManualReviewJobContentView zips the item
+# type's baseFields against the item data and the renderer dispatches on each
+# field's DECLARED TYPE, never its name. So a new field here renders to
+# moderators automatically, with a humanised label and no client change. That is
+# what makes carrying more context a config change rather than a UI fork.
+#
+# Field types are chosen for how they render: URL becomes a real hyperlink,
+# VIDEO/IMAGE become players, STRING becomes a labelled row. A field whose value
+# is null is dropped from the view entirely, so partially-populated items stay
+# tidy rather than showing empty rows.
+#
+# NOT set here: the creatorId field role. It drives the Associated User panel and
+# per-account actions, which need a User item type to resolve into. It belongs
+# with that work, not with a bare pubkey string.
+CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"relay_manager_url","type":"URL","required":false}]'
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
-if echo "$TYPES" | grep -q '"name": "nostr_event"' || echo "$TYPES" | grep -q '"name":"nostr_event"'; then
-  echo "    exists, skipping"
+CT_ID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t=(((d.get("data") or {}).get("myOrg") or {}).get("itemTypes") or []); print(next((x["id"] for x in t if x.get("name")=="nostr_event" and x.get("id")), ""))' "$TYPES")
+if [ -n "$CT_ID" ]; then
+  # Reconcile in place. updateContentItemType REPLACES the schema with the array
+  # given, so this both adds new fields and removes any we have dropped. Same
+  # reconcile-not-skip approach the routing rules use (#12): a setup script that
+  # skips existing objects silently drifts from the file that claims to define them.
+  CT_VARS=$(printf '{"input":{"id":"%s","name":"nostr_event","description":"Divine Nostr event flagged by Osprey for moderator review","fields":%s,"fieldRoles":{"displayName":"text"}}}' "$CT_ID" "$CT_FIELDS")
+  RESP=$(gql 'mutation U($input: UpdateContentItemTypeInput!){ updateContentItemType(input:$input){ __typename } }' "$CT_VARS")
+  if echo "$RESP" | grep -q '"__typename":"MutateContentTypeSuccessResponse"' && ! echo "$RESP" | grep -q '"errors"'; then
+    echo "    exists, fields reconciled"
+  else
+    echo "    ERROR: content type update failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+  fi
 else
-  CT_VARS='{"input":{"name":"nostr_event","description":"Divine Nostr event flagged by Osprey for moderator review","fields":[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false}],"fieldRoles":{"displayName":"text"}}}'
+  CT_VARS=$(printf '{"input":{"name":"nostr_event","description":"Divine Nostr event flagged by Osprey for moderator review","fields":%s,"fieldRoles":{"displayName":"text"}}}' "$CT_FIELDS")
   RESP=$(gql 'mutation C($input: CreateContentItemTypeInput!){ createContentItemType(input:$input){ __typename } }' "$CT_VARS")
   # Decide from the typed response: success typename present AND no error typename / GraphQL errors.
   if echo "$RESP" | grep -q '"__typename":"MutateContentTypeSuccessResponse"' && ! echo "$RESP" | grep -q '"errors"'; then
