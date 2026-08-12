@@ -390,7 +390,11 @@ if [ -z "${WEBHOOK_SECRET:-}" ]; then
   echo "==> WEBHOOK_SECRET unset — skipping enforcement actions (step 6)."
 else
   echo "==> Ensuring enforcement actions (-> $COOP_ADAPTER_URL/webhook/<Action>)"
-  ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
+    # Un-Restrict-Media is the reversal for Age-Restrict. It sends SAFE, which maps
+  # to Active in Blossom and so reverses AgeRestricted, Restricted and Banned
+  # alike. Without it Coop could age-restrict media and never undo it, which also
+  # meant an accepted appeal had no way to restore the content.
+  ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict Un-Restrict-Media)
   EXISTING_A=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }')
   for AN in "${ACTIONS_LIST[@]}"; do
     AID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); a=(((d.get("data") or {}).get("myOrg") or {}).get("actions") or []); print(next((x["id"] for x in a if x.get("name")==sys.argv[2] and x.get("id")), ""))' "$EXISTING_A" "$AN")
