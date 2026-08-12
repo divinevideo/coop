@@ -37,6 +37,10 @@ gql() { # $1=query  $2=variables-json  -> raw response
     -d "$(python3 -c 'import json,sys; print(json.dumps({"query":sys.argv[1],"variables":json.loads(sys.argv[2])}))' "$q" "$v")"
 }
 
+type_id() {
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t=(((d.get("data") or {}).get("myOrg") or {}).get("itemTypes") or []); print(next((x["id"] for x in t if x.get("name")==sys.argv[2] and x.get("id")), ""))' "$TYPES" "$1"
+}
+
 echo "==> Logging in as $COOP_LOGIN_EMAIL"
 curl -sS -m 15 -c "$CJ" "$GQL" -H "Content-Type: application/json" \
   -d "$(python3 -c 'import json,sys;print(json.dumps({"query":"mutation L($i: LoginInput!){ login(input:$i){ __typename ... on LoginSuccessResponse { user { email role } } } }","variables":{"i":{"email":sys.argv[1],"password":sys.argv[2]}}}))' "$COOP_LOGIN_EMAIL" "$COOP_LOGIN_PASSWORD")" \
@@ -64,22 +68,23 @@ echo "==> Ensuring content type 'nostr_event'"
 # per-account actions, which need a User item type to resolve into. It belongs
 # with that work, not with a bare pubkey string.
 CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"relay_manager_url","type":"URL","required":false}]'
+CT_FIELD_ROLES='{"displayName":"text","creatorId":null,"threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
-CT_ID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t=(((d.get("data") or {}).get("myOrg") or {}).get("itemTypes") or []); print(next((x["id"] for x in t if x.get("name")=="nostr_event" and x.get("id")), ""))' "$TYPES")
+CT_ID=$(type_id nostr_event)
 if [ -n "$CT_ID" ]; then
   # Reconcile in place. updateContentItemType REPLACES the schema with the array
-  # given, so this both adds new fields and removes any we have dropped. Same
+  # given, and explicit null field roles clear stale live role assignments. Same
   # reconcile-not-skip approach the routing rules use (#12): a setup script that
   # skips existing objects silently drifts from the file that claims to define them.
-  CT_VARS=$(printf '{"input":{"id":"%s","name":"nostr_event","description":"Divine Nostr event flagged by Osprey for moderator review","fields":%s,"fieldRoles":{"displayName":"text"}}}' "$CT_ID" "$CT_FIELDS")
+  CT_VARS=$(printf '{"input":{"id":"%s","name":"nostr_event","description":"Divine Nostr event flagged by Osprey for moderator review","fields":%s,"fieldRoles":%s}}' "$CT_ID" "$CT_FIELDS" "$CT_FIELD_ROLES")
   RESP=$(gql 'mutation U($input: UpdateContentItemTypeInput!){ updateContentItemType(input:$input){ __typename } }' "$CT_VARS")
   if echo "$RESP" | grep -q '"__typename":"MutateContentTypeSuccessResponse"' && ! echo "$RESP" | grep -q '"errors"'; then
-    echo "    exists, fields reconciled"
+    echo "    exists, schema reconciled"
   else
     echo "    ERROR: content type update failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
   fi
 else
-  CT_VARS=$(printf '{"input":{"name":"nostr_event","description":"Divine Nostr event flagged by Osprey for moderator review","fields":%s,"fieldRoles":{"displayName":"text"}}}' "$CT_FIELDS")
+  CT_VARS=$(printf '{"input":{"name":"nostr_event","description":"Divine Nostr event flagged by Osprey for moderator review","fields":%s,"fieldRoles":%s}}' "$CT_FIELDS" "$CT_FIELD_ROLES")
   RESP=$(gql 'mutation C($input: CreateContentItemTypeInput!){ createContentItemType(input:$input){ __typename } }' "$CT_VARS")
   # Decide from the typed response: success typename present AND no error typename / GraphQL errors.
   if echo "$RESP" | grep -q '"__typename":"MutateContentTypeSuccessResponse"' && ! echo "$RESP" | grep -q '"errors"'; then
@@ -105,22 +110,23 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> Ensuring user type 'nostr_user'"
 UT_FIELDS='[{"name":"pubkey","type":"STRING","required":true},{"name":"npub","type":"STRING","required":false},{"name":"first_seen_at","type":"DATETIME","required":false}]'
-UT_ID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t=(((d.get("data") or {}).get("myOrg") or {}).get("itemTypes") or []); print(next((x["id"] for x in t if x.get("name")=="nostr_user" and x.get("id")), ""))' "$TYPES")
+UT_ID=$(type_id nostr_user)
+UT_EXISTS=false
 if [ -n "$UT_ID" ]; then
-  UT_VARS=$(printf '{"input":{"id":"%s","name":"nostr_user","description":"A Nostr account, keyed by pubkey","fields":%s,"fieldRoles":{"displayName":"pubkey"}}}' "$UT_ID" "$UT_FIELDS")
-  RESP=$(gql 'mutation U($input: UpdateUserItemTypeInput!){ updateUserItemType(input:$input){ __typename } }' "$UT_VARS")
+  UT_EXISTS=true
+  UT_VARS=$(printf '{"input":{"id":"%s","name":"nostr_user","description":"A Nostr account, keyed by pubkey","fields":%s,"fieldRoles":{"displayName":"pubkey","createdAt":null,"profileIcon":null,"backgroundImage":null,"isDeleted":null}}}' "$UT_ID" "$UT_FIELDS")
+  RESP=$(gql 'mutation U($input: UpdateUserItemTypeInput!){ updateUserItemType(input:$input){ __typename ... on MutateUserTypeSuccessResponse { data { id } } } }' "$UT_VARS")
 else
-  UT_VARS=$(printf '{"input":{"name":"nostr_user","description":"A Nostr account, keyed by pubkey","fields":%s,"fieldRoles":{"displayName":"pubkey"}}}' "$UT_FIELDS")
-  RESP=$(gql 'mutation C($input: CreateUserItemTypeInput!){ createUserItemType(input:$input){ __typename } }' "$UT_VARS")
+  UT_VARS=$(printf '{"input":{"name":"nostr_user","description":"A Nostr account, keyed by pubkey","fields":%s,"fieldRoles":{"displayName":"pubkey","createdAt":null,"profileIcon":null,"backgroundImage":null,"isDeleted":null}}}' "$UT_FIELDS")
+  RESP=$(gql 'mutation C($input: CreateUserItemTypeInput!){ createUserItemType(input:$input){ __typename ... on MutateUserTypeSuccessResponse { data { id } } } }' "$UT_VARS")
 fi
-if echo "$RESP" | grep -q 'SuccessResponse' && ! echo "$RESP" | grep -q '"errors"'; then
-  if [ -n "$UT_ID" ]; then echo "    reconciled"; else echo "    created"; fi
+NEW_UT_ID=$(echo "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); r=(d.get("data") or {}).get("updateUserItemType") or (d.get("data") or {}).get("createUserItemType") or {}; print(((r.get("data") or {}).get("id")) or "")' 2>/dev/null || true)
+if echo "$RESP" | grep -q '"__typename":"MutateUserTypeSuccessResponse"' && ! echo "$RESP" | grep -q '"errors"' && [ -n "$NEW_UT_ID" ]; then
+  UT_ID="$NEW_UT_ID"
+  if [ "$UT_EXISTS" = true ]; then echo "    reconciled"; else echo "    created"; fi
 else
   echo "    ERROR: user type failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
 fi
-# Re-read so the id is available to report the value COOPSink needs.
-UT_ID=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }' \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); t=(((d.get("data") or {}).get("myOrg") or {}).get("itemTypes") or []); print(next((x["id"] for x in t if x.get("name")=="nostr_user" and x.get("id")), ""))')
 echo "    nostr_user typeId = $UT_ID  (COOPSink needs this as DIVINE_COOP_USER_TYPE_ID)"
 
 # ---------------------------------------------------------------------------
@@ -176,8 +182,11 @@ EXISTING_R=$(gql 'query { myOrg { routingRules { id name } } }')
 if echo "$EXISTING_R" | grep -qF "\"$RULE_NAME\""; then
   echo "    exists, skipping"
 else
-  TID=$(echo "$TYPES" | python3 -c "import json,sys;ts=json.load(sys.stdin)['data']['myOrg']['itemTypes'];print(next((t['id'] for t in ts if t.get('name')=='nostr_event'),''))" 2>/dev/null || true)
-  [ -z "$TID" ] && TID=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }' | python3 -c "import json,sys;ts=json.load(sys.stdin)['data']['myOrg']['itemTypes'];print(next((t['id'] for t in ts if t.get('name')=='nostr_event'),''))" 2>/dev/null || true)
+  TID=$(type_id nostr_event)
+  if [ -z "$TID" ]; then
+    TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
+    TID=$(type_id nostr_event)
+  fi
   GQID=$(gql 'query { myOrg { mrtQueues { id name } } }' | python3 -c "import json,sys;qs=json.load(sys.stdin)['data']['myOrg']['mrtQueues'];print(next((q['id'] for q in qs if q['name']=='General Review'),''))" 2>/dev/null || true)
   if [ -z "$TID" ] || [ -z "$GQID" ]; then
     echo "    ERROR: could not resolve nostr_event type ($TID) or General Review queue ($GQID)"; exit 1
@@ -194,8 +203,8 @@ else
 fi
 
 # --- Shared lookups for the rule/action steps below ----------------------------
-TID=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }' \
-  | python3 -c "import json,sys;ts=json.load(sys.stdin)['data']['myOrg']['itemTypes'];print(next((t['id'] for t in ts if t.get('name')=='nostr_event'),''))" 2>/dev/null || true)
+TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
+TID=$(type_id nostr_event)
 [ -z "$TID" ] && { echo "ERROR: cannot resolve nostr_event content type id"; exit 1; }
 QUEUES_JSON=$(gql 'query { myOrg { mrtQueues { id name } } }')
 qid() { echo "$QUEUES_JSON" | python3 -c "import json,sys;qs=json.load(sys.stdin)['data']['myOrg']['mrtQueues'];print(next((q['id'] for q in qs if q['name']==sys.argv[1]),''))" "$1"; }
@@ -424,11 +433,16 @@ if [ -z "${WEBHOOK_SECRET:-}" ]; then
   echo "==> WEBHOOK_SECRET unset — skipping enforcement actions (step 6)."
 else
   echo "==> Ensuring enforcement actions (-> $COOP_ADAPTER_URL/webhook/<Action>)"
-    # Un-Restrict-Media is the reversal for Age-Restrict. It sends SAFE, which maps
+  # Un-Restrict-Media is the reversal for Age-Restrict. It sends SAFE, which maps
   # to Active in Blossom and so reverses AgeRestricted, Restricted and Banned
   # alike. Without it Coop could age-restrict media and never undo it, which also
   # meant an accepted appeal had no way to restore the content.
   ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict Un-Restrict-Media)
+  UNRESTRICT_STATUS=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$COOP_ADAPTER_URL/webhook/Un-Restrict-Media" -H "Content-Type: application/json" -H "x-webhook-secret: __coop_setup_route_probe__" -d '{}' || true)
+  if [ "$UNRESTRICT_STATUS" = "404" ] || [ "$UNRESTRICT_STATUS" = "000" ]; then
+    echo "    WARNING: adapter route /webhook/Un-Restrict-Media is not available (HTTP $UNRESTRICT_STATUS); skipping that action."
+    ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
+  fi
   EXISTING_A=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }')
   for AN in "${ACTIONS_LIST[@]}"; do
     AID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); a=(((d.get("data") or {}).get("myOrg") or {}).get("actions") or []); print(next((x["id"] for x in a if x.get("name")==sys.argv[2] and x.get("id")), ""))' "$EXISTING_A" "$AN")
