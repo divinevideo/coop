@@ -90,6 +90,40 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 1b) User item type, keyed by pubkey.
+#
+# Needed before anything can use Coop's reporting API: POST /api/v1/report
+# REQUIRES reporter{kind,typeId,id}, and typeId must name a User item type.
+#
+# It is also the single change that unlocks three things at once, because Coop
+# keys per-account features off a User item: lookup by pubkey, an account's
+# history, and bulk actions over a pasted pubkey list. Without it, Coop can only
+# ever be searched by item id.
+#
+# displayName is the pubkey itself. We have no username to show, and a moderator
+# recognises an npub; an empty display name renders as a blank row.
+# ---------------------------------------------------------------------------
+echo "==> Ensuring user type 'nostr_user'"
+UT_FIELDS='[{"name":"pubkey","type":"STRING","required":true},{"name":"npub","type":"STRING","required":false},{"name":"first_seen_at","type":"DATETIME","required":false}]'
+UT_ID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t=(((d.get("data") or {}).get("myOrg") or {}).get("itemTypes") or []); print(next((x["id"] for x in t if x.get("name")=="nostr_user" and x.get("id")), ""))' "$TYPES")
+if [ -n "$UT_ID" ]; then
+  UT_VARS=$(printf '{"input":{"id":"%s","name":"nostr_user","description":"A Nostr account, keyed by pubkey","fields":%s,"fieldRoles":{"displayName":"pubkey"}}}' "$UT_ID" "$UT_FIELDS")
+  RESP=$(gql 'mutation U($input: UpdateUserItemTypeInput!){ updateUserItemType(input:$input){ __typename } }' "$UT_VARS")
+else
+  UT_VARS=$(printf '{"input":{"name":"nostr_user","description":"A Nostr account, keyed by pubkey","fields":%s,"fieldRoles":{"displayName":"pubkey"}}}' "$UT_FIELDS")
+  RESP=$(gql 'mutation C($input: CreateUserItemTypeInput!){ createUserItemType(input:$input){ __typename } }' "$UT_VARS")
+fi
+if echo "$RESP" | grep -q 'SuccessResponse' && ! echo "$RESP" | grep -q '"errors"'; then
+  if [ -n "$UT_ID" ]; then echo "    reconciled"; else echo "    created"; fi
+else
+  echo "    ERROR: user type failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+fi
+# Re-read so the id is available to report the value COOPSink needs.
+UT_ID=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }' \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); t=(((d.get("data") or {}).get("myOrg") or {}).get("itemTypes") or []); print(next((x["id"] for x in t if x.get("name")=="nostr_user" and x.get("id")), ""))')
+echo "    nostr_user typeId = $UT_ID  (COOPSink needs this as DIVINE_COOP_USER_TYPE_ID)"
+
+# ---------------------------------------------------------------------------
 # 2) Review queues — approximate relay-manager's category tiers (lib/constants.ts
 #    CATEGORY_LABELS + HIGH_PRIORITY_CATEGORIES + ReportWatcher immediate/threshold).
 #    The relay-manager category -> queue mapping is documented in
