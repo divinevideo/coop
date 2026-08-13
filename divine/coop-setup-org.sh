@@ -121,9 +121,30 @@ else
   RESP=$(gql 'mutation C($input: CreateUserItemTypeInput!){ createUserItemType(input:$input){ __typename ... on MutateUserTypeSuccessResponse { data { id } } } }' "$UT_VARS")
 fi
 NEW_UT_ID=$(echo "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); r=(d.get("data") or {}).get("updateUserItemType") or (d.get("data") or {}).get("createUserItemType") or {}; print(((r.get("data") or {}).get("id")) or "")' 2>/dev/null || true)
+# Coop's user item type mutations can answer with `data: null` inside a
+# MutateUserTypeSuccessResponse: server/graphql/modules/itemType.ts returns the
+# item type directly at createUserItemType/updateUserItemType, while the schema
+# declares a { data: UserItemType } wrapper. Requiring an id from that response
+# failed on a success and exited before provisioning any action, leaving the org
+# half-configured with no indication that the work it exists to do had not run.
+# Verified against staging: the type WAS created, twice, while this reported an error.
+#
+# So: trust the typename. Reuse the known id on update, and re-resolve the id by
+# querying only after create. Remove this once the deployed server wraps
+# MutateUserTypeSuccessResponse as { data: userItemType }.
+if [ -z "$NEW_UT_ID" ] && echo "$RESP" | grep -q '"__typename":"MutateUserTypeSuccessResponse"'; then
+  if [ "$UT_EXISTS" = true ]; then
+    NEW_UT_ID="$UT_ID"
+  else
+    TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
+    NEW_UT_ID=$(type_id nostr_user)
+  fi
+fi
 if echo "$RESP" | grep -q '"__typename":"MutateUserTypeSuccessResponse"' && ! echo "$RESP" | grep -q '"errors"' && [ -n "$NEW_UT_ID" ]; then
   UT_ID="$NEW_UT_ID"
   if [ "$UT_EXISTS" = true ]; then echo "    reconciled"; else echo "    created"; fi
+elif echo "$RESP" | grep -q '"__typename":"MutateUserTypeSuccessResponse"' && ! echo "$RESP" | grep -q '"errors"'; then
+  echo "    ERROR: user type mutation succeeded but id could not be resolved: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
 else
   echo "    ERROR: user type failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
 fi
