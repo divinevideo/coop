@@ -121,6 +121,19 @@ else
   RESP=$(gql 'mutation C($input: CreateUserItemTypeInput!){ createUserItemType(input:$input){ __typename ... on MutateUserTypeSuccessResponse { data { id } } } }' "$UT_VARS")
 fi
 NEW_UT_ID=$(echo "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); r=(d.get("data") or {}).get("updateUserItemType") or (d.get("data") or {}).get("createUserItemType") or {}; print(((r.get("data") or {}).get("id")) or "")' 2>/dev/null || true)
+# COOP 1.0.2 answers BOTH createUserItemType and updateUserItemType with
+# `data: null` inside a MutateUserTypeSuccessResponse -- the mutation succeeds and
+# returns no object. Requiring an id from the response therefore failed on a
+# success, and the script exited before provisioning any action, leaving the org
+# half-configured with no indication that the work it exists to do had not run.
+# Verified against staging: the type WAS created, twice, while this reported an error.
+#
+# So: trust the typename, and re-resolve the id by querying when the response
+# withholds it.
+if [ -z "$NEW_UT_ID" ] && echo "$RESP" | grep -q '"__typename":"MutateUserTypeSuccessResponse"'; then
+  TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
+  NEW_UT_ID=$(type_id nostr_user)
+fi
 if echo "$RESP" | grep -q '"__typename":"MutateUserTypeSuccessResponse"' && ! echo "$RESP" | grep -q '"errors"' && [ -n "$NEW_UT_ID" ]; then
   UT_ID="$NEW_UT_ID"
   if [ "$UT_EXISTS" = true ]; then echo "    reconciled"; else echo "    created"; fi
