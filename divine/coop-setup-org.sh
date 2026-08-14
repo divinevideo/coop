@@ -464,10 +464,20 @@ else
   # so an account action scoped to nostr_event renders NO button on the Associated
   # User panel and the feature looks broken while being fully configured.
   ACCOUNT_ACTIONS="Ban-User Suspend-User Unban-User Unsuspend-User"
-  action_type_ids() {
+  # Account actions span BOTH types, and that is deliberate rather than lazy.
+  # Scoping them to nostr_user ALONE would be a regression: the job's main action
+  # bar filters by the ITEM's type
+  # (ManualReviewJobReview.tsx:849-853, `action.itemTypes...includes(payload.item.type.id)`),
+  # so Ban-User is on that bar today for a content item, and the adapter makes it
+  # work by resolving the event's author. Narrowing it would remove a working
+  # button before the Associated User panel is able to render one -- moderators
+  # would lose the capability in between. Spanning both is strictly additive: the
+  # content-item route keeps working, and the same action also appears on the
+  # Associated User panel once `author` is populated.
+  action_type_ids_json() {
     case " $ACCOUNT_ACTIONS " in
-      *" $1 "*) printf '%s' "$UT_ID" ;;
-      *)        printf '%s' "$TID" ;;
+      *" $1 "*) python3 -c 'import json,sys;print(json.dumps([sys.argv[1],sys.argv[2]]))' "$TID" "$UT_ID" ;;
+      *)        python3 -c 'import json,sys;print(json.dumps([sys.argv[1]]))' "$TID" ;;
     esac
   }
   UNRESTRICT_STATUS=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$COOP_ADAPTER_URL/webhook/Un-Restrict-Media" -H "Content-Type: application/json" -H "x-webhook-secret: __coop_setup_route_probe__" -d '{}' || true)
@@ -493,7 +503,7 @@ else
       # forever and no amount of re-running this script would rescope it -- the
       # buttons simply never appear on the Associated User panel. Name and
       # description are still left alone.
-      UV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"id":sys.argv[1],"callbackUrl":sys.argv[2],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[3]},"itemTypeIds":[sys.argv[4]]}}))' "$AID" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET" "$(action_type_ids "$AN")")
+      UV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"id":sys.argv[1],"callbackUrl":sys.argv[2],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[3]},"itemTypeIds":json.loads(sys.argv[4])}}))' "$AID" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET" "$(action_type_ids_json "$AN")")
       RESP=$(gql 'mutation U($input: UpdateActionInput!){ updateAction(input:$input){ __typename } }' "$UV")
       if echo "$RESP" | grep -q '"__typename":"MutateActionSuccessResponse"'; then
         echo "    '$AN' updated (callbackUrl + webhook secret refreshed)"
@@ -502,7 +512,7 @@ else
       fi
       continue
     fi
-    AV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Divine enforcement via coop-webhook-adapter","itemTypeIds":[sys.argv[2]],"callbackUrl":sys.argv[3],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[4]}}}))' "$AN" "$(action_type_ids "$AN")" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET")
+    AV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Divine enforcement via coop-webhook-adapter","itemTypeIds":json.loads(sys.argv[2]),"callbackUrl":sys.argv[3],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[4]}}}))' "$AN" "$(action_type_ids_json "$AN")" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET")
     RESP=$(gql 'mutation A($input: CreateActionInput!){ createAction(input:$input){ __typename } }' "$AV")
     if echo "$RESP" | grep -q '"__typename":"MutateActionSuccessResponse"'; then
       echo "    '$AN' created"
