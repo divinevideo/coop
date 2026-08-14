@@ -67,8 +67,8 @@ echo "==> Ensuring content type 'nostr_event'"
 # NOT set here: the creatorId field role. It drives the Associated User panel and
 # per-account actions, which need a User item type to resolve into. It belongs
 # with that work, not with a bare pubkey string.
-CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"relay_manager_url","type":"URL","required":false}]'
-CT_FIELD_ROLES='{"displayName":"text","creatorId":null,"threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
+CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
+CT_FIELD_ROLES='{"displayName":"text","creatorId":"author","threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
 CT_ID=$(type_id nostr_event)
 if [ -n "$CT_ID" ]; then
@@ -459,10 +459,25 @@ else
   # alike. Without it Coop could age-restrict media and never undo it, which also
   # meant an accepted appeal had no way to restore the content.
   ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict Un-Restrict-Media)
+  # Which item type each action may be taken ON. This is not cosmetic: the review
+  # UI filters an item's buttons by `action.itemTypes.some(t => t.id === user.typeId)`,
+  # so an account action scoped to nostr_event renders NO button on the Associated
+  # User panel and the feature looks broken while being fully configured.
+  ACCOUNT_ACTIONS="Ban-User Suspend-User Unban-User Unsuspend-User"
+  action_type_ids() {
+    case " $ACCOUNT_ACTIONS " in
+      *" $1 "*) printf '%s' "$UT_ID" ;;
+      *)        printf '%s' "$TID" ;;
+    esac
+  }
   UNRESTRICT_STATUS=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$COOP_ADAPTER_URL/webhook/Un-Restrict-Media" -H "Content-Type: application/json" -H "x-webhook-secret: __coop_setup_route_probe__" -d '{}' || true)
   if [ "$UNRESTRICT_STATUS" = "404" ] || [ "$UNRESTRICT_STATUS" = "000" ]; then
     echo "    WARNING: adapter route /webhook/Un-Restrict-Media is not available (HTTP $UNRESTRICT_STATUS); skipping that action."
     ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
+  fi
+  if [ -z "$UT_ID" ]; then
+    echo "    ERROR: nostr_user typeId is empty; account actions would be scoped to nothing and render no buttons." >&2
+    exit 1
   fi
   EXISTING_A=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }')
   for AN in "${ACTIONS_LIST[@]}"; do
@@ -471,9 +486,14 @@ else
       # Update in place so a rotated WEBHOOK_SECRET (or a changed COOP_ADAPTER_URL)
       # actually propagates on re-run. Skipping would keep the OLD secret, and COOP
       # returns 202 to the moderator even when the adapter 401s the stale secret --
-      # so enforcement would fail invisibly. Only the callback fields are sent;
-      # name/description/itemTypeIds are left unchanged.
-      UV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"id":sys.argv[1],"callbackUrl":sys.argv[2],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[3]}}}))' "$AID" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET")
+      # so enforcement would fail invisibly.
+      #
+      # itemTypeIds IS now sent. It used to be omitted deliberately, which meant an
+      # action created before account moderation stayed scoped to nostr_event
+      # forever and no amount of re-running this script would rescope it -- the
+      # buttons simply never appear on the Associated User panel. Name and
+      # description are still left alone.
+      UV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"id":sys.argv[1],"callbackUrl":sys.argv[2],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[3]},"itemTypeIds":[sys.argv[4]]}}))' "$AID" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET" "$(action_type_ids "$AN")")
       RESP=$(gql 'mutation U($input: UpdateActionInput!){ updateAction(input:$input){ __typename } }' "$UV")
       if echo "$RESP" | grep -q '"__typename":"MutateActionSuccessResponse"'; then
         echo "    '$AN' updated (callbackUrl + webhook secret refreshed)"
@@ -482,7 +502,7 @@ else
       fi
       continue
     fi
-    AV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Divine enforcement via coop-webhook-adapter","itemTypeIds":[sys.argv[2]],"callbackUrl":sys.argv[3],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[4]}}}))' "$AN" "$TID" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET")
+    AV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Divine enforcement via coop-webhook-adapter","itemTypeIds":[sys.argv[2]],"callbackUrl":sys.argv[3],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[4]}}}))' "$AN" "$(action_type_ids "$AN")" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET")
     RESP=$(gql 'mutation A($input: CreateActionInput!){ createAction(input:$input){ __typename } }' "$AV")
     if echo "$RESP" | grep -q '"__typename":"MutateActionSuccessResponse"'; then
       echo "    '$AN' created"
