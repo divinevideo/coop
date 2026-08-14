@@ -67,7 +67,28 @@ echo "==> Ensuring content type 'nostr_event'"
 # NOT set here: the creatorId field role. It drives the Associated User panel and
 # per-account actions, which need a User item type to resolve into. It belongs
 # with that work, not with a bare pubkey string.
-CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
+# Profile fields (author_/reported_/reporter_) put PEOPLE on the review card instead
+# of three 64-character hex strings. The three prefixes are distinct on purpose:
+# `author` is the VERIFIED signer of the reported event, `reported` is the reporter's
+# unverified claim about who is responsible, and `reporter` is whoever filed it.
+#
+# TYPE CHOICES ARE LOAD-BEARING. Coop has two renderers. The review card shows every
+# declared field, but the QUEUE PREVIEW uses getPrimaryContentFields, which filters to
+# STRING/URL/IMAGE/VIDEO/AUDIO and silently drops BOOLEAN and NUMBER
+# (client/src/utils/itemUtils.ts:112-118). So anything a moderator must not miss while
+# scanning is a STRING -- which is why nip05 carries its own '(verified)' /
+# '(UNVERIFIED)' suffix rather than relying on the boolean beside it. An unverified
+# nip05 that reads as established identity is an impersonation vector on the
+# moderator's own screen.
+#
+# `_profile_state` distinguishes 'this account published no profile' from 'we could not
+# look it up'; funnelcake answers 200 with a null profile for an unknown pubkey, so a
+# blank name cannot tell them apart. `_profile_error` carries the reason, because
+# 'HTTP 500 Unable To Extract Key!' names the rate limiter and 'timed out' does not.
+#
+# Empty values are omitted by the sink, so a typical item populates only a handful of
+# these despite the field count.
+CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false},{"name":"author_display_name","type":"STRING","required":false},{"name":"author_nip05","type":"STRING","required":false},{"name":"author_profile_state","type":"STRING","required":false},{"name":"author_profile_error","type":"STRING","required":false},{"name":"author_nip05_verified","type":"BOOLEAN","required":false},{"name":"author_follower_count","type":"NUMBER","required":false},{"name":"author_has_vanish_request","type":"BOOLEAN","required":false},{"name":"reported_display_name","type":"STRING","required":false},{"name":"reported_nip05","type":"STRING","required":false},{"name":"reported_profile_state","type":"STRING","required":false},{"name":"reported_profile_error","type":"STRING","required":false},{"name":"reported_nip05_verified","type":"BOOLEAN","required":false},{"name":"reported_follower_count","type":"NUMBER","required":false},{"name":"reported_has_vanish_request","type":"BOOLEAN","required":false},{"name":"reporter_display_name","type":"STRING","required":false},{"name":"reporter_nip05","type":"STRING","required":false},{"name":"reporter_profile_state","type":"STRING","required":false},{"name":"reporter_profile_error","type":"STRING","required":false},{"name":"reporter_nip05_verified","type":"BOOLEAN","required":false},{"name":"reporter_follower_count","type":"NUMBER","required":false},{"name":"reporter_has_vanish_request","type":"BOOLEAN","required":false}]'
 CT_FIELD_ROLES='{"displayName":"text","creatorId":"author","threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
 CT_ID=$(type_id nostr_event)
