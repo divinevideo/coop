@@ -21,6 +21,10 @@ jobs:
     uses: ./.github/workflows/check_if_directory_changed.yaml
     with:
       directory: 'server'
+  check_for_divine_changes:
+    uses: ./.github/workflows/check_if_directory_changed.yaml
+    with:
+      directory: 'divine'
 
   check_generated_graphql:
     timeout-minutes: 4
@@ -110,6 +114,18 @@ jobs:
 
           exit 0
 
+  check_divine_setup_guards:
+    needs: check_for_divine_changes
+    if: needs.check_for_divine_changes.outputs.result == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check Divine Coop setup guards
+        run: bash divine/test-coop-setup-guards.sh
+
   # jobs have to be defined in the root workflow file in order to be marked as
   # 'Required Checks' in GitHub CI
   check_api_server:
@@ -162,5 +178,4 @@ jobs:
 
       - name: Build client
         run: docker compose run --rm --quiet-pull client npm run build
-
 
