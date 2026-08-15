@@ -64,9 +64,11 @@ echo "==> Ensuring content type 'nostr_event'"
 # is null is dropped from the view entirely, so partially-populated items stay
 # tidy rather than showing empty rows.
 #
-# NOT set here: the creatorId field role. It drives the Associated User panel and
-# per-account actions, which need a User item type to resolve into. It belongs
-# with that work, not with a bare pubkey string.
+# `creatorId` IS set here, to `author` -- see CT_FIELD_ROLES below. It drives the
+# Associated User panel and per-account actions. It could never have pointed at
+# `pubkey`: the DB constraint valid_field_role_field_type requires creatorId to name a
+# RELATED_ITEM field, and `pubkey` is a STRING. The role and the field it names have to
+# arrive together, which is why they are in the same change.
 # Profile fields (author_/reported_/reporter_) put PEOPLE on the review card instead
 # of three 64-character hex strings. The three prefixes are distinct on purpose:
 # `author` is the VERIFIED signer of the reported event, `reported` is the reporter's
@@ -97,7 +99,7 @@ echo "==> Ensuring content type 'nostr_event'"
 # resolved identity therefore sits immediately after their own pubkey rather than in a
 # block at the end; appended, the names landed below sixteen rows of hex, which
 # inverts the point of resolving them at all.
-CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"author_display_name","type":"STRING","required":false},{"name":"author_nip05","type":"STRING","required":false},{"name":"author_profile_state","type":"STRING","required":false},{"name":"author_profile_error","type":"STRING","required":false},{"name":"author_nip05_verified","type":"BOOLEAN","required":false},{"name":"author_follower_count","type":"NUMBER","required":false},{"name":"author_has_vanish_request","type":"BOOLEAN","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_display_name","type":"STRING","required":false},{"name":"reported_nip05","type":"STRING","required":false},{"name":"reported_profile_state","type":"STRING","required":false},{"name":"reported_profile_error","type":"STRING","required":false},{"name":"reported_nip05_verified","type":"BOOLEAN","required":false},{"name":"reported_follower_count","type":"NUMBER","required":false},{"name":"reported_has_vanish_request","type":"BOOLEAN","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"reporter_display_name","type":"STRING","required":false},{"name":"reporter_nip05","type":"STRING","required":false},{"name":"reporter_profile_state","type":"STRING","required":false},{"name":"reporter_profile_error","type":"STRING","required":false},{"name":"reporter_nip05_verified","type":"BOOLEAN","required":false},{"name":"reporter_follower_count","type":"NUMBER","required":false},{"name":"reporter_has_vanish_request","type":"BOOLEAN","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
+CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"author_display_name","type":"STRING","required":false},{"name":"author_nip05","type":"STRING","required":false},{"name":"author_profile_state","type":"STRING","required":false},{"name":"author_profile_error","type":"STRING","required":false},{"name":"author_nip05_verified","type":"BOOLEAN","required":false},{"name":"author_follower_count","type":"NUMBER","required":false},{"name":"author_has_vanish_request","type":"BOOLEAN","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_display_name","type":"STRING","required":false},{"name":"reported_nip05","type":"STRING","required":false},{"name":"reported_profile_state","type":"STRING","required":false},{"name":"reported_profile_error","type":"STRING","required":false},{"name":"reported_nip05_verified","type":"BOOLEAN","required":false},{"name":"reported_follower_count","type":"NUMBER","required":false},{"name":"reported_has_vanish_request","type":"BOOLEAN","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"confidence","type":"NUMBER","required":false},{"name":"model","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"reporter_display_name","type":"STRING","required":false},{"name":"reporter_nip05","type":"STRING","required":false},{"name":"reporter_profile_state","type":"STRING","required":false},{"name":"reporter_profile_error","type":"STRING","required":false},{"name":"reporter_nip05_verified","type":"BOOLEAN","required":false},{"name":"reporter_follower_count","type":"NUMBER","required":false},{"name":"reporter_has_vanish_request","type":"BOOLEAN","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
 CT_FIELD_ROLES='{"displayName":"text","creatorId":"author","threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
 CT_ID=$(type_id nostr_event)
@@ -574,10 +576,24 @@ fi
 #    Idempotent + reconciling: existing actions are UPDATED with the current
 #    callbackUrl + secret on every run, so rotating WEBHOOK_SECRET (or moving
 #    COOP_ADAPTER_URL) is just a re-run. Skipped entirely if WEBHOOK_SECRET is unset.
+#
+#    RECONCILE OVERWRITES: updateAction deletes every actions_and_item_types row for the
+#    action and reinserts, so item-type scoping added by hand in the Coop UI is discarded
+#    on the next run. Consistent with reconcile-not-skip elsewhere here, but this is the
+#    first thing the script overwrites that a human might reasonably have set there.
 # ---------------------------------------------------------------------------
 if [ -z "${WEBHOOK_SECRET:-}" ]; then
   echo "==> WEBHOOK_SECRET unset — skipping enforcement actions (step 6)."
+  # Step 1 sets creatorId, so the Associated User panel WILL render once osprey populates
+  # `author`. Scoping the four account actions to nostr_user happens only in step 6. Skip
+  # it and a moderator gets that panel with ZERO buttons -- the panel is the thing that
+  # makes account moderation look available. Say so here rather than letting the closing
+  # banner claim enforcement actions are provisioned.
+  echo "    NOTE: creatorId -> author IS set. Until this step runs with WEBHOOK_SECRET,"
+  echo "    the Associated User panel will render with no account actions on it."
+  ACTIONS_PROVISIONED=no
 else
+  ACTIONS_PROVISIONED=yes
   echo "==> Ensuring enforcement actions (-> $COOP_ADAPTER_URL/webhook/<Action>)"
   # Un-Restrict-Media is the reversal for Age-Restrict. It sends SAFE, which maps
   # to Active in Blossom and so reverses AgeRestricted, Restricted and Banned
@@ -649,7 +665,13 @@ else
   done
 fi
 
-echo "==> Done. Content type, queues, content rule, category routing, and"
-echo "    enforcement actions are provisioned. Items surface in the COOP Review"
+echo "==> Done. Content type, queues, content rule and category routing are provisioned."
+if [ "${ACTIONS_PROVISIONED:-no}" = "yes" ]; then
+  echo "    Enforcement actions are provisioned too."
+else
+  echo "    Enforcement actions were SKIPPED (no WEBHOOK_SECRET), so account actions are"
+  echo "    NOT scoped to nostr_user and the Associated User panel will have no buttons."
+fi
+echo "    Items surface in the COOP Review"
 echo "    Console once the ItemProcessingWorker (Scylla) is live; moderator"
 echo "    actions reach the relay/media stores via the deployed coop-webhook-adapter."
