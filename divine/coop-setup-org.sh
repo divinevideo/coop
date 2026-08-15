@@ -646,14 +646,19 @@ else
     echo "    WARNING: $COOP_ADAPTER_URL did not answer at all (HTTP 000). This is not specific"
     echo "    to Un-Restrict-Media: EVERY action callback written below points at that host."
     echo "    Outside the cluster this is expected, since COOP_ADAPTER_URL defaults to a service name."
-    ACTIONS_PROVISIONED=partial
-    SKIPPED_ACTIONS="all actions (adapter unreachable at $COOP_ADAPTER_URL, HTTP 000)"
+    # NOT `partial`. All nine actions get written below, to $COOP_API_URL -- a different
+    # host, already proven reachable by a dozen successful mutations earlier in this run.
+    # The config ends up complete and correct. What is unverified is whether the CALLBACKS
+    # can reach the adapter FROM WHERE THIS RAN. Reporting that as "Not done: all actions"
+    # tells an operator to re-run a script that already succeeded, and hides the real
+    # question, which is whether the adapter is up.
+    UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL did not answer from here (HTTP 000)"
   elif [ "$UNRESTRICT_STATUS" = "404" ]; then
     echo "    WARNING: adapter route /webhook/Un-Restrict-Media is not available (HTTP $UNRESTRICT_STATUS); skipping that action."
     ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
-    # The warning scrolls past nine action lines before the banner is printed. Downgrade the
-    # claim so the LAST thing on screen cannot contradict it. HTTP 000 is the DEFAULT outcome
-    # when running outside the cluster, since COOP_ADAPTER_URL defaults to a service name.
+    # The warning scrolls past nine action lines before the banner is printed, so downgrade
+    # the claim: the LAST thing on screen must not contradict it. This action genuinely is
+    # not provisioned -- it was dropped from ACTIONS_LIST above.
     ACTIONS_PROVISIONED=partial
     SKIPPED_ACTIONS="Un-Restrict-Media (route missing, HTTP 404)"
   fi
@@ -712,6 +717,11 @@ elif [ "${ACTIONS_PROVISIONED:-no}" = "partial" ]; then
 else
   echo "    Enforcement actions were SKIPPED (no WEBHOOK_SECRET), so account actions are"
   echo "    NOT scoped to nostr_user and the Associated User panel will have no buttons."
+fi
+if [ -n "${UNVERIFIED_CALLBACKS:-}" ]; then
+  echo "    NOTE: the actions above were written to Coop successfully, but $UNVERIFIED_CALLBACKS,"
+  echo "    so none of their callbacks is confirmed to reach the adapter. Coop answers a moderator"
+  echo "    202 whether or not the callback lands, so verify the adapter separately."
 fi
 echo "    Items surface in the COOP Review"
 echo "    Console once the ItemProcessingWorker (Scylla) is live; moderator"
