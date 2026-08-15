@@ -327,8 +327,13 @@ fi
 # classification fell through every specialist rule into General Review: a Hive
 # permanent_ban-tier item never reached the CSAM queue.
 #
-# Because the families are disjoint, cross-family ordering is not load-bearing. Within each
-# family CSAM must still be first (sticky, one-way, NCMEC-bound).
+# That disjointness is a property of the PRODUCERS, not something enforced here or by Coop:
+# the bridge extracts label_* only for kind 1985 and report_reason only for kind 1984, and
+# COOPSink gates each on truthiness. So cross-family ordering is not load-bearing TODAY. It
+# would become load-bearing if any producer ever emitted both. The ordering below is chosen
+# to survive that anyway -- both CSAM routes sit first -- but do not read it as a guarantee.
+# What IS load-bearing regardless: CSAM first within each family (sticky, one-way,
+# NCMEC-bound), and General Review last overall.
 CATROUTES=(
   "report_reason|CSAM|csam"
   "report_reason|Child Safety|child_safety"
@@ -372,6 +377,15 @@ for row in "${CATROUTES[@]}"; do
     report_reason) _vocab="$CANONICAL_REASONS"; _charset='^[a-z_]+$'; _srcname="osprey CANONICAL_REASONS" ;;
     label_value)   _vocab="$CANONICAL_LABEL_VALUES"; _charset='^[a-z_-]+$'; _srcname="osprey label_routing.sml" ;;
     *) echo "ERROR: route field '$_field' is not a known CONTENT_FIELD (expected report_reason or label_value)"; exit 1 ;;
+  esac
+  # The provisioner below splits with python `.split(",")`, which KEEPS empty fields;
+  # bash's `read -ra` DROPS a trailing one. That divergence let "csam," pass this guard
+  # while shipping the pattern ^$ -- which matches an EMPTY label_value and would route
+  # blank-field items straight into CSAM. Reject malformed lists before tokenizing so the
+  # two agree by construction.
+  case "${_rest#*|}" in
+    ''|*,,*|,*|*,)
+      echo "ERROR: route token list for '$_field -> ${_rest%%|*}' is malformed (empty, or a leading/trailing/double comma): '${_rest#*|}'"; exit 1 ;;
   esac
   for tok in "${_toks[@]}"; do
     if [[ ! "$tok" =~ $_charset ]]; then

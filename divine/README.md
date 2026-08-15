@@ -14,6 +14,7 @@ does not travel between environments on its own. These scripts are that missing 
 | Script | Purpose |
 |--------|---------|
 | `coop-setup-org.sh` | Idempotently bootstrap an org's moderation config: the `nostr_event` content type (matching osprey's COOPSink payload, incl. media fields), review queues mirroring relay-manager's category tiers, routing, and (when `WEBHOOK_SECRET` is set) the enforcement CUSTOM_ACTION webhooks pointing at the deployed adapter. Needs an **admin user session** (login email/password), not just the org API key. |
+| `test-coop-setup-guards.sh` | Guard tests for `coop-setup-org.sh`'s routing vocabulary and charset checks. Runs the **shipped** `CATROUTES` through its own guard, plus positive controls that must each go red. Run it after editing the routing config: `bash divine/test-coop-setup-guards.sh`. No credentials or network needed. |
 | `coop-bridge-import.sh` | Pull live kind-1984 reports from relay-manager and submit them to COOP for review (demo bridge). |
 
 ## Usage
