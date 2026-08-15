@@ -8,10 +8,10 @@
 #
 # TWO extractions, deliberately:
 #   REAL_BLOCK  starts at CATROUTES, so it carries the SHIPPED routing array and the
-#               guard validates the config we actually provision. An earlier version of
-#               this file started below CATROUTES and re-declared the array by hand --
-#               which meant poisoning the real CSAM route left these tests green. The
-#               config is the artifact worth testing; a hand-copy of it is not.
+#               guard validates the config we actually provision. It stops at the first
+#               provisioning loop, not the guard loop, so a route added below the guard's
+#               one execution point is still visible to the routing-table assertion.
+#               The config is the artifact worth testing; a hand-copy of it is not.
 #   GUARD_ONLY  starts at CANONICAL_REASONS, for driving synthetic rows.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -19,8 +19,8 @@ SRC=divine/coop-setup-org.sh
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT   # not fixed /tmp paths: concurrent runs
                                                   # clobbered each other, and a shared host
                                                   # let another user pre-create them.
-awk '/^CATROUTES=/,/^done$/'          "$SRC" > "$WORK/real.sh"
-awk '/^CANONICAL_REASONS=/,/^done$/'  "$SRC" > "$WORK/guard.sh"
+awk '/^CATROUTES=/,/^echo "==> Ensuring category routing rules"/ { if ($0 !~ /^echo "==> Ensuring category routing rules"/) print }' "$SRC" > "$WORK/real.sh"
+awk '/^CANONICAL_REASONS=/,/^done$/' "$SRC" > "$WORK/guard.sh"
 
 # Refuse to run at all if either extraction missed -- a silently-empty range is exactly
 # the vacuous pass these tests exist to prevent.
@@ -70,9 +70,10 @@ report_reason|Violence & Extremism|violence
 TRIPLES
 )
 EXPECTED=$(printf '%s\n' "$EXPECTED" | LC_ALL=C sort)   # order-insensitive: add routes anywhere
-# The guard runs ONCE, at a fixed point. A row appended below it (CATROUTES+=(...)) is
-# unvalidated by the guard and invisible to the triple check, which reads only the literal
-# declaration. So require exactly one assignment and no appends anywhere in the file.
+# The guard runs ONCE, at a fixed point. A row appended below it is unvalidated by the
+# guard but still changes what the provisioning loop sees, so the dump below must include
+# everything up to the first route use. Also require exactly one direct assignment to keep
+# the routing table declaration easy to audit.
 _assigns=$(grep -cE '^[[:space:]]*CATROUTES\+?=' "$SRC" || true)
 if [ "$_assigns" -ne 1 ]; then
   echo "  FAIL  CATROUTES is assigned/appended $_assigns times; expected exactly 1."
@@ -94,8 +95,32 @@ if [ "$ACTUAL" = "$EXPECTED" ]; then
   echo "  ok    $(printf '%s\n' "$ACTUAL" | grep -c .) routes, each to its intended queue"
 else
   echo "  FAIL  shipped routing table differs from the expected triples:"
-  diff <(printf '%s\n' "$EXPECTED") <(printf '%s\n' "$ACTUAL") | sed 's/^/        /'
+  diff <(printf '%s\n' "$EXPECTED") <(printf '%s\n' "$ACTUAL") | sed 's/^/        /' || true
   echo "        If this change is intended, update EXPECTED in this file in the same commit."
+  fails=$((fails+1))
+fi
+
+echo "the shipped priority list covers every category route:"
+EXPECTED_PRIORITY=$(printf '%s\n' "$ACTUAL" | awk -F'|' '{ print $1 " -> " $2 }')
+ACTUAL_PRIORITY=$(python3 - "$SRC" <<'PY'
+import ast
+import re
+import sys
+
+src = open(sys.argv[1], encoding="utf-8").read()
+match = re.search(r"priority = \[(.*?)\]", src, re.S)
+if not match:
+    raise SystemExit("priority list not found")
+priority = ast.literal_eval("[" + match.group(1) + "]")
+print("\n".join(sorted(priority)))
+PY
+)
+if [ "$ACTUAL_PRIORITY" = "$EXPECTED_PRIORITY" ]; then
+  echo "  ok    priority names match CATROUTES"
+else
+  echo "  FAIL  priority list differs from CATROUTES-derived route names:"
+  diff <(printf '%s\n' "$EXPECTED_PRIORITY") <(printf '%s\n' "$ACTUAL_PRIORITY") | sed 's/^/        /' || true
+  echo "        Every CATROUTES row needs a priority entry so new category routes cannot fall into the unordered bucket."
   fails=$((fails+1))
 fi
 

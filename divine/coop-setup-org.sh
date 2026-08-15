@@ -163,21 +163,50 @@ echo "    nostr_user typeId = $UT_ID  (COOPSink needs this as DIVINE_COOP_USER_T
 # path that feeds the relay-manager age-review case system. Moderators can move a
 # job between queues (transformJobAndRecreateInQueue) when a report needs recategorizing.
 QUEUES=(
-  "CSAM|false|report_reason 'csam'. Sticky/one-way; route to NCMEC. Keep undiluted by ambiguous reports."
+  "CSAM|false|Confirmed CSAM from report_reason 'csam' or label_value 'csam'/'sexual_minors'. Sticky/one-way; route to NCMEC. Keep undiluted by ambiguous reports."
   "Child Safety|false|report_reason 'child_safety' (divine-mobile childSafety). Child-safety concerns distinct from CSAM; a moderator escalates to CSAM/NCMEC if warranted."
   "Age Review|false|report_reason 'underage_user' (divine-mobile underageUser). Underage-user reports; feeds the relay-manager age-review case system (15-day clock, age tiers, suspension). See docs/moderation/under-16-system-coordination.md."
-  "Sexual Content|false|report_reason 'nudity' (web sexual-content, mobile sexualContent + aliases). Age-restrict candidates."
-  "Violence & Extremism|false|report_reason 'violence'."
+  "Sexual Content|false|Sexual content from report_reason 'nudity' or label_value 'nudity'/'sexual'/'explicit'/'pornography'. Age-restrict candidates."
+  "Violence & Extremism|false|Violence and extremism from report_reason 'violence' or label_value 'violence'/'gore'/'graphic-violence'."
   "Harassment, Threats & Safety|false|report_reason 'harassment'."
   "General Review|false|Default catch-all: spam, impersonation, copyright, false-info/other, ai_generated, illegal, malware."
   "Appeals|true|User appeals of moderation decisions."
 )
 echo "==> Ensuring review queues"
-EXISTING_Q=$(gql 'query { myOrg { mrtQueues { id name } } }')
+EXISTING_Q=$(gql 'query { myOrg { mrtQueues { id name description autoCloseJobs explicitlyAssignedReviewers { id } } } }')
 for row in "${QUEUES[@]}"; do
   NAME="${row%%|*}"; rest="${row#*|}"; APPEALS="${rest%%|*}"; DESC="${rest#*|}"
   if echo "$EXISTING_Q" | grep -qF "\"$NAME\""; then
-    echo "    '$NAME' exists, skipping"
+    QV=$(echo "$EXISTING_Q" | python3 -c '
+import json,sys
+name,desc = sys.argv[1],sys.argv[2]
+queues = json.load(sys.stdin)["data"]["myOrg"]["mrtQueues"]
+q = next((q for q in queues if q.get("name") == name), None)
+if not q:
+    raise SystemExit("queue not found")
+if q.get("description") == desc:
+    print("")
+else:
+    print(json.dumps({"input":{
+        "id": q["id"],
+        "name": name,
+        "description": desc,
+        "autoCloseJobs": bool(q.get("autoCloseJobs")),
+        "userIds": [u["id"] for u in (q.get("explicitlyAssignedReviewers") or [])],
+        "actionIdsToHide": [],
+        "actionIdsToUnhide": [],
+    }}))' "$NAME" "$DESC")
+    if [ -z "$QV" ]; then
+      echo "    '$NAME' exists, skipping"
+    else
+      RESP=$(gql 'mutation UQ($input: UpdateManualReviewQueueInput!){ updateManualReviewQueue(input:$input){ __typename } }' "$QV")
+      if echo "$RESP" | grep -q '"__typename":"MutateManualReviewQueueSuccessResponse"'; then
+        echo "    '$NAME' description reconciled"
+      else
+        echo "    ERROR: queue update failed for '$NAME': $(echo "$RESP" | tr '\n' ' ' | head -c 300)"
+        exit 1
+      fi
+    fi
     continue
   fi
   QV=$(python3 -c 'import json,sys; print(json.dumps({"input":{"name":sys.argv[1],"description":sys.argv[2],"autoCloseJobs":False,"isAppealsQueue":sys.argv[3]=="true","hiddenActionIds":[],"userIds":[]}}))' "$NAME" "$DESC" "$APPEALS")
@@ -289,19 +318,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5) Category routing rules: report_reason matches <canonical token> -> category queue.
+# 5) Category routing rules: CONTENT_FIELD matches <canonical token> -> category queue.
 #    First-match-wins by sequence, so CSAM is ordered FIRST (sticky, one-way, must
 #    reach NCMEC — docs/moderation/moderation-category-handling-principles.md), then
 #    Child Safety, Age Review, Sexual, Violence, Harassment, with General Review
 #    ordered LAST in step 5b.
 #
-#    EXACT MATCH: report_reason holds a single canonical token, so each rule must
+#    EXACT MATCH: each routed field holds a single canonical token, so each rule must
 #    match that token EXACTLY. COOP exposes no equality signal (only CONTAINS_TEXT,
 #    CONTAINS_REGEX, CONTAINS_VARIANT and their NOT forms), and plain CONTAINS_TEXT is
 #    a substring test — 'not_csam' would match the CSAM route into the sticky, one-way,
 #    NCMEC-bound queue. So we use TEXT_MATCHING_CONTAINS_REGEX with an anchored pattern
-#    ^<token>$ (the signal compiles it case-insensitively). Tokens are [a-z_] only
-#    (enforced by the guard below), so no regex escaping is needed.
+#    ^<token>$ (the signal compiles it case-insensitively). The guard below enforces a
+#    per-field token charset that contains no regex metacharacters, so no escaping is needed.
 #
 #    Tokens are the canonical report_reason values from the bridge's CANONICAL_REASONS
 #    (osprey divine/nostr-kafka-bridge/main.py), the single source of truth. Ownership
@@ -334,7 +363,7 @@ fi
 # That disjointness is a property of the PRODUCERS, not something enforced here or by Coop:
 # the bridge extracts label_* only for kind 1985 and report_reason only for kind 1984. Note
 # COOPSink writes label_value UNCONDITIONALLY in its ai_detector_nsfw branch, so that is the
-# one path that could ever submit an empty one. So cross-family ordering is not load-bearing TODAY. It
+# one path that could ever submit an empty one. Cross-family ordering is not load-bearing today. It
 # would become load-bearing if any producer ever emitted both. The ordering below is chosen
 # to survive that anyway -- both CSAM routes sit first -- but do not read it as a guarantee.
 # What IS load-bearing regardless: CSAM first within each family (sticky, one-way,
@@ -356,8 +385,7 @@ CATROUTES=(
 # Guard: every routed token MUST be in the canonical vocabulary -- a subset of osprey's
 # CANONICAL_REASONS (divine/nostr-kafka-bridge/main.py). Vendored here because coop and
 # osprey share no runtime; this fails loud on drift (a typo, or a token Osprey can't
-# emit) instead of silently provisioning a queue nothing can route to. Tokens are also
-# constrained to [a-z_] so the anchored regex above needs no escaping.
+# emit) instead of silently provisioning a queue nothing can route to.
 CANONICAL_REASONS=" csam illegal child_safety harassment nudity violence ai_generated underage_user spam impersonation other "
 # label_value is a SEPARATE vocabulary with a separate source of truth: the content-warning
 # values matched by osprey divine/rules/rules/content/label_routing.sml. Validating label
@@ -433,7 +461,8 @@ print(next((r["id"] for r in org["routingRules"] if r.get("name")==sys.argv[1]),
   # Desired input. Create and Update take the same fields; Update adds the id.
   # Anchored regex per token = exact match (COOP has no equality signal). The signal
   # compiles each string case-insensitively, so ^<token>$ matches the token exactly and
-  # rejects substrings like not_csam. Tokens are [a-z_] (guarded), so no escaping needed.
+  # rejects substrings like not_csam. Guarded token charsets contain no regex metacharacters,
+  # so no escaping is needed.
   IN=$(RID="$RID" python3 -c '
 import json,os,sys
 tid,qid,name = sys.argv[1],sys.argv[2],sys.argv[3]
@@ -474,10 +503,9 @@ import json,sys
 rules = json.load(sys.stdin)["data"]["myOrg"]["routingRules"]
 by = {r["name"]: r["id"] for r in rules}
 GENERAL = "nostr_event -> General Review"
-# Category routes in priority order, WITHOUT the catch-all.
-# The two families are disjoint (an item has report_reason XOR label_value), so their
-# relative order cannot change any outcome. What IS load-bearing: CSAM first within each
-# family, and General Review last overall (appended below).
+# Category routes in priority order, WITHOUT the catch-all. Current producers keep
+# report_reason and label_value separate, but Coop does not enforce that. Keep both CSAM
+# routes before every other category, and General Review last overall (appended below).
 priority = [
   "report_reason -> CSAM",
   "label_value -> CSAM",
