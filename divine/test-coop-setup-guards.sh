@@ -21,6 +21,13 @@ WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT   # not fixed /tmp paths: concur
                                                   # let another user pre-create them.
 awk '/^CATROUTES=/,/^echo "==> Ensuring category routing rules"/ { if ($0 !~ /^echo "==> Ensuring category routing rules"/) print }' "$SRC" > "$WORK/real.sh"
 awk '/^CANONICAL_REASONS=/,/^done$/' "$SRC" > "$WORK/guard.sh"
+awk '/^print_done_banner\(\)/{flag=1} flag{print} flag && /^}/{exit}' "$SRC" > "$WORK/banner.sh"
+awk '/^record_adapter_probe_status\(\)/{flag=1} flag{print} flag && /^}/{exit}' "$SRC" > "$WORK/probe.sh"
+awk '
+  /^  ACCOUNT_ACTIONS=/{flag=1}
+  /^  if \[ "\${COOP_ACCOUNT_ACTIONS:-0}" = "1" \]; then/{flag=0}
+  flag{sub(/^  /, ""); print}
+' "$SRC" > "$WORK/action_scope.sh"
 
 # Refuse to run at all if either extraction missed -- a silently-empty range is exactly
 # the vacuous pass these tests exist to prevent.
@@ -28,6 +35,9 @@ grep -q '^CATROUTES=(' "$WORK/real.sh"        || { echo "FATAL: CATROUTES not ca
 grep -q 'CANONICAL_LABEL_VALUES=' "$WORK/real.sh" || { echo "FATAL: vocab not captured"; exit 1; }
 grep -q 'for tok in' "$WORK/guard.sh"         || { echo "FATAL: guard loop not captured"; exit 1; }
 grep -q 'for tok in' "$WORK/real.sh"         || { echo "FATAL: shipped-config range does not reach the guard loop"; exit 1; }
+grep -q '^print_done_banner' "$WORK/banner.sh" || { echo "FATAL: final banner function not captured"; exit 1; }
+grep -q '^record_adapter_probe_status' "$WORK/probe.sh" || { echo "FATAL: probe function not captured"; exit 1; }
+grep -q '^action_type_ids_json' "$WORK/action_scope.sh" || { echo "FATAL: action scope function not captured"; exit 1; }
 fails=0
 
 # Production runs under `set -euo pipefail`, so the CHILD must too. Options are
@@ -42,6 +52,14 @@ check() { # name expect_rc rows...
     cat "$WORK/guard.sh"; } > "$WORK/case.sh"
   local out rc
   out=$(run "$WORK/case.sh") && rc=0 || rc=$?
+  if [ "$rc" -eq "$expect" ]; then printf '  ok    %s\n' "$name"
+  else printf '  FAIL  %s (rc=%s want=%s) %s\n' "$name" "$rc" "$expect" "$out"; fails=$((fails+1)); fi
+}
+
+check_script() { # name expect_rc script
+  local name="$1" expect="$2" script="$3"
+  local out rc
+  out=$(run "$script") && rc=0 || rc=$?
   if [ "$rc" -eq "$expect" ]; then printf '  ok    %s\n' "$name"
   else printf '  FAIL  %s (rc=%s want=%s) %s\n' "$name" "$rc" "$expect" "$out"; fails=$((fails+1)); fi
 }
@@ -125,7 +143,8 @@ else
 fi
 
 echo "the shipped account-moderation config is internally consistent:"
-python3 - "$SRC" <<'PY'
+cat > "$WORK/content_fields.check" <<'SH'
+python3 - "$1" <<'PY'
 import json
 import re
 import sys
@@ -148,26 +167,12 @@ if author != {"name": "author", "type": "RELATED_ITEM", "required": False}:
 if roles.get("creatorId") != "author":
     raise SystemExit(f"FAIL: creatorId role does not reference author: {roles.get('creatorId')!r}")
 
-expected_profile_fields = {
-    f"{prefix}_{suffix}": field_type
-    for prefix in ("author", "reported", "reporter")
-    for suffix, field_type in (
-        ("display_name", "STRING"),
-        ("nip05", "STRING"),
-        ("profile_state", "STRING"),
-        ("profile_error", "STRING"),
-        ("nip05_verified", "BOOLEAN"),
-        ("follower_count", "NUMBER"),
-        ("has_vanish_request", "BOOLEAN"),
-    )
-}
-for name, field_type in expected_profile_fields.items():
-    field = by_name.get(name)
-    if field is None or field.get("type") != field_type or field.get("required") is not False:
-        raise SystemExit(f"FAIL: unexpected profile field declaration for {name}: {field!r}")
-
-print("  ok    creatorId targets the author RELATED_ITEM and all profile field types match")
+for name in ["author_display_name", "reported_display_name", "reporter_display_name", "author_follower_count", "author_has_vanish_request"]:
+    if name in by_name:
+        raise SystemExit(f"FAIL: {name} belongs with the producer branch, not this setup change")
 PY
+SH
+check_script "creatorId targets author RELATED_ITEM without unreviewed profile fields" 0 <(printf 'bash %q %q\n' "$WORK/content_fields.check" "$SRC")
 
 ACTION_BLOCK="$WORK/actions.sh"
 awk '/^  ACTIONS_LIST=/,/^  UNRESTRICT_STATUS=/' "$SRC" | sed '$d' > "$ACTION_BLOCK"
@@ -179,28 +184,42 @@ else
     printf 'TID=event-type\nUT_ID=user-type\n'
     cat "$ACTION_BLOCK"
     cat <<'SH'
+COOP_ACCOUNT_ACTIONS=0
 for action in "${ACTIONS_LIST[@]}"; do
-  printf '%s|%s\n' "$action" "$(action_type_ids_json "$action")"
+  printf 'default:%s|%s\n' "$action" "$(action_type_ids_json "$action")"
+done
+COOP_ACCOUNT_ACTIONS=1
+for action in "${ACTIONS_LIST[@]}"; do
+  printf 'opt-in:%s|%s\n' "$action" "$(action_type_ids_json "$action")"
 done
 SH
   } > "$WORK/action-scopes.sh"
-  ACTION_SCOPES=$(bash -euo pipefail "$WORK/action-scopes.sh")
+  ACTION_SCOPES=$(bash -euo pipefail "$WORK/action-scopes.sh" | grep '|')
   EXPECTED_ACTION_SCOPES=$(cat <<'SCOPES'
-Ban-User|["event-type", "user-type"]
-Suspend-User|["event-type", "user-type"]
-Unban-User|["event-type", "user-type"]
-Unsuspend-User|["event-type", "user-type"]
-Delete-Content|["event-type"]
-Hide-Content|["event-type"]
-Restore-Content|["event-type"]
-Age-Restrict|["event-type"]
-Un-Restrict-Media|["event-type"]
+default:Age-Restrict|["event-type"]
+default:Ban-User|["event-type"]
+default:Delete-Content|["event-type"]
+default:Hide-Content|["event-type"]
+default:Restore-Content|["event-type"]
+default:Suspend-User|["event-type"]
+default:Un-Restrict-Media|["event-type"]
+default:Unban-User|["event-type"]
+default:Unsuspend-User|["event-type"]
+opt-in:Age-Restrict|["event-type"]
+opt-in:Ban-User|["event-type", "user-type"]
+opt-in:Delete-Content|["event-type"]
+opt-in:Hide-Content|["event-type"]
+opt-in:Restore-Content|["event-type"]
+opt-in:Suspend-User|["event-type", "user-type"]
+opt-in:Un-Restrict-Media|["event-type"]
+opt-in:Unban-User|["event-type", "user-type"]
+opt-in:Unsuspend-User|["event-type", "user-type"]
 SCOPES
   )
   SORTED_ACTION_SCOPES=$(printf '%s\n' "$ACTION_SCOPES" | LC_ALL=C sort)
   SORTED_EXPECTED_ACTION_SCOPES=$(printf '%s\n' "$EXPECTED_ACTION_SCOPES" | LC_ALL=C sort)
   if [ "$SORTED_ACTION_SCOPES" = "$SORTED_EXPECTED_ACTION_SCOPES" ]; then
-    echo "  ok    account actions span event and user types; content actions remain event-only"
+    echo "  ok    account actions add nostr_user only when COOP_ACCOUNT_ACTIONS=1"
   else
     echo "  FAIL  shipped action set or scopes differ from the required config:"
     diff <(printf '%s\n' "$EXPECTED_ACTION_SCOPES") <(printf '%s\n' "$ACTION_SCOPES") | sed 's/^/        /' || true
@@ -220,12 +239,80 @@ for payload in UV AV; do
   fi
 done
 
-if [ "$(grep -cF 'adapter handles nostr_user item targets' "$SRC")" -eq 2 ]; then
-  echo "  ok    adapter compatibility appears in both the step warning and final banner"
+if [ "$(grep -cF 'adapter handles nostr_user action targets' "$SRC")" -ge 2 ]; then
+  echo "  ok    adapter compatibility appears in usage, step warning, or final banner"
 else
   echo "  FAIL  adapter compatibility warning is missing"
   fails=$((fails+1))
 fi
+
+echo "enforcement action scoping:"
+cat > "$WORK/action_scope.check" <<'SH'
+TID=nostr-event-type
+UT_ID=nostr-user-type
+. "$1"
+[ "$(COOP_ACCOUNT_ACTIONS=0 action_type_ids_json Ban-User)" = '["nostr-event-type"]' ]
+[ "$(COOP_ACCOUNT_ACTIONS=1 action_type_ids_json Ban-User)" = '["nostr-event-type", "nostr-user-type"]' ]
+[ "$(COOP_ACCOUNT_ACTIONS=1 action_type_ids_json Delete-Content)" = '["nostr-event-type"]' ]
+SH
+check_script "nostr_user action scope is opt-in and content actions stay content-only" 0 <(printf 'bash %q %q\n' "$WORK/action_scope.check" "$WORK/action_scope.sh")
+
+echo "adapter probe classification:"
+cat > "$WORK/probe_status.check" <<'SH'
+. "$1"
+
+COOP_ADAPTER_URL=http://adapter
+ACTIONS_LIST=(Ban-User Un-Restrict-Media)
+ACTIONS_PROVISIONED=yes
+SKIPPED_ACTIONS=""
+UNVERIFIED_CALLBACKS=""
+UNRESTRICT_STATUS=503
+record_adapter_probe_status >/dev/null
+[ "$ACTIONS_PROVISIONED" = yes ]
+case "$UNVERIFIED_CALLBACKS" in *503*) ;; *) exit 1 ;; esac
+
+ACTIONS_LIST=(Ban-User Un-Restrict-Media)
+ACTIONS_PROVISIONED=yes
+SKIPPED_ACTIONS=""
+UNVERIFIED_CALLBACKS=""
+UNRESTRICT_STATUS=404
+record_adapter_probe_status >/dev/null
+[ "$ACTIONS_PROVISIONED" = partial ]
+[ "${ACTIONS_LIST[*]}" = "Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict" ]
+case "$SKIPPED_ACTIONS" in *Un-Restrict-Media*) ;; *) exit 1 ;; esac
+
+ACTIONS_LIST=(Ban-User Un-Restrict-Media)
+ACTIONS_PROVISIONED=yes
+SKIPPED_ACTIONS=""
+UNVERIFIED_CALLBACKS=""
+UNRESTRICT_STATUS=000
+record_adapter_probe_status >/dev/null
+[ "$ACTIONS_PROVISIONED" = yes ]
+case "$UNVERIFIED_CALLBACKS" in *000*) ;; *) exit 1 ;; esac
+SH
+check_script "000/404/5xx probe statuses set distinct banner state" 0 <(printf 'bash %q %q\n' "$WORK/probe_status.check" "$WORK/probe.sh")
+
+echo "final banner states:"
+cat > "$WORK/banner.check" <<'SH'
+. "$1"
+
+ACTIONS_PROVISIONED=yes
+SKIPPED_ACTIONS=""
+UNVERIFIED_CALLBACKS=""
+COOP_ACCOUNT_ACTIONS=0
+out=$(print_done_banner)
+case "$out" in *"Account action buttons are NOT enabled for nostr_user"*) ;; *) exit 1 ;; esac
+case "$out" in *"callbacks is confirmed"*) exit 1 ;; esac
+
+ACTIONS_PROVISIONED=partial
+SKIPPED_ACTIONS="Un-Restrict-Media"
+UNVERIFIED_CALLBACKS="adapter returned HTTP 503"
+COOP_ACCOUNT_ACTIONS=1
+out=$(print_done_banner)
+case "$out" in *"PARTIALLY provisioned"*"Un-Restrict-Media"*503*) ;; *) exit 1 ;; esac
+case "$out" in *"Account action buttons are NOT enabled"*) exit 1 ;; esac
+SH
+check_script "banner reports action and callback state without inherited leakage" 0 <(printf 'bash %q %q\n' "$WORK/banner.check" "$WORK/banner.sh")
 
 echo "accepted:"
 check "hyphenated label token (the old [a-z_] charset rejected these)" 0 \

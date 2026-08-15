@@ -16,6 +16,8 @@
 #   # supply the shared webhook secret (omit WEBHOOK_SECRET to skip step 6):
 #   export COOP_ADAPTER_URL=http://coop-webhook-adapter:3456   # default
 #   export WEBHOOK_SECRET=...             # MUST match the adapter's WEBHOOK_SECRET env
+#   # Optional: only after the adapter handles nostr_user action targets:
+#   export COOP_ACCOUNT_ACTIONS=1         # also scope account actions to nostr_user
 #   ./divine/coop-setup-org.sh
 #
 # Requires: curl, python3. The login user must be an org ADMIN (admin GraphQL
@@ -69,46 +71,14 @@ echo "==> Ensuring content type 'nostr_event'"
 # `pubkey`: the DB constraint valid_field_role_field_type requires creatorId to name a
 # RELATED_ITEM field, and `pubkey` is a STRING. The role and the field it names have to
 # arrive together, which is why they are in the same change.
-# NOT declared: `confidence` and `model`. The detector branch emits them with DEFAULTS
-# rather than omitting -- `model: ''` and `confidence: 0` when the features are absent --
-# and declaring a field is what turns it from ignored into rendered. That would put a blank
-# row on the card (see the warning below) and a `0` a moderator reads as "the model was 0%
-# confident" when it means "not reported". Declare them once the emitter omits them like
-# every other field in build_content_fields does.
+# NOT declared yet: profile/enrichment fields such as author_display_name,
+# confidence, model, follower counts, and vanish-request booleans. Declaring a
+# field is what turns producer output from ignored into rendered. Those fields
+# belong with the producer branch that proves exact names and omits unknown
+# values rather than sending defaults like "", 0, or false that moderators would
+# read as real facts.
 #
-# Profile fields (author_/reported_/reporter_) put PEOPLE on the review card instead
-# of three 64-character hex strings. The three prefixes are distinct on purpose:
-# `author` is the VERIFIED signer of the reported event, `reported` is the reporter's
-# unverified claim about who is responsible, and `reporter` is whoever filed it.
-#
-# TYPE CHOICES ARE LOAD-BEARING. Coop has two renderers. The review card shows every
-# declared field, but the QUEUE PREVIEW uses getPrimaryContentFields, which filters to
-# STRING/URL/IMAGE/VIDEO/AUDIO and silently drops BOOLEAN and NUMBER
-# (client/src/utils/itemUtils.ts:112-118). So anything a moderator must not miss while
-# scanning is a STRING -- which is why nip05 carries its own '(verified)' /
-# '(UNVERIFIED)' suffix rather than relying on the boolean beside it. An unverified
-# nip05 that reads as established identity is an impersonation vector on the
-# moderator's own screen.
-#
-# `_profile_state` distinguishes 'this account published no profile' from 'we could not
-# look it up'; funnelcake answers 200 with a null profile for an unknown pubkey, so a
-# blank name cannot tell them apart. `_profile_error` carries the reason, because
-# 'HTTP 500 Unable To Extract Key!' names the rate limiter and 'timed out' does not.
-#
-# Empty values are omitted by the sink, so a typical item populates only a handful of
-# these despite the field count. That tidiness depends on the sink OMITTING rather than
-# sending "": FieldComponent skips only `undefined`, so an empty string renders a
-# visible blank row.
-#
-# FIELD ORDER IS LAYOUT. The card sorts stably with only one rule -- media last
-# (ManualReviewJobFieldsComponent.tsx:558-583) -- so declaration order is what a
-# moderator reads top to bottom, and the queue preview inherits it. Each person's
-# resolved identity therefore sits immediately after the pubkey it belongs to, where one
-# is emitted -- osprey sends no reporter_pubkey (coop_sink.py uses the reporter's key only
-# to choose the profile prefix), so that block carries names with no key beside them.
-# Appended instead, the names would land below sixteen rows of hex, which inverts the
-# point of resolving them at all.
-CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"author_display_name","type":"STRING","required":false},{"name":"author_nip05","type":"STRING","required":false},{"name":"author_profile_state","type":"STRING","required":false},{"name":"author_profile_error","type":"STRING","required":false},{"name":"author_nip05_verified","type":"BOOLEAN","required":false},{"name":"author_follower_count","type":"NUMBER","required":false},{"name":"author_has_vanish_request","type":"BOOLEAN","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_display_name","type":"STRING","required":false},{"name":"reported_nip05","type":"STRING","required":false},{"name":"reported_profile_state","type":"STRING","required":false},{"name":"reported_profile_error","type":"STRING","required":false},{"name":"reported_nip05_verified","type":"BOOLEAN","required":false},{"name":"reported_follower_count","type":"NUMBER","required":false},{"name":"reported_has_vanish_request","type":"BOOLEAN","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"reporter_display_name","type":"STRING","required":false},{"name":"reporter_nip05","type":"STRING","required":false},{"name":"reporter_profile_state","type":"STRING","required":false},{"name":"reporter_profile_error","type":"STRING","required":false},{"name":"reporter_nip05_verified","type":"BOOLEAN","required":false},{"name":"reporter_follower_count","type":"NUMBER","required":false},{"name":"reporter_has_vanish_request","type":"BOOLEAN","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
+CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
 CT_FIELD_ROLES='{"displayName":"text","creatorId":"author","threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
 CT_ID=$(type_id nostr_event)
@@ -574,6 +544,62 @@ else
   echo "    ERROR: reorder failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
 fi
 
+print_done_banner() {
+  echo "==> Done. Content type, queues, content rule and category routing are provisioned."
+  if [ "${ACTIONS_PROVISIONED:-no}" = "yes" ]; then
+    echo "    Enforcement actions are provisioned too."
+  elif [ "${ACTIONS_PROVISIONED:-no}" = "partial" ]; then
+    echo "    Enforcement actions are only PARTIALLY provisioned. Not done: ${SKIPPED_ACTIONS:-unknown}."
+    echo "    Those actions will not reach the adapter, or still carry an old secret."
+  else
+    echo "    Enforcement actions were SKIPPED (no WEBHOOK_SECRET), so account actions are"
+    echo "    NOT scoped to nostr_user and the Associated User panel will have no buttons."
+  fi
+  if [ "${COOP_ACCOUNT_ACTIONS:-0}" != "1" ]; then
+    echo "    Account action buttons are NOT enabled for nostr_user. Set COOP_ACCOUNT_ACTIONS=1"
+    echo "    only after the adapter can handle nostr_user action targets."
+  fi
+  if [ -n "${UNVERIFIED_CALLBACKS:-}" ]; then
+    echo "    NOTE: the actions above were written to Coop successfully, but $UNVERIFIED_CALLBACKS,"
+    echo "    so none of their callbacks is confirmed to reach the adapter. Coop answers a moderator"
+    echo "    202 whether or not the callback lands, so verify the adapter separately."
+  fi
+  echo "    Items surface in the COOP Review"
+  echo "    Console once the ItemProcessingWorker (Scylla) is live; moderator"
+  echo "    actions reach the relay/media stores via the deployed coop-webhook-adapter."
+}
+
+record_adapter_probe_status() {
+  case "$UNRESTRICT_STATUS" in
+    000)
+      echo "    WARNING: $COOP_ADAPTER_URL did not answer at all (HTTP 000). This is not specific"
+      echo "    to Un-Restrict-Media: EVERY action callback written below points at that host."
+      echo "    Outside the cluster this is expected, since COOP_ADAPTER_URL defaults to a service name."
+      # NOT `partial`. All nine actions get written below, to $COOP_API_URL -- a different
+      # host, already proven reachable by a dozen successful mutations earlier in this run.
+      # The config ends up complete and correct. What is unverified is whether the CALLBACKS
+      # can reach the adapter FROM WHERE THIS RAN. Reporting that as "Not done: all actions"
+      # tells an operator to re-run a script that already succeeded, and hides the real
+      # question, which is whether the adapter is up.
+      UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL did not answer from here (HTTP 000)"
+      ;;
+    404)
+      echo "    WARNING: adapter route /webhook/Un-Restrict-Media is not available (HTTP $UNRESTRICT_STATUS); skipping that action."
+      ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
+      # The warning scrolls past nine action lines before the banner is printed, so downgrade
+      # the claim: the LAST thing on screen must not contradict it. This action genuinely is
+      # not provisioned -- it was dropped from ACTIONS_LIST above.
+      ACTIONS_PROVISIONED=partial
+      SKIPPED_ACTIONS="Un-Restrict-Media (route missing, HTTP 404)"
+      ;;
+    5??)
+      echo "    WARNING: $COOP_ADAPTER_URL answered HTTP $UNRESTRICT_STATUS during the route probe."
+      echo "    The actions below can be written, but callback delivery is not confirmed."
+      UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL answered HTTP $UNRESTRICT_STATUS from here"
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # 6) Enforcement actions (CUSTOM_ACTION webhooks -> coop-webhook-adapter). Each
 #    action POSTs to the adapter, which translates to relay-manager NIP-86
@@ -607,6 +633,7 @@ else
   # the caller's shell would be prepended into the "Not done" list and name an action that
   # is perfectly fine. The message added to stop the banner lying must not itself lie.
   SKIPPED_ACTIONS=""
+  UNVERIFIED_CALLBACKS=""
   echo "==> Ensuring enforcement actions (-> $COOP_ADAPTER_URL/webhook/<Action>)"
   echo "    WARNING: verify the adapter handles nostr_user item targets before using"
   echo "    account actions; otherwise the Associated User buttons return an error."
@@ -620,54 +647,30 @@ else
   # so an account action scoped to nostr_event renders NO button on the Associated
   # User panel and the feature looks broken while being fully configured.
   ACCOUNT_ACTIONS="Ban-User Suspend-User Unban-User Unsuspend-User"
-  # Account actions span BOTH types, and that is deliberate rather than lazy.
-  # Scoping them to nostr_user ALONE would be a regression: the job's main action
-  # bar filters by the ITEM's type
-  # (ManualReviewJobReview.tsx:849-853, `action.itemTypes...includes(payload.item.type.id)`),
-  # so Ban-User is on that bar today for a content item, and the adapter makes it
-  # work by resolving the event's author. Narrowing it would remove a working
-  # button before the Associated User panel is able to render one -- moderators
-  # would lose the capability in between. Spanning both is strictly additive: the
-  # content-item route keeps working, and the same action also appears on the
-  # Associated User panel once `author` is populated.
+  # Account actions may span BOTH types, but only after the adapter has the matching
+  # nostr_user target branch. Before that, the Associated User panel would enqueue
+  # itemId=<pubkey>, itemTypeId=<nostr_user>, while older adapters treat itemId as
+  # an event id and 400 after Coop has already answered the moderator 202. Default
+  # off keeps reconcile safe until the adapter branch lands.
   action_type_ids_json() {
     case " $ACCOUNT_ACTIONS " in
-      *" $1 "*) python3 -c 'import json,sys;print(json.dumps([sys.argv[1],sys.argv[2]]))' "$TID" "$UT_ID" ;;
+      *" $1 "*) if [ "${COOP_ACCOUNT_ACTIONS:-0}" = "1" ]; then
+          python3 -c 'import json,sys;print(json.dumps([sys.argv[1],sys.argv[2]]))' "$TID" "$UT_ID"
+        else
+          python3 -c 'import json,sys;print(json.dumps([sys.argv[1]]))' "$TID"
+        fi ;;
       *)        python3 -c 'import json,sys;print(json.dumps([sys.argv[1]]))' "$TID" ;;
     esac
   }
+  if [ "${COOP_ACCOUNT_ACTIONS:-0}" = "1" ]; then
+    echo "    COOP_ACCOUNT_ACTIONS=1: account actions will also be scoped to nostr_user."
+    echo "    Only use this after the adapter handles nostr_user action targets."
+  else
+    echo "    COOP_ACCOUNT_ACTIONS is not 1: keeping account actions scoped to nostr_event only."
+    echo "    This avoids exposing nostr_user buttons before the adapter can handle them."
+  fi
   UNRESTRICT_STATUS=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$COOP_ADAPTER_URL/webhook/Un-Restrict-Media" -H "Content-Type: application/json" -H "x-webhook-secret: __coop_setup_route_probe__" -d '{}' || true)
-  # 404 and 000 are NOT the same fact. 404 means the host answered and that one route is
-  # missing -- per-route, handled below. 000 means the host never answered at all, which
-  # says nothing about Un-Restrict-Media and everything about COOP_ADAPTER_URL: every one
-  # of the nine callbacks we are about to write points somewhere unreachable. Filing that
-  # under one route's name turns the probe's evidence into a misleading report, and this
-  # is the one signal that catches the documented failure where Coop answers the moderator
-  # 202 while the callback goes nowhere.
-  if [ "$UNRESTRICT_STATUS" = "000" ]; then
-    echo "    WARNING: $COOP_ADAPTER_URL did not answer at all (HTTP 000). This is not specific"
-    echo "    to Un-Restrict-Media: EVERY action callback written below points at that host."
-    echo "    Outside the cluster this is expected, since COOP_ADAPTER_URL defaults to a service name."
-    # NOT `partial`. All nine actions get written below, to $COOP_API_URL -- a different
-    # host, already proven reachable by a dozen successful mutations earlier in this run.
-    # The config ends up complete and correct. What is unverified is whether the CALLBACKS
-    # can reach the adapter FROM WHERE THIS RAN. Reporting that as "Not done: all actions"
-    # tells an operator to re-run a script that already succeeded, and hides the real
-    # question, which is whether the adapter is up.
-    UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL did not answer from here (HTTP 000)"
-  elif [ "$UNRESTRICT_STATUS" = "404" ]; then
-    echo "    WARNING: adapter route /webhook/Un-Restrict-Media is not available (HTTP $UNRESTRICT_STATUS); skipping that action."
-    ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
-    # The warning scrolls past nine action lines before the banner is printed, so downgrade
-    # the claim: the LAST thing on screen must not contradict it. This action genuinely is
-    # not provisioned -- it was dropped from ACTIONS_LIST above.
-    ACTIONS_PROVISIONED=partial
-    SKIPPED_ACTIONS="Un-Restrict-Media (route missing, HTTP 404)"
-  fi
-  if [ -z "$UT_ID" ]; then
-    echo "    ERROR: nostr_user typeId is empty; account actions would be scoped to nothing and render no buttons." >&2
-    exit 1
-  fi
+  record_adapter_probe_status
   EXISTING_A=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }')
   for AN in "${ACTIONS_LIST[@]}"; do
     AID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); a=(((d.get("data") or {}).get("myOrg") or {}).get("actions") or []); print(next((x["id"] for x in a if x.get("name")==sys.argv[2] and x.get("id")), ""))' "$EXISTING_A" "$AN")
@@ -710,22 +713,4 @@ else
   done
 fi
 
-echo "==> Done. Content type, queues, content rule and category routing are provisioned."
-if [ "${ACTIONS_PROVISIONED:-no}" = "yes" ]; then
-  echo "    Enforcement actions are provisioned too."
-  echo "    Before using account actions, verify the adapter handles nostr_user item targets."
-elif [ "${ACTIONS_PROVISIONED:-no}" = "partial" ]; then
-  echo "    Enforcement actions are only PARTIALLY provisioned. Not done: ${SKIPPED_ACTIONS:-unknown}."
-  echo "    Those actions will not reach the adapter, or still carry an old secret."
-else
-  echo "    Enforcement actions were SKIPPED (no WEBHOOK_SECRET), so account actions are"
-  echo "    NOT scoped to nostr_user and the Associated User panel will have no buttons."
-fi
-if [ -n "${UNVERIFIED_CALLBACKS:-}" ]; then
-  echo "    NOTE: the actions above were written to Coop successfully, but $UNVERIFIED_CALLBACKS,"
-  echo "    so none of their callbacks is confirmed to reach the adapter. Coop answers a moderator"
-  echo "    202 whether or not the callback lands, so verify the adapter separately."
-fi
-echo "    Items surface in the COOP Review"
-echo "    Console once the ItemProcessingWorker (Scylla) is live; moderator"
-echo "    actions reach the relay/media stores via the deployed coop-webhook-adapter."
+print_done_banner
