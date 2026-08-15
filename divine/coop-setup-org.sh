@@ -319,30 +319,67 @@ fi
 #    routed to CSAM: mobile overloads it for CSAM, violence, AND copyright, so it is
 #    ambiguous and must be human-triaged, not auto-classified into the CSAM/NCMEC queue.
 # ---------------------------------------------------------------------------
-# queue|comma-separated report_reason tokens (canonical, from _normalize_report_reason)
+# field|queue|comma-separated tokens. The field is the CONTENT_FIELD the rule matches.
+#
+# TWO FAMILIES, because an item carries EITHER a report_reason OR a label_value, never
+# both -- COOPSink sets them in different branches for different action_names. A kind-1985
+# classification from moderation-service has no report_reason at all, so before this every
+# classification fell through every specialist rule into General Review: a Hive
+# permanent_ban-tier item never reached the CSAM queue.
+#
+# Because the families are disjoint, cross-family ordering is not load-bearing. Within each
+# family CSAM must still be first (sticky, one-way, NCMEC-bound).
 CATROUTES=(
-  "CSAM|csam"
-  "Child Safety|child_safety"
-  "Age Review|underage_user"
-  "Sexual Content|nudity"
-  "Violence & Extremism|violence"
-  "Harassment, Threats & Safety|harassment"
+  "report_reason|CSAM|csam"
+  "report_reason|Child Safety|child_safety"
+  "report_reason|Age Review|underage_user"
+  "report_reason|Sexual Content|nudity"
+  "report_reason|Violence & Extremism|violence"
+  "report_reason|Harassment, Threats & Safety|harassment"
+  "label_value|CSAM|csam,sexual_minors"
+  "label_value|Sexual Content|nudity,sexual,explicit,pornography"
+  "label_value|Violence & Extremism|violence,gore,graphic-violence"
 )
+# ai-generated and deepfake are deliberately NOT routed: General Review is the match-all
+# catch-all, ordered last, and its remit already covers AI-generated content. They route
+# correctly by falling through, so a rule would add config with no behaviour change.
 # Guard: every routed token MUST be in the canonical vocabulary -- a subset of osprey's
 # CANONICAL_REASONS (divine/nostr-kafka-bridge/main.py). Vendored here because coop and
 # osprey share no runtime; this fails loud on drift (a typo, or a token Osprey can't
 # emit) instead of silently provisioning a queue nothing can route to. Tokens are also
 # constrained to [a-z_] so the anchored regex above needs no escaping.
 CANONICAL_REASONS=" csam illegal child_safety harassment nudity violence ai_generated underage_user spam impersonation other "
+# label_value is a SEPARATE vocabulary with a separate source of truth: the content-warning
+# values matched by osprey divine/rules/rules/content/label_routing.sml. Validating label
+# tokens against CANONICAL_REASONS would reject every one of them. Vendored for the same
+# fail-loud-on-drift reason as above.
+#
+# SCOPE: this is the CONTENT-WARNING vocabulary only. `label_value` has a second producer --
+# the ai_detector_nsfw path sets it from DetectorClass ('porn'/'sexy'/'hentai', defaulting to
+# 'nsfw'), which shares NO tokens with the list below. Those items therefore fall through to
+# General Review today. That is deliberate for now, not an oversight: the detector emits
+# flag_for_review (machine evidence awaiting a human), and mixing machine suspicion into a
+# specialist queue alongside human-confirmed classifications is a moderation-policy call, not
+# a provisioning one. If that call is made, add the tokens here AND a route above.
+CANONICAL_LABEL_VALUES=" csam sexual_minors nudity sexual explicit pornography violence gore graphic-violence ai-generated deepfake "
 for row in "${CATROUTES[@]}"; do
-  IFS=',' read -ra _toks <<< "${row#*|}"
+  _field="${row%%|*}"; _rest="${row#*|}"
+  IFS=',' read -ra _toks <<< "${_rest#*|}"
+  # Charset is per-field. report_reason tokens are [a-z_]; label_value tokens also contain
+  # hyphens (ai-generated, graphic-violence). A hyphen is not a metacharacter in an anchored
+  # ^token$ pattern, so it stays regex-safe; the vocabulary check below is the real guard.
+  case "$_field" in
+    report_reason) _vocab="$CANONICAL_REASONS"; _charset='^[a-z_]+$'; _srcname="osprey CANONICAL_REASONS" ;;
+    label_value)   _vocab="$CANONICAL_LABEL_VALUES"; _charset='^[a-z_-]+$'; _srcname="osprey label_routing.sml" ;;
+    *) echo "ERROR: route field '$_field' is not a known CONTENT_FIELD (expected report_reason or label_value)"; exit 1 ;;
+  esac
   for tok in "${_toks[@]}"; do
-    if [[ ! "$tok" =~ ^[a-z_]+$ ]]; then
-      echo "ERROR: route token '$tok' is not [a-z_] (regex-unsafe / malformed)"; exit 1
+    if [[ ! "$tok" =~ $_charset ]]; then
+      echo "ERROR: route token '$tok' does not match $_charset for field '$_field' (regex-unsafe / malformed)"; exit 1
     fi
-    case "$CANONICAL_REASONS" in
+    case "$_vocab" in
       *" $tok "*) ;;
-      *) echo "ERROR: route token '$tok' is not in the canonical report_reason vocabulary (drift vs osprey CANONICAL_REASONS)"; exit 1 ;;
+      *) echo "ERROR: route token '$tok' is not in the canonical $_field vocabulary (drift vs $_srcname)"; exit 1 ;;
     esac
   done
 done
@@ -354,8 +391,8 @@ echo "==> Ensuring category routing rules"
 # 4. Idempotent: a rule already in the desired state is simply re-set to it.
 EXISTING_R=$(gql 'query { myOrg { routingRules { id name } } }')
 for row in "${CATROUTES[@]}"; do
-  QUEUE="${row%%|*}"; KEYWORDS="${row#*|}"
-  CR_NAME="report_reason -> $QUEUE"
+  FIELD="${row%%|*}"; _rest="${row#*|}"; QUEUE="${_rest%%|*}"; KEYWORDS="${_rest#*|}"
+  CR_NAME="$FIELD -> $QUEUE"
   QID=$(qid "$QUEUE")
   if [ -z "$QID" ]; then
     echo "    ERROR: queue '$QUEUE' not found (run step 2 first)"; exit 1
@@ -378,14 +415,15 @@ print(next((r["id"] for r in org["routingRules"] if r.get("name")==sys.argv[1]),
 import json,os,sys
 tid,qid,name = sys.argv[1],sys.argv[2],sys.argv[3]
 kw = ["^" + t + "$" for t in sys.argv[4].split(",")]
-cond = {"input":{"type":"CONTENT_FIELD","name":"report_reason","contentTypeId":tid},
+field = sys.argv[5]
+cond = {"input":{"type":"CONTENT_FIELD","name":field,"contentTypeId":tid},
         "signal":{"id":json.dumps({"type":"TEXT_MATCHING_CONTAINS_REGEX"}),"type":"TEXT_MATCHING_CONTAINS_REGEX"},
         "matchingValues":{"strings":kw}}
 inp = {"name":name,"conditionSet":{"conditions":[cond],"conjunction":"AND"},
        "destinationQueueId":qid,"itemTypeIds":[tid],"status":"LIVE"}
 rid = os.environ.get("RID","")
 if rid: inp["id"] = rid
-print(json.dumps({"input":inp}))' "$TID" "$QID" "$CR_NAME" "$KEYWORDS")
+print(json.dumps({"input":inp}))' "$TID" "$QID" "$CR_NAME" "$KEYWORDS" "$FIELD")
   if [ -n "$RID" ]; then
     RESP=$(gql 'mutation UR($input: UpdateRoutingRuleInput!){ updateRoutingRule(input:$input){ __typename } }' "$IN")
     ACT=reconciled
@@ -414,12 +452,18 @@ rules = json.load(sys.stdin)["data"]["myOrg"]["routingRules"]
 by = {r["name"]: r["id"] for r in rules}
 GENERAL = "nostr_event -> General Review"
 # Category routes in priority order, WITHOUT the catch-all.
+# The two families are disjoint (an item has report_reason XOR label_value), so their
+# relative order cannot change any outcome. What IS load-bearing: CSAM first within each
+# family, and General Review last overall (appended below).
 priority = [
   "report_reason -> CSAM",
+  "label_value -> CSAM",
   "report_reason -> Child Safety",
   "report_reason -> Age Review",
   "report_reason -> Sexual Content",
+  "label_value -> Sexual Content",
   "report_reason -> Violence & Extremism",
+  "label_value -> Violence & Extremism",
   "report_reason -> Harassment, Threats & Safety",
 ]
 gen = by.get(GENERAL)
