@@ -124,6 +124,80 @@ else
   fails=$((fails+1))
 fi
 
+echo "the shipped account-moderation config is internally consistent:"
+python3 - "$SRC" <<'PY'
+import json
+import re
+import sys
+
+src = open(sys.argv[1], encoding="utf-8").read()
+
+def assignment(name):
+    match = re.search(rf"^{name}='([^']*)'$", src, re.M)
+    if not match:
+        raise SystemExit(f"FAIL: {name} assignment not found")
+    return json.loads(match.group(1))
+
+fields = assignment("CT_FIELDS")
+roles = assignment("CT_FIELD_ROLES")
+by_name = {field["name"]: field for field in fields}
+
+author = by_name.get("author")
+if author != {"name": "author", "type": "RELATED_ITEM", "required": False}:
+    raise SystemExit(f"FAIL: author field is not the expected optional RELATED_ITEM: {author!r}")
+if roles.get("creatorId") != "author":
+    raise SystemExit(f"FAIL: creatorId role does not reference author: {roles.get('creatorId')!r}")
+
+expected_profile_fields = {
+    f"{prefix}_{suffix}": field_type
+    for prefix in ("author", "reported", "reporter")
+    for suffix, field_type in (
+        ("display_name", "STRING"),
+        ("nip05", "STRING"),
+        ("profile_state", "STRING"),
+        ("profile_error", "STRING"),
+        ("nip05_verified", "BOOLEAN"),
+        ("follower_count", "NUMBER"),
+        ("has_vanish_request", "BOOLEAN"),
+    )
+}
+for name, field_type in expected_profile_fields.items():
+    field = by_name.get(name)
+    if field is None or field.get("type") != field_type or field.get("required") is not False:
+        raise SystemExit(f"FAIL: unexpected profile field declaration for {name}: {field!r}")
+
+print("  ok    creatorId targets the author RELATED_ITEM and all profile field types match")
+PY
+
+ACTION_BLOCK="$WORK/actions.sh"
+awk '/^  ACTIONS_LIST=/,/^  UNRESTRICT_STATUS=/' "$SRC" | sed '$d' > "$ACTION_BLOCK"
+grep -q '^  action_type_ids_json()' "$ACTION_BLOCK" || { echo "  FAIL  action scope function not captured"; fails=$((fails+1)); }
+if [ "$fails" -eq 0 ]; then
+  {
+    printf 'TID=event-type\nUT_ID=user-type\n'
+    cat "$ACTION_BLOCK"
+    cat <<'SH'
+for action in "${ACTIONS_LIST[@]}"; do
+  printf '%s|%s\n' "$action" "$(action_type_ids_json "$action")"
+done
+SH
+  } > "$WORK/action-scopes.sh"
+  ACTION_SCOPES=$(bash -euo pipefail "$WORK/action-scopes.sh")
+  while IFS='|' read -r action scope; do
+    case " Ban-User Suspend-User Unban-User Unsuspend-User " in
+      *" $action "*) expected='["event-type", "user-type"]' ;;
+      *) expected='["event-type"]' ;;
+    esac
+    if [ "$scope" != "$expected" ]; then
+      echo "  FAIL  $action scope is $scope; expected $expected"
+      fails=$((fails+1))
+    fi
+  done <<< "$ACTION_SCOPES"
+  if [ "$fails" -eq 0 ]; then
+    echo "  ok    account actions span event and user types; content actions remain event-only"
+  fi
+fi
+
 echo "accepted:"
 check "hyphenated label token (the old [a-z_] charset rejected these)" 0 \
   "label_value|Violence & Extremism|graphic-violence,ai-generated"
