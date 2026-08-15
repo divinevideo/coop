@@ -197,7 +197,9 @@ Age-Restrict|["event-type"]
 Un-Restrict-Media|["event-type"]
 SCOPES
   )
-  if [ "$ACTION_SCOPES" = "$EXPECTED_ACTION_SCOPES" ]; then
+  SORTED_ACTION_SCOPES=$(printf '%s\n' "$ACTION_SCOPES" | LC_ALL=C sort)
+  SORTED_EXPECTED_ACTION_SCOPES=$(printf '%s\n' "$EXPECTED_ACTION_SCOPES" | LC_ALL=C sort)
+  if [ "$SORTED_ACTION_SCOPES" = "$SORTED_EXPECTED_ACTION_SCOPES" ]; then
     echo "  ok    account actions span event and user types; content actions remain event-only"
   else
     echo "  FAIL  shipped action set or scopes differ from the required config:"
@@ -207,17 +209,19 @@ SCOPES
 fi
 
 for payload in UV AV; do
-  line=$(grep -E "^[[:space:]]+$payload=" "$SRC" || true)
-  if [ "$(printf '%s\n' "$line" | grep -cF '$(action_type_ids_json "$AN")')" -eq 1 ]; then
-    echo "  ok    $payload mutation payload consumes the tested action scope"
+  line=$(grep -E "^[[:space:]]+$payload=" "$SRC" | grep -F 'COOP_ADAPTER_URL/webhook/$AN' || true)
+  if [ "$payload" = UV ]; then scope_key='"itemTypeIds":json.loads(sys.argv[4])'; else scope_key='"itemTypeIds":json.loads(sys.argv[2])'; fi
+  if [ "$(printf '%s\n' "$line" | grep -cF "$scope_key")" -eq 1 ] &&
+     [ "$(printf '%s\n' "$line" | grep -cF '$(action_type_ids_json "$AN")')" -eq 1 ]; then
+    echo "  ok    $payload mutation payload declares and receives the tested action scope"
   else
     echo "  FAIL  $payload mutation payload does not consume action_type_ids_json"
     fails=$((fails+1))
   fi
 done
 
-if grep -qF 'verify the adapter handles nostr_user item targets' "$SRC"; then
-  echo "  ok    operators are warned about the adapter compatibility requirement"
+if [ "$(grep -cF 'adapter handles nostr_user item targets' "$SRC")" -eq 2 ]; then
+  echo "  ok    adapter compatibility appears in both the step warning and final banner"
 else
   echo "  FAIL  adapter compatibility warning is missing"
   fails=$((fails+1))

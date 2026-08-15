@@ -713,6 +713,7 @@ fi
 echo "==> Done. Content type, queues, content rule and category routing are provisioned."
 if [ "${ACTIONS_PROVISIONED:-no}" = "yes" ]; then
   echo "    Enforcement actions are provisioned too."
+  echo "    Before using account actions, verify the adapter handles nostr_user item targets."
 elif [ "${ACTIONS_PROVISIONED:-no}" = "partial" ]; then
   echo "    Enforcement actions are only PARTIALLY provisioned. Not done: ${SKIPPED_ACTIONS:-unknown}."
   echo "    Those actions will not reach the adapter, or still carry an old secret."
