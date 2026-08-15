@@ -161,18 +161,40 @@ fields = assignment("CT_FIELDS")
 roles = assignment("CT_FIELD_ROLES")
 by_name = {field["name"]: field for field in fields}
 
+expected_fields = [
+    ("event_id", "STRING", True),
+    ("source_event_id", "STRING", False),
+    ("pubkey", "STRING", False),
+    ("kind", "NUMBER", False),
+    ("created_at", "NUMBER", False),
+    ("verdict", "STRING", False),
+    ("action_name", "STRING", False),
+    ("report_reason", "STRING", False),
+    ("reported_pubkey", "STRING", False),
+    ("reported_event_id", "STRING", False),
+    ("label_value", "STRING", False),
+    ("label_namespace", "STRING", False),
+    ("text", "STRING", False),
+    ("media_url", "VIDEO", False),
+    ("media_thumbnail", "IMAGE", False),
+    ("media_sha256", "STRING", False),
+    ("reporter_pubkey", "STRING", False),
+    ("relay_manager_url", "URL", False),
+    ("author", "RELATED_ITEM", False),
+]
+actual_fields = [(field["name"], field["type"], field["required"]) for field in fields]
+if actual_fields != expected_fields:
+    raise SystemExit(f"FAIL: content fields differ from the reviewed schema: {actual_fields!r}")
+
 author = by_name.get("author")
 if author != {"name": "author", "type": "RELATED_ITEM", "required": False}:
     raise SystemExit(f"FAIL: author field is not the expected optional RELATED_ITEM: {author!r}")
 if roles.get("creatorId") != "author":
     raise SystemExit(f"FAIL: creatorId role does not reference author: {roles.get('creatorId')!r}")
 
-for name in ["author_display_name", "reported_display_name", "reporter_display_name", "author_follower_count", "author_has_vanish_request"]:
-    if name in by_name:
-        raise SystemExit(f"FAIL: {name} belongs with the producer branch, not this setup change")
 PY
 SH
-check_script "creatorId targets author RELATED_ITEM without unreviewed profile fields" 0 <(printf 'bash %q %q\n' "$WORK/content_fields.check" "$SRC")
+check_script "content fields and creatorId match the reviewed producer-independent schema" 0 <(printf 'bash %q %q\n' "$WORK/content_fields.check" "$SRC")
 
 ACTION_BLOCK="$WORK/actions.sh"
 awk '/^  ACTIONS_LIST=/,/^  UNRESTRICT_STATUS=/' "$SRC" | sed '$d' > "$ACTION_BLOCK"
@@ -239,10 +261,27 @@ for payload in UV AV; do
   fi
 done
 
-if [ "$(grep -cF 'adapter handles nostr_user action targets' "$SRC")" -ge 2 ]; then
-  echo "  ok    adapter compatibility appears in usage, step warning, or final banner"
+if [ "$(grep -Ec '^[[:space:]]*echo ".*adapter.*nostr_user action targets' "$SRC")" -eq 2 ]; then
+  echo "  ok    adapter compatibility appears in both runtime opt-in messages"
 else
-  echo "  FAIL  adapter compatibility warning is missing"
+  echo "  FAIL  runtime adapter compatibility messages are missing"
+  fails=$((fails+1))
+fi
+
+grep '^UNVERIFIED_CALLBACKS=""$' "$SRC" > "$WORK/action-state-init.sh"
+cat > "$WORK/action_state_init.check" <<'SH'
+UNVERIFIED_CALLBACKS="stale inherited value"
+. "$1"
+[ -z "$UNVERIFIED_CALLBACKS" ]
+SH
+check_script "internal callback state overrides an inherited caller value" 0 <(printf 'bash %q %q\n' "$WORK/action_state_init.check" "$WORK/action-state-init.sh")
+
+probe_line=$(grep 'UNRESTRICT_STATUS=.*webhook/Un-Restrict-Media' "$SRC" || true)
+if [ "$(printf '%s\n' "$probe_line" | grep -cF 'x-webhook-secret: $WEBHOOK_SECRET')" -eq 1 ] &&
+   ! printf '%s\n' "$probe_line" | grep -qF '__coop_setup_route_probe__'; then
+  echo "  ok    route probe authenticates before interpreting route status"
+else
+  echo "  FAIL  route probe cannot reach adapter route dispatch"
   fails=$((fails+1))
 fi
 
@@ -275,6 +314,15 @@ ACTIONS_LIST=(Ban-User Un-Restrict-Media)
 ACTIONS_PROVISIONED=yes
 SKIPPED_ACTIONS=""
 UNVERIFIED_CALLBACKS=""
+UNRESTRICT_STATUS=401
+record_adapter_probe_status >/dev/null
+[ "$ACTIONS_PROVISIONED" = yes ]
+case "$UNVERIFIED_CALLBACKS" in *401*) ;; *) exit 1 ;; esac
+
+ACTIONS_LIST=(Ban-User Un-Restrict-Media)
+ACTIONS_PROVISIONED=yes
+SKIPPED_ACTIONS=""
+UNVERIFIED_CALLBACKS=""
 UNRESTRICT_STATUS=404
 record_adapter_probe_status >/dev/null
 [ "$ACTIONS_PROVISIONED" = partial ]
@@ -302,6 +350,7 @@ UNVERIFIED_CALLBACKS=""
 COOP_ACCOUNT_ACTIONS=0
 out=$(print_done_banner)
 case "$out" in *"Account action buttons are NOT enabled for nostr_user"*) ;; *) exit 1 ;; esac
+case "$out" in *"only after the adapter can handle nostr_user action targets"*) ;; *) exit 1 ;; esac
 case "$out" in *"callbacks is confirmed"*) exit 1 ;; esac
 
 ACTIONS_PROVISIONED=partial

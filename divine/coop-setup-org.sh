@@ -597,6 +597,11 @@ record_adapter_probe_status() {
       echo "    The actions below can be written, but callback delivery is not confirmed."
       UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL answered HTTP $UNRESTRICT_STATUS from here"
       ;;
+    401|403)
+      echo "    WARNING: $COOP_ADAPTER_URL rejected the configured webhook secret (HTTP $UNRESTRICT_STATUS)."
+      echo "    The actions below can be written, but their callbacks will fail authentication."
+      UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL rejected the configured webhook secret with HTTP $UNRESTRICT_STATUS"
+      ;;
   esac
 }
 
@@ -617,6 +622,7 @@ record_adapter_probe_status() {
 #    on the next run. Consistent with reconcile-not-skip elsewhere here, but this is the
 #    first thing the script overwrites that a human might reasonably have set there.
 # ---------------------------------------------------------------------------
+UNVERIFIED_CALLBACKS=""
 if [ -z "${WEBHOOK_SECRET:-}" ]; then
   echo "==> WEBHOOK_SECRET unset — skipping enforcement actions (step 6)."
   # Step 1 sets creatorId, so the Associated User panel WILL render once osprey populates
@@ -633,10 +639,7 @@ else
   # the caller's shell would be prepended into the "Not done" list and name an action that
   # is perfectly fine. The message added to stop the banner lying must not itself lie.
   SKIPPED_ACTIONS=""
-  UNVERIFIED_CALLBACKS=""
   echo "==> Ensuring enforcement actions (-> $COOP_ADAPTER_URL/webhook/<Action>)"
-  echo "    WARNING: verify the adapter handles nostr_user item targets before using"
-  echo "    account actions; otherwise the Associated User buttons return an error."
   # Un-Restrict-Media is the reversal for Age-Restrict. It sends SAFE, which maps
   # to Active in Blossom and so reverses AgeRestricted, Restricted and Banned
   # alike. Without it Coop could age-restrict media and never undo it, which also
@@ -669,7 +672,10 @@ else
     echo "    COOP_ACCOUNT_ACTIONS is not 1: keeping account actions scoped to nostr_event only."
     echo "    This avoids exposing nostr_user buttons before the adapter can handle them."
   fi
-  UNRESTRICT_STATUS=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$COOP_ADAPTER_URL/webhook/Un-Restrict-Media" -H "Content-Type: application/json" -H "x-webhook-secret: __coop_setup_route_probe__" -d '{}' || true)
+  # Authenticate with the configured secret so route dispatch can distinguish an
+  # existing handler (400 for the deliberately empty target) from a missing one (404).
+  # The empty body is rejected by target validation before any enforcement call.
+  UNRESTRICT_STATUS=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$COOP_ADAPTER_URL/webhook/Un-Restrict-Media" -H "Content-Type: application/json" -H "x-webhook-secret: $WEBHOOK_SECRET" -d '{}' || true)
   record_adapter_probe_status
   EXISTING_A=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }')
   for AN in "${ACTIONS_LIST[@]}"; do
