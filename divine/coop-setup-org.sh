@@ -321,15 +321,20 @@ fi
 # ---------------------------------------------------------------------------
 # field|queue|comma-separated tokens. The field is the CONTENT_FIELD the rule matches.
 #
-# TWO FAMILIES, because an item carries EITHER a report_reason OR a label_value, never
-# both -- COOPSink sets them in different branches for different action_names. A kind-1985
+# TWO FAMILIES, because an item carries EITHER a report_reason OR a label_value. A kind-1985
 # classification from moderation-service has no report_reason at all, so before this every
-# classification fell through every specialist rule into General Review: a Hive
-# permanent_ban-tier item never reached the CSAM queue.
+# human-confirmed classification fell through every specialist rule into General Review --
+# a ConfirmedCSAM label never reached the CSAM queue.
+#
+# NOT fixed here, and worth knowing: osprey's most severe verdict still does not route.
+# PermanentBan fires on Kind in [34235, 34236] (ai_classification.sml) -- video events that
+# carry NEITHER report_reason NOR label_value -- so those items land in General Review with
+# verdict 'ban'. Routing them needs a third family keyed on `verdict`, not a label token.
 #
 # That disjointness is a property of the PRODUCERS, not something enforced here or by Coop:
-# the bridge extracts label_* only for kind 1985 and report_reason only for kind 1984, and
-# COOPSink gates each on truthiness. So cross-family ordering is not load-bearing TODAY. It
+# the bridge extracts label_* only for kind 1985 and report_reason only for kind 1984. Note
+# COOPSink writes label_value UNCONDITIONALLY in its ai_detector_nsfw branch, so that is the
+# one path that could ever submit an empty one. So cross-family ordering is not load-bearing TODAY. It
 # would become load-bearing if any producer ever emitted both. The ordering below is chosen
 # to survive that anyway -- both CSAM routes sit first -- but do not read it as a guarantee.
 # What IS load-bearing regardless: CSAM first within each family (sticky, one-way,
@@ -366,6 +371,8 @@ CANONICAL_REASONS=" csam illegal child_safety harassment nudity violence ai_gene
 # flag_for_review (machine evidence awaiting a human), and mixing machine suspicion into a
 # specialist queue alongside human-confirmed classifications is a moderation-policy call, not
 # a provisioning one. If that call is made, add the tokens here AND a route above.
+_NL='
+'
 CANONICAL_LABEL_VALUES=" csam sexual_minors nudity sexual explicit pornography violence gore graphic-violence ai-generated deepfake "
 for row in "${CATROUTES[@]}"; do
   _field="${row%%|*}"; _rest="${row#*|}"
@@ -384,6 +391,8 @@ for row in "${CATROUTES[@]}"; do
   # blank-field items straight into CSAM. Reject malformed lists before tokenizing so the
   # two agree by construction.
   case "${_rest#*|}" in
+    *"$_NL"*)
+      echo "ERROR: route token list for '$_field -> ${_rest%%|*}' contains a newline (a wrapped array element); bash reads only the first line, so the guard would not see the rest"; exit 1 ;;
     ''|*,,*|,*|*,)
       echo "ERROR: route token list for '$_field -> ${_rest%%|*}' is malformed (empty, or a leading/trailing/double comma): '${_rest#*|}'"; exit 1 ;;
   esac
