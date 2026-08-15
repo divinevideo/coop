@@ -16,6 +16,8 @@
 #   # supply the shared webhook secret (omit WEBHOOK_SECRET to skip step 6):
 #   export COOP_ADAPTER_URL=http://coop-webhook-adapter:3456   # default
 #   export WEBHOOK_SECRET=...             # MUST match the adapter's WEBHOOK_SECRET env
+#   # Optional: only after the adapter handles nostr_user action targets:
+#   export COOP_ACCOUNT_ACTIONS=1         # also scope account actions to nostr_user
 #   ./divine/coop-setup-org.sh
 #
 # Requires: curl, python3. The login user must be an org ADMIN (admin GraphQL
@@ -64,11 +66,20 @@ echo "==> Ensuring content type 'nostr_event'"
 # is null is dropped from the view entirely, so partially-populated items stay
 # tidy rather than showing empty rows.
 #
-# NOT set here: the creatorId field role. It drives the Associated User panel and
-# per-account actions, which need a User item type to resolve into. It belongs
-# with that work, not with a bare pubkey string.
-CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"relay_manager_url","type":"URL","required":false}]'
-CT_FIELD_ROLES='{"displayName":"text","creatorId":null,"threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
+# `creatorId` IS set here, to `author` -- see CT_FIELD_ROLES below. It drives the
+# Associated User panel and per-account actions. It could never have pointed at
+# `pubkey`: the DB constraint valid_field_role_field_type requires creatorId to name a
+# RELATED_ITEM field, and `pubkey` is a STRING. The role and the field it names have to
+# arrive together, which is why they are in the same change.
+# NOT declared yet: profile/enrichment fields such as author_display_name,
+# confidence, model, follower counts, and vanish-request booleans. Declaring a
+# field is what turns producer output from ignored into rendered. Those fields
+# belong with the producer branch that proves exact names and omits unknown
+# values rather than sending defaults like "", 0, or false that moderators would
+# read as real facts.
+#
+CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
+CT_FIELD_ROLES='{"displayName":"text","creatorId":"author","threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
 CT_ID=$(type_id nostr_event)
 if [ -n "$CT_ID" ]; then
@@ -533,6 +544,75 @@ else
   echo "    ERROR: reorder failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
 fi
 
+print_done_banner() {
+  echo "==> Done. Content type, queues, content rule and category routing are provisioned."
+  if [ "${ACTIONS_PROVISIONED:-no}" = "yes" ]; then
+    echo "    Enforcement actions are provisioned too."
+  elif [ "${ACTIONS_PROVISIONED:-no}" = "partial" ]; then
+    echo "    Enforcement actions are only PARTIALLY provisioned. Not done: ${SKIPPED_ACTIONS:-unknown}."
+    echo "    Those actions will not reach the adapter, or still carry an old secret."
+  else
+    echo "    Enforcement actions were SKIPPED (no WEBHOOK_SECRET), so account actions are"
+    echo "    NOT scoped to nostr_user and the Associated User panel will have no buttons."
+  fi
+  if [ "${COOP_ACCOUNT_ACTIONS:-0}" != "1" ]; then
+    echo "    Account action buttons are NOT enabled for nostr_user. Set COOP_ACCOUNT_ACTIONS=1"
+    echo "    only after the adapter can handle nostr_user action targets."
+  fi
+  if [ -n "${UNVERIFIED_CALLBACKS:-}" ]; then
+    echo "    NOTE: the actions above were written to Coop successfully, but $UNVERIFIED_CALLBACKS,"
+    echo "    so none of their callbacks is confirmed to reach the adapter. Coop answers a moderator"
+    echo "    202 whether or not the callback lands, so verify the adapter separately."
+  fi
+  echo "    Items surface in the COOP Review"
+  echo "    Console once the ItemProcessingWorker (Scylla) is live; moderator"
+  echo "    actions reach the relay/media stores via the deployed coop-webhook-adapter."
+}
+
+record_adapter_probe_status() {
+  case "$UNRESTRICT_STATUS" in
+    000)
+      echo "    WARNING: $COOP_ADAPTER_URL did not answer at all (HTTP 000). This is not specific"
+      echo "    to Un-Restrict-Media: EVERY action callback written below points at that host."
+      echo "    Outside the cluster this is expected, since COOP_ADAPTER_URL defaults to a service name."
+      # NOT `partial`. All nine actions get written below, to $COOP_API_URL -- a different
+      # host, already proven reachable by a dozen successful mutations earlier in this run.
+      # The config ends up complete and correct. What is unverified is whether the CALLBACKS
+      # can reach the adapter FROM WHERE THIS RAN. Reporting that as "Not done: all actions"
+      # tells an operator to re-run a script that already succeeded, and hides the real
+      # question, which is whether the adapter is up.
+      UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL did not answer from here (HTTP 000)"
+      ;;
+    404)
+      echo "    WARNING: adapter route /webhook/Un-Restrict-Media is not available (HTTP $UNRESTRICT_STATUS); skipping that action."
+      ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
+      # The warning scrolls past nine action lines before the banner is printed, so downgrade
+      # the claim: the LAST thing on screen must not contradict it. This action genuinely is
+      # not provisioned -- it was dropped from ACTIONS_LIST above.
+      ACTIONS_PROVISIONED=partial
+      SKIPPED_ACTIONS="Un-Restrict-Media (route missing, HTTP 404)"
+      ;;
+    5??)
+      echo "    WARNING: $COOP_ADAPTER_URL answered HTTP $UNRESTRICT_STATUS during the route probe."
+      echo "    The actions below can be written, but callback delivery is not confirmed."
+      UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL answered HTTP $UNRESTRICT_STATUS from here"
+      ;;
+    401|403)
+      echo "    WARNING: $COOP_ADAPTER_URL rejected the configured webhook secret (HTTP $UNRESTRICT_STATUS)."
+      echo "    The actions below can be written, but their callbacks will fail authentication."
+      UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL rejected the configured webhook secret with HTTP $UNRESTRICT_STATUS"
+      ;;
+    400)
+      echo "    adapter route exists (authenticated empty-target probe was rejected as expected)."
+      ;;
+    *)
+      echo "    WARNING: $COOP_ADAPTER_URL answered unexpected HTTP $UNRESTRICT_STATUS during the route probe."
+      echo "    The actions below can be written, but callback delivery is not confirmed."
+      UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL answered unexpected HTTP $UNRESTRICT_STATUS from here"
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # 6) Enforcement actions (CUSTOM_ACTION webhooks -> coop-webhook-adapter). Each
 #    action POSTs to the adapter, which translates to relay-manager NIP-86
@@ -544,21 +624,67 @@ fi
 #    Idempotent + reconciling: existing actions are UPDATED with the current
 #    callbackUrl + secret on every run, so rotating WEBHOOK_SECRET (or moving
 #    COOP_ADAPTER_URL) is just a re-run. Skipped entirely if WEBHOOK_SECRET is unset.
+#
+#    RECONCILE OVERWRITES: updateAction deletes every actions_and_item_types row for the
+#    action and reinserts, so item-type scoping added by hand in the Coop UI is discarded
+#    on the next run. Consistent with reconcile-not-skip elsewhere here, but this is the
+#    first thing the script overwrites that a human might reasonably have set there.
 # ---------------------------------------------------------------------------
+UNVERIFIED_CALLBACKS=""
 if [ -z "${WEBHOOK_SECRET:-}" ]; then
   echo "==> WEBHOOK_SECRET unset — skipping enforcement actions (step 6)."
+  # Step 1 sets creatorId, so the Associated User panel WILL render once osprey populates
+  # `author`. Scoping the four account actions to nostr_user happens only in step 6. Skip
+  # it and a moderator gets that panel with ZERO buttons -- the panel is the thing that
+  # makes account moderation look available. Say so here rather than letting the closing
+  # banner claim enforcement actions are provisioned.
+  echo "    NOTE: creatorId -> author IS set. Until this step runs with WEBHOOK_SECRET,"
+  echo "    the Associated User panel will render with no account actions on it."
+  ACTIONS_PROVISIONED=no
 else
+  ACTIONS_PROVISIONED=yes
+  # Initialise: the append below uses ${SKIPPED_ACTIONS:+...}, so an inherited value from
+  # the caller's shell would be prepended into the "Not done" list and name an action that
+  # is perfectly fine. The message added to stop the banner lying must not itself lie.
+  SKIPPED_ACTIONS=""
   echo "==> Ensuring enforcement actions (-> $COOP_ADAPTER_URL/webhook/<Action>)"
   # Un-Restrict-Media is the reversal for Age-Restrict. It sends SAFE, which maps
   # to Active in Blossom and so reverses AgeRestricted, Restricted and Banned
   # alike. Without it Coop could age-restrict media and never undo it, which also
   # meant an accepted appeal had no way to restore the content.
   ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict Un-Restrict-Media)
-  UNRESTRICT_STATUS=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$COOP_ADAPTER_URL/webhook/Un-Restrict-Media" -H "Content-Type: application/json" -H "x-webhook-secret: __coop_setup_route_probe__" -d '{}' || true)
-  if [ "$UNRESTRICT_STATUS" = "404" ] || [ "$UNRESTRICT_STATUS" = "000" ]; then
-    echo "    WARNING: adapter route /webhook/Un-Restrict-Media is not available (HTTP $UNRESTRICT_STATUS); skipping that action."
-    ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
+  # Which item type each action may be taken ON. This is not cosmetic: the review
+  # UI filters an item's buttons by `action.itemTypes.some(t => t.id === user.typeId)`,
+  # so an account action scoped to nostr_event renders NO button on the Associated
+  # User panel and the feature looks broken while being fully configured.
+  ACCOUNT_ACTIONS="Ban-User Suspend-User Unban-User Unsuspend-User"
+  # Account actions may span BOTH types, but only after the adapter has the matching
+  # nostr_user target branch. Before that, the Associated User panel would enqueue
+  # itemId=<pubkey>, itemTypeId=<nostr_user>, while older adapters treat itemId as
+  # an event id and 400 after Coop has already answered the moderator 202. Default
+  # off keeps reconcile safe until the adapter branch lands.
+  action_type_ids_json() {
+    case " $ACCOUNT_ACTIONS " in
+      *" $1 "*) if [ "${COOP_ACCOUNT_ACTIONS:-0}" = "1" ]; then
+          python3 -c 'import json,sys;print(json.dumps([sys.argv[1],sys.argv[2]]))' "$TID" "$UT_ID"
+        else
+          python3 -c 'import json,sys;print(json.dumps([sys.argv[1]]))' "$TID"
+        fi ;;
+      *)        python3 -c 'import json,sys;print(json.dumps([sys.argv[1]]))' "$TID" ;;
+    esac
+  }
+  if [ "${COOP_ACCOUNT_ACTIONS:-0}" = "1" ]; then
+    echo "    COOP_ACCOUNT_ACTIONS=1: account actions will also be scoped to nostr_user."
+    echo "    Only use this after the adapter handles nostr_user action targets."
+  else
+    echo "    COOP_ACCOUNT_ACTIONS is not 1: keeping account actions scoped to nostr_event only."
+    echo "    This avoids exposing nostr_user buttons before the adapter can handle them."
   fi
+  # Authenticate with the configured secret so route dispatch can distinguish an
+  # existing handler (400 for the deliberately empty target) from a missing one (404).
+  # The empty body is rejected by target validation before any enforcement call.
+  UNRESTRICT_STATUS=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$COOP_ADAPTER_URL/webhook/Un-Restrict-Media" -H "Content-Type: application/json" -H "x-webhook-secret: $WEBHOOK_SECRET" -d '{}' || true)
+  record_adapter_probe_status
   EXISTING_A=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }')
   for AN in "${ACTIONS_LIST[@]}"; do
     AID=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); a=(((d.get("data") or {}).get("myOrg") or {}).get("actions") or []); print(next((x["id"] for x in a if x.get("name")==sys.argv[2] and x.get("id")), ""))' "$EXISTING_A" "$AN")
@@ -566,9 +692,14 @@ else
       # Update in place so a rotated WEBHOOK_SECRET (or a changed COOP_ADAPTER_URL)
       # actually propagates on re-run. Skipping would keep the OLD secret, and COOP
       # returns 202 to the moderator even when the adapter 401s the stale secret --
-      # so enforcement would fail invisibly. Only the callback fields are sent;
-      # name/description/itemTypeIds are left unchanged.
-      UV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"id":sys.argv[1],"callbackUrl":sys.argv[2],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[3]}}}))' "$AID" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET")
+      # so enforcement would fail invisibly.
+      #
+      # itemTypeIds IS now sent. It used to be omitted deliberately, which meant an
+      # action created before account moderation stayed scoped to nostr_event
+      # forever and no amount of re-running this script would rescope it -- the
+      # buttons simply never appear on the Associated User panel. Name and
+      # description are still left alone.
+      UV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"id":sys.argv[1],"callbackUrl":sys.argv[2],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[3]},"itemTypeIds":json.loads(sys.argv[4])}}))' "$AID" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET" "$(action_type_ids_json "$AN")")
       RESP=$(gql 'mutation U($input: UpdateActionInput!){ updateAction(input:$input){ __typename } }' "$UV")
       if echo "$RESP" | grep -q '"__typename":"MutateActionSuccessResponse"'; then
         echo "    '$AN' updated (callbackUrl + webhook secret refreshed)"
@@ -577,19 +708,23 @@ else
       fi
       continue
     fi
-    AV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Divine enforcement via coop-webhook-adapter","itemTypeIds":[sys.argv[2]],"callbackUrl":sys.argv[3],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[4]}}}))' "$AN" "$TID" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET")
+    AV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Divine enforcement via coop-webhook-adapter","itemTypeIds":json.loads(sys.argv[2]),"callbackUrl":sys.argv[3],"callbackUrlHeaders":{"x-webhook-secret":sys.argv[4]}}}))' "$AN" "$(action_type_ids_json "$AN")" "$COOP_ADAPTER_URL/webhook/$AN" "$WEBHOOK_SECRET")
     RESP=$(gql 'mutation A($input: CreateActionInput!){ createAction(input:$input){ __typename } }' "$AV")
     if echo "$RESP" | grep -q '"__typename":"MutateActionSuccessResponse"'; then
       echo "    '$AN' created"
     elif echo "$RESP" | grep -q 'ActionNameExistsError'; then
-      echo "    '$AN' exists (created concurrently); re-run to refresh its secret"
+      # Nothing was written for this action: not the callbackUrl, not the webhook secret,
+      # not itemTypeIds. If the actions query at the top of this step returned a GraphQL
+      # error payload over HTTP 200 (an expired session does this), EVERY id comes back
+      # empty, every action takes this path, and the run touches nothing at all while
+      # exiting 0. That also silently defeats "rotating WEBHOOK_SECRET is just a re-run".
+      echo "    '$AN' exists but was NOT updated: callbackUrl, secret and itemTypeIds are unchanged"
+      ACTIONS_PROVISIONED=partial
+      SKIPPED_ACTIONS="${SKIPPED_ACTIONS:+$SKIPPED_ACTIONS, }$AN (exists; not refreshed)"
     else
       echo "    ERROR: action create failed for '$AN': $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
     fi
   done
 fi
 
-echo "==> Done. Content type, queues, content rule, category routing, and"
-echo "    enforcement actions are provisioned. Items surface in the COOP Review"
-echo "    Console once the ItemProcessingWorker (Scylla) is live; moderator"
-echo "    actions reach the relay/media stores via the deployed coop-webhook-adapter."
+print_done_banner

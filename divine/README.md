@@ -13,7 +13,7 @@ does not travel between environments on its own. These scripts are that missing 
 
 | Script | Purpose |
 |--------|---------|
-| `coop-setup-org.sh` | Idempotently bootstrap an org's moderation config: the `nostr_event` content type (matching osprey's COOPSink payload, incl. media fields), review queues mirroring relay-manager's category tiers, routing, and (when `WEBHOOK_SECRET` is set) the enforcement CUSTOM_ACTION webhooks pointing at the deployed adapter. Needs an **admin user session** (login email/password), not just the org API key. |
+| `coop-setup-org.sh` | Idempotently bootstrap an org's moderation config: the `nostr_event` content type and `nostr_user` user type, review queues mirroring relay-manager's category tiers, routing, and (when `WEBHOOK_SECRET` is set) the enforcement CUSTOM_ACTION webhooks pointing at the deployed adapter. Needs an **admin user session** (login email/password), not just the org API key. |
 | `test-coop-setup-guards.sh` | Guard tests for `coop-setup-org.sh`'s routing vocabulary, charset, route table, and priority checks. Runs in CI for `divine/` changes; run locally after editing the routing config: `bash divine/test-coop-setup-guards.sh`. No credentials or network needed. |
 | `coop-bridge-import.sh` | Pull live kind-1984 reports from relay-manager and submit them to COOP for review (demo bridge). |
 
@@ -29,6 +29,10 @@ export COOP_LOGIN_PASSWORD=...
 `coop-bridge-import.sh` reads additional vars (relay URL, CF Access creds, COOP API
 key) — see the script header. The enforcement webhooks are provisioned by
 `coop-setup-org.sh` step 6 (gated on `WEBHOOK_SECRET`), not a separate script.
+Account actions remain scoped to `nostr_event` by default. Set
+`COOP_ACCOUNT_ACTIONS=1` only after the adapter can handle `nostr_user` action
+targets; otherwise the Associated User panel can expose buttons that Coop accepts
+but the adapter cannot execute.
 
 ## Design notes
 
