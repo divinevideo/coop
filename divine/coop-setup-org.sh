@@ -608,6 +608,8 @@ else
   # is perfectly fine. The message added to stop the banner lying must not itself lie.
   SKIPPED_ACTIONS=""
   echo "==> Ensuring enforcement actions (-> $COOP_ADAPTER_URL/webhook/<Action>)"
+  echo "    WARNING: verify the adapter handles nostr_user item targets before using"
+  echo "    account actions; otherwise the Associated User buttons return an error."
   # Un-Restrict-Media is the reversal for Age-Restrict. It sends SAFE, which maps
   # to Active in Blossom and so reverses AgeRestricted, Restricted and Banned
   # alike. Without it Coop could age-restrict media and never undo it, which also

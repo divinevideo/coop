@@ -171,8 +171,10 @@ PY
 
 ACTION_BLOCK="$WORK/actions.sh"
 awk '/^  ACTIONS_LIST=/,/^  UNRESTRICT_STATUS=/' "$SRC" | sed '$d' > "$ACTION_BLOCK"
-grep -q '^  action_type_ids_json()' "$ACTION_BLOCK" || { echo "  FAIL  action scope function not captured"; fails=$((fails+1)); }
-if [ "$fails" -eq 0 ]; then
+if ! grep -q '^  action_type_ids_json()' "$ACTION_BLOCK"; then
+  echo "  FAIL  action scope function not captured"
+  fails=$((fails+1))
+else
   {
     printf 'TID=event-type\nUT_ID=user-type\n'
     cat "$ACTION_BLOCK"
@@ -183,19 +185,42 @@ done
 SH
   } > "$WORK/action-scopes.sh"
   ACTION_SCOPES=$(bash -euo pipefail "$WORK/action-scopes.sh")
-  while IFS='|' read -r action scope; do
-    case " Ban-User Suspend-User Unban-User Unsuspend-User " in
-      *" $action "*) expected='["event-type", "user-type"]' ;;
-      *) expected='["event-type"]' ;;
-    esac
-    if [ "$scope" != "$expected" ]; then
-      echo "  FAIL  $action scope is $scope; expected $expected"
-      fails=$((fails+1))
-    fi
-  done <<< "$ACTION_SCOPES"
-  if [ "$fails" -eq 0 ]; then
+  EXPECTED_ACTION_SCOPES=$(cat <<'SCOPES'
+Ban-User|["event-type", "user-type"]
+Suspend-User|["event-type", "user-type"]
+Unban-User|["event-type", "user-type"]
+Unsuspend-User|["event-type", "user-type"]
+Delete-Content|["event-type"]
+Hide-Content|["event-type"]
+Restore-Content|["event-type"]
+Age-Restrict|["event-type"]
+Un-Restrict-Media|["event-type"]
+SCOPES
+  )
+  if [ "$ACTION_SCOPES" = "$EXPECTED_ACTION_SCOPES" ]; then
     echo "  ok    account actions span event and user types; content actions remain event-only"
+  else
+    echo "  FAIL  shipped action set or scopes differ from the required config:"
+    diff <(printf '%s\n' "$EXPECTED_ACTION_SCOPES") <(printf '%s\n' "$ACTION_SCOPES") | sed 's/^/        /' || true
+    fails=$((fails+1))
   fi
+fi
+
+for payload in UV AV; do
+  line=$(grep -E "^[[:space:]]+$payload=" "$SRC" || true)
+  if [ "$(printf '%s\n' "$line" | grep -cF '$(action_type_ids_json "$AN")')" -eq 1 ]; then
+    echo "  ok    $payload mutation payload consumes the tested action scope"
+  else
+    echo "  FAIL  $payload mutation payload does not consume action_type_ids_json"
+    fails=$((fails+1))
+  fi
+done
+
+if grep -qF 'verify the adapter handles nostr_user item targets' "$SRC"; then
+  echo "  ok    operators are warned about the adapter compatibility requirement"
+else
+  echo "  FAIL  adapter compatibility warning is missing"
+  fails=$((fails+1))
 fi
 
 echo "accepted:"
