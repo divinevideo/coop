@@ -69,6 +69,13 @@ echo "==> Ensuring content type 'nostr_event'"
 # `pubkey`: the DB constraint valid_field_role_field_type requires creatorId to name a
 # RELATED_ITEM field, and `pubkey` is a STRING. The role and the field it names have to
 # arrive together, which is why they are in the same change.
+# NOT declared: `confidence` and `model`. The detector branch emits them with DEFAULTS
+# rather than omitting -- `model: ''` and `confidence: 0` when the features are absent --
+# and declaring a field is what turns it from ignored into rendered. That would put a blank
+# row on the card (see the warning below) and a `0` a moderator reads as "the model was 0%
+# confident" when it means "not reported". Declare them once the emitter omits them like
+# every other field in build_content_fields does.
+#
 # Profile fields (author_/reported_/reporter_) put PEOPLE on the review card instead
 # of three 64-character hex strings. The three prefixes are distinct on purpose:
 # `author` is the VERIFIED signer of the reported event, `reported` is the reporter's
@@ -99,7 +106,7 @@ echo "==> Ensuring content type 'nostr_event'"
 # resolved identity therefore sits immediately after their own pubkey rather than in a
 # block at the end; appended, the names landed below sixteen rows of hex, which
 # inverts the point of resolving them at all.
-CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"author_display_name","type":"STRING","required":false},{"name":"author_nip05","type":"STRING","required":false},{"name":"author_profile_state","type":"STRING","required":false},{"name":"author_profile_error","type":"STRING","required":false},{"name":"author_nip05_verified","type":"BOOLEAN","required":false},{"name":"author_follower_count","type":"NUMBER","required":false},{"name":"author_has_vanish_request","type":"BOOLEAN","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_display_name","type":"STRING","required":false},{"name":"reported_nip05","type":"STRING","required":false},{"name":"reported_profile_state","type":"STRING","required":false},{"name":"reported_profile_error","type":"STRING","required":false},{"name":"reported_nip05_verified","type":"BOOLEAN","required":false},{"name":"reported_follower_count","type":"NUMBER","required":false},{"name":"reported_has_vanish_request","type":"BOOLEAN","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"confidence","type":"NUMBER","required":false},{"name":"model","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"reporter_display_name","type":"STRING","required":false},{"name":"reporter_nip05","type":"STRING","required":false},{"name":"reporter_profile_state","type":"STRING","required":false},{"name":"reporter_profile_error","type":"STRING","required":false},{"name":"reporter_nip05_verified","type":"BOOLEAN","required":false},{"name":"reporter_follower_count","type":"NUMBER","required":false},{"name":"reporter_has_vanish_request","type":"BOOLEAN","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
+CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"author_display_name","type":"STRING","required":false},{"name":"author_nip05","type":"STRING","required":false},{"name":"author_profile_state","type":"STRING","required":false},{"name":"author_profile_error","type":"STRING","required":false},{"name":"author_nip05_verified","type":"BOOLEAN","required":false},{"name":"author_follower_count","type":"NUMBER","required":false},{"name":"author_has_vanish_request","type":"BOOLEAN","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_display_name","type":"STRING","required":false},{"name":"reported_nip05","type":"STRING","required":false},{"name":"reported_profile_state","type":"STRING","required":false},{"name":"reported_profile_error","type":"STRING","required":false},{"name":"reported_nip05_verified","type":"BOOLEAN","required":false},{"name":"reported_follower_count","type":"NUMBER","required":false},{"name":"reported_has_vanish_request","type":"BOOLEAN","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"reporter_display_name","type":"STRING","required":false},{"name":"reporter_nip05","type":"STRING","required":false},{"name":"reporter_profile_state","type":"STRING","required":false},{"name":"reporter_profile_error","type":"STRING","required":false},{"name":"reporter_nip05_verified","type":"BOOLEAN","required":false},{"name":"reporter_follower_count","type":"NUMBER","required":false},{"name":"reporter_has_vanish_request","type":"BOOLEAN","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
 CT_FIELD_ROLES='{"displayName":"text","creatorId":"author","threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
 CT_ID=$(type_id nostr_event)
@@ -625,6 +632,11 @@ else
   if [ "$UNRESTRICT_STATUS" = "404" ] || [ "$UNRESTRICT_STATUS" = "000" ]; then
     echo "    WARNING: adapter route /webhook/Un-Restrict-Media is not available (HTTP $UNRESTRICT_STATUS); skipping that action."
     ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
+    # The warning scrolls past nine action lines before the banner is printed. Downgrade the
+    # claim so the LAST thing on screen cannot contradict it. HTTP 000 is the DEFAULT outcome
+    # when running outside the cluster, since COOP_ADAPTER_URL defaults to a service name.
+    ACTIONS_PROVISIONED=partial
+    SKIPPED_ACTIONS="Un-Restrict-Media (adapter route unavailable, HTTP $UNRESTRICT_STATUS)"
   fi
   if [ -z "$UT_ID" ]; then
     echo "    ERROR: nostr_user typeId is empty; account actions would be scoped to nothing and render no buttons." >&2
@@ -658,7 +670,14 @@ else
     if echo "$RESP" | grep -q '"__typename":"MutateActionSuccessResponse"'; then
       echo "    '$AN' created"
     elif echo "$RESP" | grep -q 'ActionNameExistsError'; then
-      echo "    '$AN' exists (created concurrently); re-run to refresh its secret"
+      # Nothing was written for this action: not the callbackUrl, not the webhook secret,
+      # not itemTypeIds. If the actions query at the top of this step returned a GraphQL
+      # error payload over HTTP 200 (an expired session does this), EVERY id comes back
+      # empty, every action takes this path, and the run touches nothing at all while
+      # exiting 0. That also silently defeats "rotating WEBHOOK_SECRET is just a re-run".
+      echo "    '$AN' exists but was NOT updated: callbackUrl, secret and itemTypeIds are unchanged"
+      ACTIONS_PROVISIONED=partial
+      SKIPPED_ACTIONS="${SKIPPED_ACTIONS:+$SKIPPED_ACTIONS, }$AN (exists; not refreshed)"
     else
       echo "    ERROR: action create failed for '$AN': $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
     fi
@@ -668,6 +687,9 @@ fi
 echo "==> Done. Content type, queues, content rule and category routing are provisioned."
 if [ "${ACTIONS_PROVISIONED:-no}" = "yes" ]; then
   echo "    Enforcement actions are provisioned too."
+elif [ "${ACTIONS_PROVISIONED:-no}" = "partial" ]; then
+  echo "    Enforcement actions are only PARTIALLY provisioned. Not done: ${SKIPPED_ACTIONS:-unknown}."
+  echo "    Those actions will not reach the adapter, or still carry an old secret."
 else
   echo "    Enforcement actions were SKIPPED (no WEBHOOK_SECRET), so account actions are"
   echo "    NOT scoped to nostr_user and the Associated User panel will have no buttons."
