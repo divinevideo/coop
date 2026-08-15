@@ -602,6 +602,14 @@ record_adapter_probe_status() {
       echo "    The actions below can be written, but their callbacks will fail authentication."
       UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL rejected the configured webhook secret with HTTP $UNRESTRICT_STATUS"
       ;;
+    400)
+      echo "    adapter route exists (authenticated empty-target probe was rejected as expected)."
+      ;;
+    *)
+      echo "    WARNING: $COOP_ADAPTER_URL answered unexpected HTTP $UNRESTRICT_STATUS during the route probe."
+      echo "    The actions below can be written, but callback delivery is not confirmed."
+      UNVERIFIED_CALLBACKS="$COOP_ADAPTER_URL answered unexpected HTTP $UNRESTRICT_STATUS from here"
+      ;;
   esac
 }
 

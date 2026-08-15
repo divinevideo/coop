@@ -268,13 +268,18 @@ else
   fails=$((fails+1))
 fi
 
-grep '^UNVERIFIED_CALLBACKS=""$' "$SRC" > "$WORK/action-state-init.sh"
 cat > "$WORK/action_state_init.check" <<'SH'
-UNVERIFIED_CALLBACKS="stale inherited value"
-. "$1"
-[ -z "$UNVERIFIED_CALLBACKS" ]
+python3 - "$1" <<'PY'
+import sys
+
+src = open(sys.argv[1], encoding="utf-8").read()
+init = src.find('\nUNVERIFIED_CALLBACKS=""\n')
+branch = src.find('\nif [ -z "${WEBHOOK_SECRET:-}" ]; then\n')
+if init < 0 or branch < 0 or init > branch:
+    raise SystemExit("UNVERIFIED_CALLBACKS must be reset before the WEBHOOK_SECRET branch")
+PY
 SH
-check_script "internal callback state overrides an inherited caller value" 0 <(printf 'bash %q %q\n' "$WORK/action_state_init.check" "$WORK/action-state-init.sh")
+check_script "internal callback state resets before both secret branches" 0 <(printf 'bash %q %q\n' "$WORK/action_state_init.check" "$SRC")
 
 probe_line=$(grep 'UNRESTRICT_STATUS=.*webhook/Un-Restrict-Media' "$SRC" || true)
 if [ "$(printf '%s\n' "$probe_line" | grep -cF 'x-webhook-secret: $WEBHOOK_SECRET')" -eq 1 ] &&
@@ -323,6 +328,33 @@ ACTIONS_LIST=(Ban-User Un-Restrict-Media)
 ACTIONS_PROVISIONED=yes
 SKIPPED_ACTIONS=""
 UNVERIFIED_CALLBACKS=""
+UNRESTRICT_STATUS=403
+record_adapter_probe_status >/dev/null
+[ "$ACTIONS_PROVISIONED" = yes ]
+case "$UNVERIFIED_CALLBACKS" in *403*) ;; *) exit 1 ;; esac
+
+ACTIONS_LIST=(Ban-User Un-Restrict-Media)
+ACTIONS_PROVISIONED=yes
+SKIPPED_ACTIONS=""
+UNVERIFIED_CALLBACKS=""
+UNRESTRICT_STATUS=400
+record_adapter_probe_status >/dev/null
+[ "$ACTIONS_PROVISIONED" = yes ]
+[ -z "$UNVERIFIED_CALLBACKS" ]
+
+ACTIONS_LIST=(Ban-User Un-Restrict-Media)
+ACTIONS_PROVISIONED=yes
+SKIPPED_ACTIONS=""
+UNVERIFIED_CALLBACKS=""
+UNRESTRICT_STATUS=429
+record_adapter_probe_status >/dev/null
+[ "$ACTIONS_PROVISIONED" = yes ]
+case "$UNVERIFIED_CALLBACKS" in *429*) ;; *) exit 1 ;; esac
+
+ACTIONS_LIST=(Ban-User Un-Restrict-Media)
+ACTIONS_PROVISIONED=yes
+SKIPPED_ACTIONS=""
+UNVERIFIED_CALLBACKS=""
 UNRESTRICT_STATUS=404
 record_adapter_probe_status >/dev/null
 [ "$ACTIONS_PROVISIONED" = partial ]
@@ -338,7 +370,7 @@ record_adapter_probe_status >/dev/null
 [ "$ACTIONS_PROVISIONED" = yes ]
 case "$UNVERIFIED_CALLBACKS" in *000*) ;; *) exit 1 ;; esac
 SH
-check_script "000/404/5xx probe statuses set distinct banner state" 0 <(printf 'bash %q %q\n' "$WORK/probe_status.check" "$WORK/probe.sh")
+check_script "expected, missing, auth, server, transport, and unexpected probe statuses classify distinctly" 0 <(printf 'bash %q %q\n' "$WORK/probe_status.check" "$WORK/probe.sh")
 
 echo "final banner states:"
 cat > "$WORK/banner.check" <<'SH'
