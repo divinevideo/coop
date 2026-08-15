@@ -69,6 +69,7 @@ report_reason|Sexual Content|nudity
 report_reason|Violence & Extremism|violence
 TRIPLES
 )
+EXPECTED=$(printf '%s\n' "$EXPECTED" | LC_ALL=C sort)   # order-insensitive: add routes anywhere
 # The guard runs ONCE, at a fixed point. A row appended below it (CATROUTES+=(...)) is
 # unvalidated by the guard and invisible to the triple check, which reads only the literal
 # declaration. So require exactly one assignment and no appends anywhere in the file.
@@ -79,9 +80,18 @@ if [ "$_assigns" -ne 1 ]; then
   grep -nE '^[[:space:]]*CATROUTES\+?=' "$SRC" | sed 's/^/        /'
   fails=$((fails+1))
 fi
-ACTUAL=$(sed -n '/^CATROUTES=(/,/^)/p' "$SRC" | sed -n 's/^  "\(.*\)"$/\1/p' | LC_ALL=C sort)
+# Derive ACTUAL from BASH, not from text. A sed that matched only `  "row"` was blind to
+# five shapes bash accepts -- a trailing comment, tab/4-space/no indent, single quotes --
+# so an ADDED route vanished from the comparison and the suite reported all-clear while
+# bash held one more route than it printed. Text extraction fails safe on deletions (a
+# missing row still diffs) but fails OPEN on additions, which is the class that hides a
+# duplicate `label_value -> CSAM` row that would later overwrite the real CSAM rule.
+# Running the shipped block and printing the array is by construction what the script
+# iterates, so no shape can hide -- and it catches indexed assignment and eval too.
+{ cat "$WORK/real.sh"; echo 'printf "%s\n" "${CATROUTES[@]}"'; } > "$WORK/dump.sh"
+ACTUAL=$(bash -euo pipefail "$WORK/dump.sh" 2>/dev/null | LC_ALL=C sort)
 if [ "$ACTUAL" = "$EXPECTED" ]; then
-  echo "  ok    9 routes, each to its intended queue"
+  echo "  ok    $(printf '%s\n' "$ACTUAL" | grep -c .) routes, each to its intended queue"
 else
   echo "  FAIL  shipped routing table differs from the expected triples:"
   diff <(printf '%s\n' "$EXPECTED") <(printf '%s\n' "$ACTUAL") | sed 's/^/        /'
@@ -110,6 +120,10 @@ check "trailing comma (would ship ^\$ into CSAM)" 1 "label_value|CSAM|csam,"
 check "leading comma" 1 "label_value|CSAM|,csam"
 check "double comma" 1 "label_value|CSAM|csam,,sexual_minors"
 check "empty token list" 1 "label_value|CSAM|"
+# `read -ra` on a here-string sees only the FIRST line, so without this arm a wrapped array
+# element shipped ^csam\n$ -- a pattern matching nothing, silently disabling the CSAM route.
+check "newline inside a token list (wrapped array element)" 1 "label_value|CSAM|csam
+,sexual_minors"
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"
