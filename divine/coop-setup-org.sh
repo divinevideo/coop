@@ -103,9 +103,11 @@ echo "==> Ensuring content type 'nostr_event'"
 # FIELD ORDER IS LAYOUT. The card sorts stably with only one rule -- media last
 # (ManualReviewJobFieldsComponent.tsx:558-583) -- so declaration order is what a
 # moderator reads top to bottom, and the queue preview inherits it. Each person's
-# resolved identity therefore sits immediately after their own pubkey rather than in a
-# block at the end; appended, the names landed below sixteen rows of hex, which
-# inverts the point of resolving them at all.
+# resolved identity therefore sits immediately after the pubkey it belongs to, where one
+# is emitted -- osprey sends no reporter_pubkey (coop_sink.py uses the reporter's key only
+# to choose the profile prefix), so that block carries names with no key beside them.
+# Appended instead, the names would land below sixteen rows of hex, which inverts the
+# point of resolving them at all.
 CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"author_display_name","type":"STRING","required":false},{"name":"author_nip05","type":"STRING","required":false},{"name":"author_profile_state","type":"STRING","required":false},{"name":"author_profile_error","type":"STRING","required":false},{"name":"author_nip05_verified","type":"BOOLEAN","required":false},{"name":"author_follower_count","type":"NUMBER","required":false},{"name":"author_has_vanish_request","type":"BOOLEAN","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_display_name","type":"STRING","required":false},{"name":"reported_nip05","type":"STRING","required":false},{"name":"reported_profile_state","type":"STRING","required":false},{"name":"reported_profile_error","type":"STRING","required":false},{"name":"reported_nip05_verified","type":"BOOLEAN","required":false},{"name":"reported_follower_count","type":"NUMBER","required":false},{"name":"reported_has_vanish_request","type":"BOOLEAN","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"reporter_display_name","type":"STRING","required":false},{"name":"reporter_nip05","type":"STRING","required":false},{"name":"reporter_profile_state","type":"STRING","required":false},{"name":"reporter_profile_error","type":"STRING","required":false},{"name":"reporter_nip05_verified","type":"BOOLEAN","required":false},{"name":"reporter_follower_count","type":"NUMBER","required":false},{"name":"reporter_has_vanish_request","type":"BOOLEAN","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
 CT_FIELD_ROLES='{"displayName":"text","creatorId":"author","threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
@@ -601,6 +603,10 @@ if [ -z "${WEBHOOK_SECRET:-}" ]; then
   ACTIONS_PROVISIONED=no
 else
   ACTIONS_PROVISIONED=yes
+  # Initialise: the append below uses ${SKIPPED_ACTIONS:+...}, so an inherited value from
+  # the caller's shell would be prepended into the "Not done" list and name an action that
+  # is perfectly fine. The message added to stop the banner lying must not itself lie.
+  SKIPPED_ACTIONS=""
   echo "==> Ensuring enforcement actions (-> $COOP_ADAPTER_URL/webhook/<Action>)"
   # Un-Restrict-Media is the reversal for Age-Restrict. It sends SAFE, which maps
   # to Active in Blossom and so reverses AgeRestricted, Restricted and Banned
@@ -629,14 +635,27 @@ else
     esac
   }
   UNRESTRICT_STATUS=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$COOP_ADAPTER_URL/webhook/Un-Restrict-Media" -H "Content-Type: application/json" -H "x-webhook-secret: __coop_setup_route_probe__" -d '{}' || true)
-  if [ "$UNRESTRICT_STATUS" = "404" ] || [ "$UNRESTRICT_STATUS" = "000" ]; then
+  # 404 and 000 are NOT the same fact. 404 means the host answered and that one route is
+  # missing -- per-route, handled below. 000 means the host never answered at all, which
+  # says nothing about Un-Restrict-Media and everything about COOP_ADAPTER_URL: every one
+  # of the nine callbacks we are about to write points somewhere unreachable. Filing that
+  # under one route's name turns the probe's evidence into a misleading report, and this
+  # is the one signal that catches the documented failure where Coop answers the moderator
+  # 202 while the callback goes nowhere.
+  if [ "$UNRESTRICT_STATUS" = "000" ]; then
+    echo "    WARNING: $COOP_ADAPTER_URL did not answer at all (HTTP 000). This is not specific"
+    echo "    to Un-Restrict-Media: EVERY action callback written below points at that host."
+    echo "    Outside the cluster this is expected, since COOP_ADAPTER_URL defaults to a service name."
+    ACTIONS_PROVISIONED=partial
+    SKIPPED_ACTIONS="all actions (adapter unreachable at $COOP_ADAPTER_URL, HTTP 000)"
+  elif [ "$UNRESTRICT_STATUS" = "404" ]; then
     echo "    WARNING: adapter route /webhook/Un-Restrict-Media is not available (HTTP $UNRESTRICT_STATUS); skipping that action."
     ACTIONS_LIST=(Ban-User Suspend-User Unban-User Unsuspend-User Delete-Content Hide-Content Restore-Content Age-Restrict)
     # The warning scrolls past nine action lines before the banner is printed. Downgrade the
     # claim so the LAST thing on screen cannot contradict it. HTTP 000 is the DEFAULT outcome
     # when running outside the cluster, since COOP_ADAPTER_URL defaults to a service name.
     ACTIONS_PROVISIONED=partial
-    SKIPPED_ACTIONS="Un-Restrict-Media (adapter route unavailable, HTTP $UNRESTRICT_STATUS)"
+    SKIPPED_ACTIONS="Un-Restrict-Media (route missing, HTTP 404)"
   fi
   if [ -z "$UT_ID" ]; then
     echo "    ERROR: nostr_user typeId is empty; account actions would be scoped to nothing and render no buttons." >&2
