@@ -40,6 +40,14 @@ grep -q '^record_adapter_probe_status' "$WORK/probe.sh" || { echo "FATAL: probe 
 grep -q '^action_type_ids_json' "$WORK/action_scope.sh" || { echo "FATAL: action scope function not captured"; exit 1; }
 fails=0
 
+extract_fields() { # src dest -- capture the shipped field declaration from a source file
+  awk '/^CT_FIELDS=/{f=1} f{print} f && /^# --- end field declaration/{exit}' "$1" > "$2"
+  # Returns non-zero rather than exiting: the positive controls deliberately feed this
+  # broken input, and an exit here would take the whole suite with it.
+  grep -q '^profile_fields_json()' "$2" || { echo "field generator not captured from $1"; return 1; }
+  grep -q 'end field declaration'  "$2" || { echo "field declaration range never terminated in $1"; return 1; }
+}
+
 # Production runs under `set -euo pipefail`, so the CHILD must too. Options are
 # per-process: `( set -euo pipefail; bash f )` gives them to the subshell and NOT to the
 # bash it spawns, which is how an unset-variable abort stayed invisible here even after
@@ -143,23 +151,29 @@ else
 fi
 
 echo "the shipped account-moderation config is internally consistent:"
-cat > "$WORK/content_fields.check" <<'SH'
-python3 - "$1" <<'PY'
+# Pins the COMPLETE shipped schema: name, type, required, IN ORDER.
+#
+# It reads the EVALUATED CT_FIELDS, not the literal assignment. It used to regex the
+# literal, which WAS the artifact until this file started rewriting CT_FIELDS to append
+# the profile fields. From that point a literal-regex check validated a value that is no
+# longer what gets POSTed: inserting a rewrite between the literal and the splice silently
+# downgraded media_url from VIDEO to STRING with the whole suite green.
+#
+# `required` matters more than it looks. Osprey OMITS six of the seven profile suffixes
+# whenever it has nothing to say, and Coop rejects an ENTIRE item when a required field is
+# absent, so flipping these to required:true would 400 every submission and strand every
+# report. It is pinned here rather than left to reviewer attention.
+extract_fields "$SRC" "$WORK/schema_block.sh" || { echo "FATAL: cannot read the shipped field declaration"; exit 1; }
+cat > "$WORK/schema.check" <<'SHEOF'
+set -euo pipefail
+# shellcheck disable=SC1090
+. "$1"
+python3 - "$CT_FIELDS" "$CT_FIELD_ROLES" <<'PYEOF'
 import json
-import re
 import sys
 
-src = open(sys.argv[1], encoding="utf-8").read()
-
-def assignment(name):
-    match = re.search(rf"^{name}='([^']*)'$", src, re.M)
-    if not match:
-        raise SystemExit(f"FAIL: {name} assignment not found")
-    return json.loads(match.group(1))
-
-fields = assignment("CT_FIELDS")
-roles = assignment("CT_FIELD_ROLES")
-by_name = {field["name"]: field for field in fields}
+fields = json.loads(sys.argv[1])
+roles = json.loads(sys.argv[2])
 
 expected_fields = [
     ("event_id", "STRING", True),
@@ -181,20 +195,45 @@ expected_fields = [
     ("reporter_pubkey", "STRING", False),
     ("relay_manager_url", "URL", False),
     ("author", "RELATED_ITEM", False),
+    # Profile enrichment, in EMISSION order (prefix x suffix). Order is pinned because the
+    # setup script states that ordering decides where these read on a moderator's card.
+    ("author_profile_state", "STRING", False),
+    ("author_profile_error", "STRING", False),
+    ("author_has_vanish_request", "BOOLEAN", False),
+    ("author_display_name", "STRING", False),
+    ("author_nip05", "STRING", False),
+    ("author_nip05_verified", "BOOLEAN", False),
+    ("author_follower_count", "NUMBER", False),
+    ("reported_profile_state", "STRING", False),
+    ("reported_profile_error", "STRING", False),
+    ("reported_has_vanish_request", "BOOLEAN", False),
+    ("reported_display_name", "STRING", False),
+    ("reported_nip05", "STRING", False),
+    ("reported_nip05_verified", "BOOLEAN", False),
+    ("reported_follower_count", "NUMBER", False),
+    ("reporter_profile_state", "STRING", False),
+    ("reporter_profile_error", "STRING", False),
+    ("reporter_has_vanish_request", "BOOLEAN", False),
+    ("reporter_display_name", "STRING", False),
+    ("reporter_nip05", "STRING", False),
+    ("reporter_nip05_verified", "BOOLEAN", False),
+    ("reporter_follower_count", "NUMBER", False),
 ]
-actual_fields = [(field["name"], field["type"], field["required"]) for field in fields]
+actual_fields = [(f["name"], f["type"], f["required"]) for f in fields]
 if actual_fields != expected_fields:
-    raise SystemExit(f"FAIL: content fields differ from the reviewed schema: {actual_fields!r}")
+    raise SystemExit("FAIL: shipped content fields differ from the reviewed schema: %r" % (actual_fields,))
 
-author = by_name.get("author")
-if author != {"name": "author", "type": "RELATED_ITEM", "required": False}:
-    raise SystemExit(f"FAIL: author field is not the expected optional RELATED_ITEM: {author!r}")
+names = [f["name"] for f in fields]
+dupes = sorted({n for n in names if names.count(n) > 1})
+if dupes:
+    raise SystemExit("FAIL: duplicate field names: %s" % dupes)
+
 if roles.get("creatorId") != "author":
-    raise SystemExit(f"FAIL: creatorId role does not reference author: {roles.get('creatorId')!r}")
+    raise SystemExit("FAIL: creatorId role does not reference author: %r" % (roles.get("creatorId"),))
 
-PY
-SH
-check_script "content fields and creatorId match the reviewed producer-independent schema" 0 <(printf 'bash %q %q\n' "$WORK/content_fields.check" "$SRC")
+PYEOF
+SHEOF
+check_script "the SHIPPED fields, types, required flags and creatorId match the reviewed schema" 0 <(printf 'bash %q %q\n' "$WORK/schema.check" "$WORK/schema_block.sh")
 
 ACTION_BLOCK="$WORK/actions.sh"
 awk '/^  ACTIONS_LIST=/,/^  UNRESTRICT_STATUS=/' "$SRC" | sed '$d' > "$ACTION_BLOCK"
@@ -421,124 +460,57 @@ check "empty token list" 1 "label_value|CSAM|"
 check "newline inside a token list (wrapped array element)" 1 "label_value|CSAM|csam
 ,sexual_minors"
 
-# --- Profile enrichment fields -------------------------------------------------------
+# --- Positive controls for the schema pin ---------------------------------------------
 #
-# The 21 profile fields are GENERATED in the setup script from a prefix x suffix rule,
-# because osprey generates them the same way (divine/plugins/src/coop_profile.py builds
-# every key as f'{prefix}_{suffix}'). A hand-typed list of 21 strings on the consumer side
-# is exactly what drifts from a generated list on the producer side. So the script derives
-# and this test PINS: the script cannot rot by typo, and the derivation cannot change
-# silently, because changing PROFILE_PREFIXES or PROFILE_SUFFIX_TYPES makes the pin go red.
+# The pin above is only a guard if it can go red. These mutate the SHIPPED script and
+# require the pin to reject the result. Three properties make them non-vacuous:
 #
-# READ THE ARTIFACT, NOT THE GENERATOR. An earlier version of this block called
-# profile_fields_json directly. That proved the generator produced 21 correct names and
-# proved NOTHING about whether they reached CT_FIELDS -- the string actually POSTed to
-# Coop. Deleting the splice line left this suite entirely green while provisioning a
-# 19-field org, and the well-formedness check printed "19 fields" without asserting it.
-# Everything below extracts from $CT_FIELDS after the shipped assignment has run.
-extract_fields() { # src dest -- capture the shipped field declaration from a source file
-  awk '/^CT_FIELDS=/{f=1} f{print} f && /^# --- end field declaration/{exit}' "$1" > "$2"
-  grep -q '^profile_fields_json()' "$2" || { echo "FATAL: profile field generator not captured from $1"; exit 1; }
-  grep -q 'end field declaration' "$2"  || { echo "FATAL: field declaration range never terminated in $1"; exit 1; }
-}
-
-# name:TYPE, not name alone. Type is load-bearing: the queue preview selects on type, so a
-# BOOLEAN declared STRING moves where a moderator sees it, and follower_count as STRING
-# sorts lexically. A name-only pin let nip05_verified BOOLEAN -> STRING through.
-# The three identifier fields are excluded: osprey sets them directly, they are not built
-# by the prefix x suffix rule, and including them would make this pin drift-blind to the
-# rule it exists to pin.
-PF_EXTRACT='printf "%s" "$CT_FIELDS" | grep -oE "\"name\":\"(author|reported|reporter)_[a-z0-9_]+\",\"type\":\"[A-Z_]+\"" | grep -vE "\"name\":\"(reported_pubkey|reported_event_id|reporter_pubkey)\"" | sed "s/\"name\":\"//; s/\",\"type\":\"/:/; s/\"\$//" | LC_ALL=C sort'
-
-profile_names_from() { # src -> sorted "name:TYPE" lines from the SHIPPED CT_FIELDS
-  extract_fields "$1" "$WORK/pf_fields.sh"
-  { cat "$WORK/pf_fields.sh"; printf '%s\n' "$PF_EXTRACT"; } > "$WORK/pf_names.sh"
-  run "$WORK/pf_names.sh"
-}
-
-# Pinned by construction: 3 prefixes x 7 suffixes. Written longhand on purpose -- a pin
-# that recomputes the rule it is pinning proves nothing.
-EXPECTED_PROFILE=$(cat <<'PFIELDS'
-author_display_name:STRING
-author_follower_count:NUMBER
-author_has_vanish_request:BOOLEAN
-author_nip05:STRING
-author_nip05_verified:BOOLEAN
-author_profile_error:STRING
-author_profile_state:STRING
-reported_display_name:STRING
-reported_follower_count:NUMBER
-reported_has_vanish_request:BOOLEAN
-reported_nip05:STRING
-reported_nip05_verified:BOOLEAN
-reported_profile_error:STRING
-reported_profile_state:STRING
-reporter_display_name:STRING
-reporter_follower_count:NUMBER
-reporter_has_vanish_request:BOOLEAN
-reporter_nip05:STRING
-reporter_nip05_verified:BOOLEAN
-reporter_profile_error:STRING
-reporter_profile_state:STRING
-PFIELDS
-)
-
-echo "the shipped CT_FIELDS carries the pinned profile fields:"
-ACTUAL_PROFILE=$(profile_names_from "$SRC") || { echo "  FAIL  extraction errored"; fails=$((fails+1)); ACTUAL_PROFILE=''; }
-if [ "$ACTUAL_PROFILE" = "$EXPECTED_PROFILE" ]; then
-  echo "  ok    21 profile fields reach CT_FIELDS, names and types as osprey builds them"
-else
-  echo "  FAIL  profile fields in CT_FIELDS drifted from the pin"
-  diff <(printf '%s\n' "$EXPECTED_PROFILE") <(printf '%s\n' "$ACTUAL_PROFILE") | sed 's/^/        /'
-  fails=$((fails+1))
-fi
-
-# Positive controls. A pin that has never been seen to go red is indistinguishable from one
-# that compares nothing. Each control asserts its OWN mutation applied first -- a sed that
-# silently matches nothing would otherwise "pass" by testing the unmodified file.
+#   1. Each asserts its own mutation applied. A sed that silently matches nothing would
+#      otherwise "pass" by testing the unmodified file.
+#   2. Rejection must come from the PIN, not from collateral damage. An earlier version
+#      compared output strings, so a mutation that merely broke bash produced different
+#      output and scored a pass while proving nothing. A control now has to see either a
+#      FAIL: from the schema check or an unreadable field block, and says which.
+#   3. They drive the real schema check, not a parallel re-implementation of it. A control
+#      that exercises a copy of the pin cannot tell you the shipped pin discriminates.
+#
+# The first control is the one that matters most, and is the reason this section exists:
+# the generator can be perfectly correct while its output never reaches CT_FIELDS.
 pin_control() { # name sed-expression
-  local name="$1" expr="$2" got
-  sed "$expr" "$SRC" > "$WORK/pf_mut.sh"
-  if cmp -s "$SRC" "$WORK/pf_mut.sh"; then
+  local name="$1" expr="$2" out rc
+  sed "$expr" "$SRC" > "$WORK/ctl_src.sh"
+  if cmp -s "$SRC" "$WORK/ctl_src.sh"; then
     printf '  FAIL  %s -- mutation did not apply, so this control tested nothing\n' "$name"
     fails=$((fails+1)); return
   fi
-  got=$(profile_names_from "$WORK/pf_mut.sh" 2>/dev/null) || got=''
-  if [ "$got" != "$EXPECTED_PROFILE" ]; then printf '  ok    %s\n' "$name"
-  else printf '  FAIL  %s -- the pin did not notice\n' "$name"; fails=$((fails+1)); fi
+  if ! extract_fields "$WORK/ctl_src.sh" "$WORK/ctl_block.sh" >/dev/null 2>&1; then
+    printf '  ok    %s (rejected: field declaration unreadable)\n' "$name"; return
+  fi
+  out=$(bash "$WORK/schema.check" "$WORK/ctl_block.sh" 2>&1) && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'FAIL:'; then
+    printf '  ok    %s (rejected by the schema pin)\n' "$name"
+  elif [ "$rc" -ne 0 ]; then
+    printf '  FAIL  %s -- rejected, but NOT by the pin (the mutation broke the script): %s\n' "$name" "$(printf '%s' "$out" | tail -1)"
+    fails=$((fails+1))
+  else
+    printf '  FAIL  %s -- the pin did not notice\n' "$name"
+    fails=$((fails+1))
+  fi
 }
 
-echo "positive controls: the pin discriminates:"
-# The one that matters most: the generator is correct but its output never reaches the
-# artifact. This is what the previous version of this test could not see.
-pin_control "the splice is deleted (generator fine, CT_FIELDS unchanged)" '/^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$/d'
-pin_control "a whole prefix is dropped (card loses reporter identity)"    's/^PROFILE_PREFIXES="author reported reporter"$/PROFILE_PREFIXES="author reported"/'
-pin_control "a field is renamed"                                          's/display_name:STRING/displayname:STRING/'
-pin_control "a field type changes (BOOLEAN -> STRING)"                    's/nip05_verified:BOOLEAN/nip05_verified:STRING/'
-pin_control "a field is removed from the rule"                            's/ nip05:STRING//'
-
-# Every field Coop is given is rendered, and a duplicate name is a field defined twice with
-# no indication which wins. The COUNT is asserted, not merely printed: printing it is how a
-# 19-field org read as healthy.
-echo "the shipped CT_FIELDS is well-formed:"
-extract_fields "$SRC" "$WORK/wf_fields.sh"
-{ cat "$WORK/wf_fields.sh"
-  printf '%s\n' 'printf "%s" "$CT_FIELDS" | python3 -c "
-import json,sys
-fields = json.load(sys.stdin)
-names = [f[\"name\"] for f in fields]
-dupes = {n for n in names if names.count(n) > 1}
-assert not dupes, f\"duplicate field names: {sorted(dupes)}\"
-allowed = {\"STRING\",\"NUMBER\",\"BOOLEAN\",\"URL\",\"IMAGE\",\"VIDEO\",\"RELATED_ITEM\"}
-bad = {f[\"name\"]: f[\"type\"] for f in fields if f[\"type\"] not in allowed}
-assert not bad, f\"unknown field types: {bad}\"
-assert len(fields) == 40, f\"expected 40 fields (19 core + 21 profile), got {len(fields)}\"
-print(len(fields))
-"'
-} > "$WORK/wellformed.sh"
-COUNT=$(run "$WORK/wellformed.sh") && rc=0 || rc=$?
-if [ "${rc:-0}" -eq 0 ]; then echo "  ok    valid JSON, no duplicate names, all types known, $COUNT fields"
-else echo "  FAIL  CT_FIELDS malformed: $COUNT"; fails=$((fails+1)); fi
+echo "positive controls: the schema pin discriminates:"
+pin_control "the splice is deleted (generator correct, CT_FIELDS never gets it)" '/^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$/d'
+pin_control "a whole prefix is dropped (card loses reporter identity)"           's/^PROFILE_PREFIXES="author reported reporter"$/PROFILE_PREFIXES="author reported"/'
+pin_control "a field is renamed"                                                 's/display_name:STRING/displayname:STRING/'
+pin_control "a field type changes (BOOLEAN -> STRING)"                           's/nip05_verified:BOOLEAN/nip05_verified:STRING/'
+pin_control "a field is removed from the rule"                                   's/ nip05:STRING//'
+pin_control "the emission ORDER changes"                                         's/profile_state:STRING profile_error:STRING/profile_error:STRING profile_state:STRING/'
+# required:true would make Coop 400 every submission, because osprey omits six of the
+# seven suffixes whenever it has nothing to say.
+pin_control "the profile fields become required"                                 's/,\"required\":false}/,\"required\":true}/'
+# A rewrite between the literal and the splice: the shape that made regexing the literal
+# assignment stop being a check on the artifact.
+pin_control "CT_FIELDS is rewritten after the literal (media_url VIDEO -> STRING)" 's|^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$|CT_FIELDS="${CT_FIELDS//VIDEO/STRING}"\n&|'
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"
