@@ -150,6 +150,13 @@ if uncovered:
     print("       certify parity for those fields.")
     raise SystemExit(2)
 
+# ...and the run must not EXCEED the rule either. The AST cannot see a key built by
+# concatenation or any other shape, but the execution does -- and until now that evidence
+# was collected and thrown away. Adding out[prefix + '_account_age_days'] to coop_profile.py
+# left this printing "agree exactly" while Coop silently dropped the field. The docstring
+# promised both directions; only one was implemented.
+unknown = sorted(executed - expected)
+
 # --- coop side -------------------------------------------------------------------------
 coop_prefixes = set((work / 'coop_prefixes.txt').read_text().split())
 coop_suffixes = {st.split(':', 1)[0] for st in (work / 'coop_suffixes.txt').read_text().split()}
@@ -166,6 +173,9 @@ declared_profile = {n for n in declared
                     if n.split('_')[0] in all_prefixes and n not in IDENTIFIERS}
 
 problems = []
+if unknown:
+    problems.append("osprey emits keys the prefix x suffix rule does not describe, so no "
+                    f"declaration can exist for them and Coop drops them: {unknown}")
 if prefixes != coop_prefixes:
     problems.append(f"PREFIX rule differs: osprey {sorted(prefixes)} vs coop {sorted(coop_prefixes)}")
 if suffixes != coop_suffixes:

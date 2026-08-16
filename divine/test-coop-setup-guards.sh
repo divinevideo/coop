@@ -223,11 +223,6 @@ actual_fields = [(f["name"], f["type"], f["required"]) for f in fields]
 if actual_fields != expected_fields:
     raise SystemExit("FAIL: shipped content fields differ from the reviewed schema: %r" % (actual_fields,))
 
-names = [f["name"] for f in fields]
-dupes = sorted({n for n in names if names.count(n) > 1})
-if dupes:
-    raise SystemExit("FAIL: duplicate field names: %s" % dupes)
-
 if roles.get("creatorId") != "author":
     raise SystemExit("FAIL: creatorId role does not reference author: %r" % (roles.get("creatorId"),))
 
@@ -510,12 +505,36 @@ pin_control() { # name sed-expression
 cat > "$WORK/boundary.check" <<'SHEOF'
 set -euo pipefail
 src="$1"
-n=$(grep -cE '^[[:space:]]*CT_FIELDS\+?=' "$src" || true)
-[ "$n" -eq 2 ] || { echo "FAIL: CT_FIELDS is assigned $n times, expected exactly 2 (the literal and the profile splice). An assignment after '# --- end field declaration ---' is invisible to the schema pin but IS what gets provisioned."; exit 1; }
-n=$(grep -cE '^[[:space:]]*CT_FIELD_ROLES\+?=' "$src" || true)
-[ "$n" -eq 1 ] || { echo "FAIL: CT_FIELD_ROLES is assigned $n times, expected exactly 1. A second assignment can unbind creatorId from author without the pin seeing it."; exit 1; }
-n=$(grep -cF '"$CT_FIELDS" "$CT_FIELD_ROLES"' "$src" || true)
-[ "$n" -eq 2 ] || { echo "FAIL: the (CT_FIELDS, CT_FIELD_ROLES) pair is consumed $n times, expected 2 (the update branch and the create branch). A provisioning call reading different variables would bypass the pin entirely."; exit 1; }
+
+# POSITION, not count. An earlier version asserted "CT_FIELDS is assigned exactly twice",
+# which fired on a legitimate second generated family spliced INSIDE the pinned region and
+# told the developer, falsely, that something had escaped it. The obvious repair to a wrong
+# diagnosis is to bump the number, which would permanently admit one real escape. A guard
+# whose message can be false teaches people to weaken it.
+mark=$(grep -n '^# --- end field declaration ---$' "$src" | cut -d: -f1 || true)
+[ -n "$mark" ] || { echo "FAIL: the end-of-declaration marker is missing, so the pinned region has no lower bound"; exit 1; }
+
+escaped=$(awk -v m="$mark" 'NR > m && /^[[:space:]]*(CT_FIELDS|CT_FIELD_ROLES)\+?=/ { print NR": "$0 }' "$src")
+[ -z "$escaped" ] || {
+  echo "FAIL: a schema assignment sits BELOW the pinned region, so the schema pin evaluates one value while a different one is provisioned:"
+  echo "$escaped"
+  exit 1
+}
+
+# Both provisioning branches must send the variables the pin actually checked. Phrased per
+# call site rather than as a total, so extracting the two near-identical printf calls into
+# one helper -- an obvious cleanup -- does not trip it.
+bad=$(grep -n 'CT_VARS=$(printf' "$src" | grep -vF '"$CT_FIELDS" "$CT_FIELD_ROLES"' || true)
+[ -z "$bad" ] || {
+  echo "FAIL: a provisioning call does not send the pinned (CT_FIELDS, CT_FIELD_ROLES) pair, so it bypasses the schema pin:"
+  echo "$bad"
+  exit 1
+}
+
+# SCOPE, stated honestly: this catches an assignment a future edit puts in the wrong place.
+# It is syntactic, so it does not catch deliberate evasion (eval, printf -v, declare -n,
+# a nameref). That is the right trade -- the risk here is a careless edit, not an attacker
+# with commit access -- but the limit belongs in writing rather than in someone's head.
 SHEOF
 echo "the pinned region actually reaches the provisioning call:"
 check_script "no schema assignment escapes the pinned region" 0 <(printf 'bash %q %q\n' "$WORK/boundary.check" "$SRC")
@@ -539,7 +558,8 @@ boundary_control() { # name sed-expression
 
 boundary_control "CT_FIELDS re-assigned below the marker (media_url VIDEO -> STRING)" 's|^# --- end field declaration ---$|&\nCT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
 boundary_control "CT_FIELD_ROLES re-assigned below the marker (creatorId unbound)"    's|^# --- end field declaration ---$|&\nCT_FIELD_ROLES="${CT_FIELD_ROLES//author/null}"|'
-boundary_control "a provisioning branch reads a different variable"                   's|"\$CT_FIELDS" "\$CT_FIELD_ROLES"|"$OTHER_FIELDS" "$CT_FIELD_ROLES"|'
+boundary_control "a provisioning branch sends a different variable"                   's|"\$CT_FIELDS" "\$CT_FIELD_ROLES"|"$OTHER_FIELDS" "$CT_FIELD_ROLES"|'
+boundary_control "the end-of-declaration marker is deleted"                          '/^# --- end field declaration ---$/d'
 
 echo "positive controls: the schema pin discriminates:"
 pin_control "the splice is deleted (generator correct, CT_FIELDS never gets it)" '/^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$/d'
