@@ -421,5 +421,104 @@ check "empty token list" 1 "label_value|CSAM|"
 check "newline inside a token list (wrapped array element)" 1 "label_value|CSAM|csam
 ,sexual_minors"
 
+# --- Profile enrichment fields -------------------------------------------------------
+#
+# The 21 profile fields are GENERATED in the setup script from a prefix x suffix rule,
+# because osprey generates them the same way (divine/plugins/src/coop_profile.py builds
+# every key as f'{prefix}_{suffix}'). A hand-typed list of 21 strings on the consumer side
+# is exactly what drifts from a generated list on the producer side.
+#
+# So the script derives and this test PINS. That split is the point: the script cannot rot
+# by typo, and the derivation cannot change silently, because changing PROFILE_PREFIXES or
+# PROFILE_SUFFIX_TYPES makes the pinned set below go red.
+#
+# The extraction runs the SHIPPED CT_FIELDS assignment, not a copy, so what is asserted is
+# the artifact actually provisioned to Coop.
+awk '/^CT_FIELDS=/{flag=1} flag{print} flag && /^# --- end field declaration/{exit}' "$SRC" > "$WORK/fields.sh"
+grep -q '^profile_fields_json()' "$WORK/fields.sh" || { echo "FATAL: profile field generator not captured"; exit 1; }
+grep -q 'end field declaration' "$WORK/fields.sh"  || { echo "FATAL: field declaration range never terminated"; exit 1; }
+
+# Pinned by construction: 3 prefixes x 7 suffixes. Written out longhand on purpose -- a
+# pin that recomputes the rule it is pinning proves nothing.
+EXPECTED_PROFILE=$(cat <<'PFIELDS'
+author_display_name:STRING
+author_follower_count:NUMBER
+author_has_vanish_request:BOOLEAN
+author_nip05:STRING
+author_nip05_verified:BOOLEAN
+author_profile_error:STRING
+author_profile_state:STRING
+reported_display_name:STRING
+reported_follower_count:NUMBER
+reported_has_vanish_request:BOOLEAN
+reported_nip05:STRING
+reported_nip05_verified:BOOLEAN
+reported_profile_error:STRING
+reported_profile_state:STRING
+reporter_display_name:STRING
+reporter_follower_count:NUMBER
+reporter_has_vanish_request:BOOLEAN
+reporter_nip05:STRING
+reporter_nip05_verified:BOOLEAN
+reporter_profile_error:STRING
+reporter_profile_state:STRING
+PFIELDS
+)
+
+# Pin name:TYPE, not name alone. A type change is silent to a name-only pin, and type is
+# load-bearing: follower_count as STRING sorts lexically, and the queue preview selects on
+# type, so a BOOLEAN declared STRING changes where a moderator sees it.
+PF_EXTRACT='profile_fields_json | grep -oE "\"name\":\"[a-z0-9_]+\",\"type\":\"[A-Z_]+\"" | sed "s/\"name\":\"//; s/\",\"type\":\"/:/; s/\"\$//" | LC_ALL=C sort'
+
+# Emit every generated profile field name from the shipped assignment.
+{ cat "$WORK/fields.sh"
+  printf '%s\n' "$PF_EXTRACT"
+} > "$WORK/names.sh"
+
+echo "the shipped profile fields match the pinned set:"
+ACTUAL_PROFILE=$(run "$WORK/names.sh") || { echo "  FAIL  generator errored: $ACTUAL_PROFILE"; fails=$((fails+1)); ACTUAL_PROFILE=''; }
+if [ "$ACTUAL_PROFILE" = "$EXPECTED_PROFILE" ]; then
+  echo "  ok    21 profile fields, names exactly as osprey builds them"
+else
+  echo "  FAIL  profile field set drifted from the pin"
+  diff <(printf '%s\n' "$EXPECTED_PROFILE") <(printf '%s\n' "$ACTUAL_PROFILE") | sed 's/^/        /'
+  fails=$((fails+1))
+fi
+
+# Positive control. The pin above is only a guard if it can go red; a set comparison that
+# has never been seen to fail is indistinguishable from one that compares nothing.
+echo "positive control: the pin discriminates:"
+{ cat "$WORK/fields.sh"
+  printf '%s\n' 'PROFILE_PREFIXES="author reported"'
+  printf '%s\n' "$PF_EXTRACT"
+} > "$WORK/mutant.sh"
+MUTANT=$(run "$WORK/mutant.sh") || MUTANT=''
+if [ "$MUTANT" != "$EXPECTED_PROFILE" ] && [ -n "$MUTANT" ]; then
+  echo "  ok    dropping a prefix is caught (would ship a card with no reporter identity)"
+else
+  echo "  FAIL  dropping a whole prefix did NOT change the field set -- the pin is vacuous"
+  fails=$((fails+1))
+fi
+
+# Every field Coop is given is rendered, and a duplicate name is a field defined twice with
+# no indication which definition wins. Cheap to assert, silent and confusing if it happens.
+echo "the shipped CT_FIELDS is well-formed:"
+{ cat "$WORK/fields.sh"
+  printf '%s\n' 'printf "%s" "$CT_FIELDS" | python3 -c "
+import json,sys
+fields = json.load(sys.stdin)
+names = [f[\"name\"] for f in fields]
+dupes = {n for n in names if names.count(n) > 1}
+assert not dupes, f\"duplicate field names: {sorted(dupes)}\"
+allowed = {\"STRING\",\"NUMBER\",\"BOOLEAN\",\"URL\",\"IMAGE\",\"VIDEO\",\"RELATED_ITEM\"}
+bad = {f[\"name\"]: f[\"type\"] for f in fields if f[\"type\"] not in allowed}
+assert not bad, f\"unknown field types: {bad}\"
+print(len(fields))
+"'
+} > "$WORK/wellformed.sh"
+COUNT=$(run "$WORK/wellformed.sh") && rc=0 || rc=$?
+if [ "${rc:-0}" -eq 0 ]; then echo "  ok    valid JSON, no duplicate names, all types known ($COUNT fields)"
+else echo "  FAIL  CT_FIELDS malformed: $COUNT"; fails=$((fails+1)); fi
+
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"
