@@ -471,8 +471,8 @@ check "newline inside a token list (wrapped array element)" 1 "label_value|CSAM|
 #
 # The first control is the one that matters most, and is the reason this section exists:
 # the generator can be perfectly correct while its output never reaches CT_FIELDS.
-pin_control() { # name sed-expression
-  local name="$1" expr="$2" out rc
+pin_control() { # name expected-message-fragment sed-expression
+  local name="$1" want="$2" expr="$3" out rc
   sed "$expr" "$SRC" > "$WORK/ctl_src.sh"
   if cmp -s "$SRC" "$WORK/ctl_src.sh"; then
     printf '  FAIL  %s -- mutation did not apply, so this control tested nothing\n' "$name"
@@ -482,7 +482,7 @@ pin_control() { # name sed-expression
     printf '  ok    %s (rejected: field declaration unreadable)\n' "$name"; return
   fi
   out=$(bash "$WORK/schema.check" "$WORK/ctl_block.sh" 2>&1) && rc=0 || rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'FAIL:'; then
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$want"; then
     printf '  ok    %s (rejected by the schema pin)\n' "$name"
   elif [ "$rc" -ne 0 ]; then
     printf '  FAIL  %s -- rejected, but NOT by the pin (the mutation broke the script): %s\n' "$name" "$(printf '%s' "$out" | tail -1)"
@@ -532,7 +532,9 @@ escaped=$(awk -v m="$mark" 'NR > m+0 && /^[[:space:]]*(export|readonly|declare|t
 # its own it is vacuous exactly when it matters most: rename CT_VARS and the set is empty,
 # every line "passes", and the pin governs nothing. Assert the pinned pair is read at all
 # before asserting where it is read.
-uses=$(grep -cF '"$CT_FIELDS" "$CT_FIELD_ROLES"' "$src" || true)
+# Comment lines excluded: a stale comment mentioning the pair satisfied a bare count,
+# which reopened the exact vacuity this floor exists to close.
+uses=$(grep -F '"$CT_FIELDS" "$CT_FIELD_ROLES"' "$src" | grep -vc '^[[:space:]]*#' || true)
 [ "$uses" -ge 1 ] || { echo "FAIL: nothing in the script reads the pinned (CT_FIELDS, CT_FIELD_ROLES) pair, so the schema pin governs nothing that is actually provisioned"; exit 1; }
 
 # Then per call site, so extracting the two near-identical printf calls into one helper --
@@ -558,44 +560,54 @@ echo "the pinned region actually reaches the provisioning call:"
 check_script "no schema assignment escapes the pinned region" 0 <(printf 'bash %q %q\n' "$WORK/boundary.check" "$SRC")
 
 # Controls for the boundary guard, so it is not itself a check that cannot go red.
-boundary_control() { # name sed-expression
-  local name="$1" expr="$2" out rc
+# A control must name WHICH assertion it expects to trip. Matching a bare "FAIL:" let a
+# control pass on a NEIGHBOUR's failure: an unanchored sed hit both provisioning branches,
+# emptied the floor, and the control scored the floor's message as proof that the
+# per-call-site rule works -- leaving that rule with no coverage at all. It could then be
+# deleted outright with the suite fully green. Requiring the expected message makes a
+# control incapable of borrowing another's evidence.
+boundary_control() { # name expected-message-fragment sed-expression
+  local name="$1" want="$2" expr="$3" out rc
   sed "$expr" "$SRC" > "$WORK/bctl_src.sh"
   if cmp -s "$SRC" "$WORK/bctl_src.sh"; then
     printf '  FAIL  %s -- mutation did not apply, so this control tested nothing\n' "$name"
     fails=$((fails+1)); return
   fi
   out=$(bash "$WORK/boundary.check" "$WORK/bctl_src.sh" 2>&1) && rc=0 || rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'FAIL:'; then
+  if [ "$rc" -eq 0 ]; then
+    printf '  FAIL  %s -- the boundary guard did not notice\n' "$name"
+    fails=$((fails+1))
+  elif printf '%s' "$out" | grep -qF "$want"; then
     printf '  ok    %s\n' "$name"
   else
-    printf '  FAIL  %s -- the boundary guard did not notice\n' "$name"
+    printf '  FAIL  %s -- rejected, but by a DIFFERENT assertion than this control covers (wanted %s): %s\n' \
+      "$name" "$want" "$(printf '%s' "$out" | head -1)"
     fails=$((fails+1))
   fi
 }
 
-boundary_control "CT_FIELDS re-assigned below the marker (media_url VIDEO -> STRING)" 's|^# --- end field declaration ---$|&\nCT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
-boundary_control "CT_FIELD_ROLES re-assigned below the marker (creatorId unbound)"    's|^# --- end field declaration ---$|&\nCT_FIELD_ROLES="${CT_FIELD_ROLES//author/null}"|'
-boundary_control "a provisioning branch sends a different variable"                   's|"\$CT_FIELDS" "\$CT_FIELD_ROLES"|"$OTHER_FIELDS" "$CT_FIELD_ROLES"|'
-boundary_control "CT_VARS is renamed so no call site matches (guard would go vacuous)" 's/CT_VARS=\$(printf/CTV=$(printf/; s/"\$CT_FIELDS" "\$CT_FIELD_ROLES"/"$OTHER_A" "$OTHER_B"/'
-boundary_control "a schema assignment below the marker is exported"                  's|^# --- end field declaration ---$|&\nexport CT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
-boundary_control "a second end-of-declaration marker appears"                        's|^# --- end field declaration ---$|&\n# --- end field declaration ---|'
-boundary_control "the end-of-declaration marker is deleted"                          '/^# --- end field declaration ---$/d'
+boundary_control "CT_FIELDS re-assigned below the marker (media_url VIDEO -> STRING)" "sits BELOW the pinned region" 's|^# --- end field declaration ---$|&\nCT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
+boundary_control "CT_FIELD_ROLES re-assigned below the marker (creatorId unbound)" "sits BELOW the pinned region"    's|^# --- end field declaration ---$|&\nCT_FIELD_ROLES="${CT_FIELD_ROLES//author/null}"|'
+boundary_control "ONE provisioning branch sends a different variable" "does not send the pinned" '/"input":{"name":"nostr_event"/s|"\$CT_FIELDS" "\$CT_FIELD_ROLES"|"$OTHER_FIELDS" "$OTHER_ROLES"|'
+boundary_control "CT_VARS is renamed so no call site matches (guard would go vacuous)" "nothing in the script reads the pinned" 's/CT_VARS=\$(printf/CTV=$(printf/; s/"\$CT_FIELDS" "\$CT_FIELD_ROLES"/"$OTHER_A" "$OTHER_B"/'
+boundary_control "a schema assignment below the marker is exported" "sits BELOW the pinned region"                  's|^# --- end field declaration ---$|&\nexport CT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
+boundary_control "a second end-of-declaration marker appears" "end-of-declaration marker, found"                        's|^# --- end field declaration ---$|&\n# --- end field declaration ---|'
+boundary_control "the end-of-declaration marker is deleted" "end-of-declaration marker, found"                          '/^# --- end field declaration ---$/d'
 
 echo "positive controls: the schema pin discriminates:"
-pin_control "the splice is deleted (generator correct, CT_FIELDS never gets it)" '/^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$/d'
-pin_control "a whole prefix is dropped (card loses reporter identity)"           's/^PROFILE_PREFIXES="author reported reporter"$/PROFILE_PREFIXES="author reported"/'
-pin_control "a field is renamed"                                                 's/display_name:STRING/displayname:STRING/'
-pin_control "a field type changes (BOOLEAN -> STRING)"                           's/nip05_verified:BOOLEAN/nip05_verified:STRING/'
-pin_control "a field is removed from the rule"                                   's/ nip05:STRING//'
-pin_control "the emission ORDER changes"                                         's/profile_state:STRING profile_error:STRING/profile_error:STRING profile_state:STRING/'
+pin_control "the splice is deleted (generator correct, CT_FIELDS never gets it)" "shipped content fields differ" '/^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$/d'
+pin_control "a whole prefix is dropped (card loses reporter identity)" "shipped content fields differ"           's/^PROFILE_PREFIXES="author reported reporter"$/PROFILE_PREFIXES="author reported"/'
+pin_control "a field is renamed" "shipped content fields differ"                                                 's/display_name:STRING/displayname:STRING/'
+pin_control "a field type changes (BOOLEAN -> STRING)" "shipped content fields differ"                           's/nip05_verified:BOOLEAN/nip05_verified:STRING/'
+pin_control "a field is removed from the rule" "shipped content fields differ"                                   's/ nip05:STRING//'
+pin_control "the emission ORDER changes" "shipped content fields differ"                                         's/profile_state:STRING profile_error:STRING/profile_error:STRING profile_state:STRING/'
+pin_control "creatorId is unbound from author (Associated User panel stops resolving)" "creatorId role does not reference author" 's/"creatorId":"author"/"creatorId":null/'
 # required:true would make Coop 400 every submission, because osprey omits six of the
 # seven suffixes whenever it has nothing to say.
-pin_control "creatorId is unbound from author (Associated User panel stops resolving)" 's/"creatorId":"author"/"creatorId":null/'
-pin_control "the profile fields become required"                                 's/,\"required\":false}/,\"required\":true}/'
+pin_control "the profile fields become required" "shipped content fields differ"                                 's/,\"required\":false}/,\"required\":true}/'
 # A rewrite between the literal and the splice: the shape that made regexing the literal
 # assignment stop being a check on the artifact.
-pin_control "CT_FIELDS is rewritten after the literal (media_url VIDEO -> STRING)" 's|^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$|CT_FIELDS="${CT_FIELDS//VIDEO/STRING}"\n&|'
+pin_control "CT_FIELDS is rewritten after the literal (media_url VIDEO -> STRING)" "shipped content fields differ" 's|^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$|CT_FIELDS="${CT_FIELDS//VIDEO/STRING}"\n&|'
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"
