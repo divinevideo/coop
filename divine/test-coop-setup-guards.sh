@@ -223,12 +223,20 @@ actual_fields = [(f["name"], f["type"], f["required"]) for f in fields]
 if actual_fields != expected_fields:
     raise SystemExit("FAIL: shipped content fields differ from the reviewed schema: %r" % (actual_fields,))
 
-if roles.get("creatorId") != "author":
-    raise SystemExit("FAIL: creatorId role does not reference author: %r" % (roles.get("creatorId"),))
+expected_roles = {
+    "displayName": "text",
+    "creatorId": "author",
+    "threadId": None,
+    "parentId": None,
+    "createdAt": None,
+    "isDeleted": None,
+}
+if roles != expected_roles:
+    raise SystemExit("FAIL: shipped field roles differ from the reviewed schema: %r" % (roles,))
 
 PYEOF
 SHEOF
-check_script "the SHIPPED fields, types, required flags and creatorId match the reviewed schema" 0 <(printf 'bash %q %q\n' "$WORK/schema.check" "$WORK/schema_block.sh")
+check_script "the SHIPPED fields, types, required flags and field roles match the reviewed schema" 0 <(printf 'bash %q %q\n' "$WORK/schema.check" "$WORK/schema_block.sh")
 
 ACTION_BLOCK="$WORK/actions.sh"
 awk '/^  ACTIONS_LIST=/,/^  UNRESTRICT_STATUS=/' "$SRC" | sed '$d' > "$ACTION_BLOCK"
@@ -595,17 +603,18 @@ boundary_control "a second end-of-declaration marker appears" "end-of-declaratio
 boundary_control "the end-of-declaration marker is deleted" "end-of-declaration marker, found"                          '/^# --- end field declaration ---$/d'
 
 echo "positive controls: the schema pin discriminates:"
-# Six controls, not nine. Three were provably redundant: a neuter matrix over partial
+# Seven controls, not nine. Three were provably redundant: a neuter matrix over partial
 # degradations of the pin showed "a whole prefix is dropped", "a field is removed from the
 # rule" and "CT_FIELDS is rewritten after the literal" went red in exactly the same cases as
 # controls kept below, so they cost maintenance and bought no detection. The ones kept are
-# each uniquely red for one way the pin can weaken: name, type, ORDER, required, creatorId,
-# and the splice never reaching the artifact.
+# each tied to one way the pin can weaken: name, type, ORDER, required, field roles, and
+# the splice never reaching the artifact.
 pin_control "the splice is deleted (generator correct, CT_FIELDS never gets it)" "shipped content fields differ" '/^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$/d'
 pin_control "a field is renamed" "shipped content fields differ"                                                 's/display_name:STRING/displayname:STRING/'
 pin_control "a field type changes (BOOLEAN -> STRING)" "shipped content fields differ"                           's/nip05_verified:BOOLEAN/nip05_verified:STRING/'
 pin_control "the emission ORDER changes" "shipped content fields differ"                                         's/profile_state:STRING profile_error:STRING/profile_error:STRING profile_state:STRING/'
-pin_control "creatorId is unbound from author (Associated User panel stops resolving)" "creatorId role does not reference author" 's/"creatorId":"author"/"creatorId":null/'
+pin_control "displayName points at the event id instead of the post text" "shipped field roles differ" 's/"displayName":"text"/"displayName":"event_id"/'
+pin_control "creatorId is unbound from author (Associated User panel stops resolving)" "shipped field roles differ" 's/"creatorId":"author"/"creatorId":null/'
 # required:true would make Coop 400 every submission, because osprey omits six of the
 # seven suffixes whenever it has nothing to say.
 pin_control "the profile fields become required" "shipped content fields differ"                                 's/,\"required\":false}/,\"required\":true}/'
