@@ -40,6 +40,14 @@ grep -q '^record_adapter_probe_status' "$WORK/probe.sh" || { echo "FATAL: probe 
 grep -q '^action_type_ids_json' "$WORK/action_scope.sh" || { echo "FATAL: action scope function not captured"; exit 1; }
 fails=0
 
+extract_fields() { # src dest -- capture the shipped field declaration from a source file
+  awk '/^CT_FIELDS=/{f=1} f{print} f && /^# --- end field declaration/{exit}' "$1" > "$2"
+  # Returns non-zero rather than exiting: the positive controls deliberately feed this
+  # broken input, and an exit here would take the whole suite with it.
+  grep -q '^profile_fields_json()' "$2" || { echo "field generator not captured from $1"; return 1; }
+  grep -q 'end field declaration'  "$2" || { echo "field declaration range never terminated in $1"; return 1; }
+}
+
 # Production runs under `set -euo pipefail`, so the CHILD must too. Options are
 # per-process: `( set -euo pipefail; bash f )` gives them to the subshell and NOT to the
 # bash it spawns, which is how an unset-variable abort stayed invisible here even after
@@ -143,23 +151,29 @@ else
 fi
 
 echo "the shipped account-moderation config is internally consistent:"
-cat > "$WORK/content_fields.check" <<'SH'
-python3 - "$1" <<'PY'
+# Pins the COMPLETE shipped schema: name, type, required, IN ORDER.
+#
+# It reads the EVALUATED CT_FIELDS, not the literal assignment. It used to regex the
+# literal, which WAS the artifact until this file started rewriting CT_FIELDS to append
+# the profile fields. From that point a literal-regex check validated a value that is no
+# longer what gets POSTed: inserting a rewrite between the literal and the splice silently
+# downgraded media_url from VIDEO to STRING with the whole suite green.
+#
+# `required` matters more than it looks. Osprey OMITS six of the seven profile suffixes
+# whenever it has nothing to say, and Coop rejects an ENTIRE item when a required field is
+# absent, so flipping these to required:true would 400 every submission and strand every
+# report. It is pinned here rather than left to reviewer attention.
+extract_fields "$SRC" "$WORK/schema_block.sh" || { echo "FATAL: cannot read the shipped field declaration"; exit 1; }
+cat > "$WORK/schema.check" <<'SHEOF'
+set -euo pipefail
+# shellcheck disable=SC1090
+. "$1"
+python3 - "$CT_FIELDS" "$CT_FIELD_ROLES" <<'PYEOF'
 import json
-import re
 import sys
 
-src = open(sys.argv[1], encoding="utf-8").read()
-
-def assignment(name):
-    match = re.search(rf"^{name}='([^']*)'$", src, re.M)
-    if not match:
-        raise SystemExit(f"FAIL: {name} assignment not found")
-    return json.loads(match.group(1))
-
-fields = assignment("CT_FIELDS")
-roles = assignment("CT_FIELD_ROLES")
-by_name = {field["name"]: field for field in fields}
+fields = json.loads(sys.argv[1])
+roles = json.loads(sys.argv[2])
 
 expected_fields = [
     ("event_id", "STRING", True),
@@ -181,20 +195,48 @@ expected_fields = [
     ("reporter_pubkey", "STRING", False),
     ("relay_manager_url", "URL", False),
     ("author", "RELATED_ITEM", False),
+    # Profile enrichment, in EMISSION order (prefix x suffix). Order is pinned because the
+    # setup script states that ordering decides where these read on a moderator's card.
+    ("author_profile_state", "STRING", False),
+    ("author_profile_error", "STRING", False),
+    ("author_has_vanish_request", "BOOLEAN", False),
+    ("author_display_name", "STRING", False),
+    ("author_nip05", "STRING", False),
+    ("author_nip05_verified", "BOOLEAN", False),
+    ("author_follower_count", "NUMBER", False),
+    ("reported_profile_state", "STRING", False),
+    ("reported_profile_error", "STRING", False),
+    ("reported_has_vanish_request", "BOOLEAN", False),
+    ("reported_display_name", "STRING", False),
+    ("reported_nip05", "STRING", False),
+    ("reported_nip05_verified", "BOOLEAN", False),
+    ("reported_follower_count", "NUMBER", False),
+    ("reporter_profile_state", "STRING", False),
+    ("reporter_profile_error", "STRING", False),
+    ("reporter_has_vanish_request", "BOOLEAN", False),
+    ("reporter_display_name", "STRING", False),
+    ("reporter_nip05", "STRING", False),
+    ("reporter_nip05_verified", "BOOLEAN", False),
+    ("reporter_follower_count", "NUMBER", False),
 ]
-actual_fields = [(field["name"], field["type"], field["required"]) for field in fields]
+actual_fields = [(f["name"], f["type"], f["required"]) for f in fields]
 if actual_fields != expected_fields:
-    raise SystemExit(f"FAIL: content fields differ from the reviewed schema: {actual_fields!r}")
+    raise SystemExit("FAIL: shipped content fields differ from the reviewed schema: %r" % (actual_fields,))
 
-author = by_name.get("author")
-if author != {"name": "author", "type": "RELATED_ITEM", "required": False}:
-    raise SystemExit(f"FAIL: author field is not the expected optional RELATED_ITEM: {author!r}")
-if roles.get("creatorId") != "author":
-    raise SystemExit(f"FAIL: creatorId role does not reference author: {roles.get('creatorId')!r}")
+expected_roles = {
+    "displayName": "text",
+    "creatorId": "author",
+    "threadId": None,
+    "parentId": None,
+    "createdAt": None,
+    "isDeleted": None,
+}
+if roles != expected_roles:
+    raise SystemExit("FAIL: shipped field roles differ from the reviewed schema: %r" % (roles,))
 
-PY
-SH
-check_script "content fields and creatorId match the reviewed producer-independent schema" 0 <(printf 'bash %q %q\n' "$WORK/content_fields.check" "$SRC")
+PYEOF
+SHEOF
+check_script "the SHIPPED fields, types, required flags and field roles match the reviewed schema" 0 <(printf 'bash %q %q\n' "$WORK/schema.check" "$WORK/schema_block.sh")
 
 ACTION_BLOCK="$WORK/actions.sh"
 awk '/^  ACTIONS_LIST=/,/^  UNRESTRICT_STATUS=/' "$SRC" | sed '$d' > "$ACTION_BLOCK"
@@ -420,6 +462,162 @@ check "empty token list" 1 "label_value|CSAM|"
 # element shipped ^csam\n$ -- a pattern matching nothing, silently disabling the CSAM route.
 check "newline inside a token list (wrapped array element)" 1 "label_value|CSAM|csam
 ,sexual_minors"
+
+# --- Positive controls for the schema pin ---------------------------------------------
+#
+# The pin above is only a guard if it can go red. These mutate the SHIPPED script and
+# require the pin to reject the result. Three properties make them non-vacuous:
+#
+#   1. Each asserts its own mutation applied. A sed that silently matches nothing would
+#      otherwise "pass" by testing the unmodified file.
+#   2. Rejection must come from the PIN, not from collateral damage. An earlier version
+#      compared output strings, so a mutation that merely broke bash produced different
+#      output and scored a pass while proving nothing. A control now has to see either a
+#      FAIL: from the schema check or an unreadable field block, and says which.
+#   3. They drive the real schema check, not a parallel re-implementation of it. A control
+#      that exercises a copy of the pin cannot tell you the shipped pin discriminates.
+#
+# The first control is the one that matters most, and is the reason this section exists:
+# the generator can be perfectly correct while its output never reaches CT_FIELDS.
+pin_control() { # name expected-message-fragment sed-expression
+  local name="$1" want="$2" expr="$3" out rc
+  sed "$expr" "$SRC" > "$WORK/ctl_src.sh"
+  if cmp -s "$SRC" "$WORK/ctl_src.sh"; then
+    printf '  FAIL  %s -- mutation did not apply, so this control tested nothing\n' "$name"
+    fails=$((fails+1)); return
+  fi
+  if ! extract_fields "$WORK/ctl_src.sh" "$WORK/ctl_block.sh" >/dev/null 2>&1; then
+    printf '  ok    %s (rejected: field declaration unreadable)\n' "$name"; return
+  fi
+  out=$(bash "$WORK/schema.check" "$WORK/ctl_block.sh" 2>&1) && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$want"; then
+    printf '  ok    %s (rejected by the schema pin)\n' "$name"
+  elif [ "$rc" -ne 0 ]; then
+    printf '  FAIL  %s -- rejected, but NOT by the pin (the mutation broke the script): %s\n' "$name" "$(printf '%s' "$out" | tail -1)"
+    fails=$((fails+1))
+  else
+    printf '  FAIL  %s -- the pin did not notice\n' "$name"
+    fails=$((fails+1))
+  fi
+}
+
+# The schema pin evaluates CT_FIELDS as of the end marker, but the values that reach
+# updateContentItemType / createContentItemType are read further down. Anything in between
+# is outside the pin: re-assigning CT_FIELDS one line BELOW the marker downgrades media_url
+# to STRING, and re-assigning CT_FIELD_ROLES unbinds creatorId from author so the
+# Associated User panel stops resolving. Both left every check green.
+#
+# This is the same single-execution-point gap the CATROUTES count guard above exists to
+# close, and it gets the same treatment: assert there is no room for a second assignment
+# rather than trying to evaluate the script at the point of use.
+cat > "$WORK/boundary.check" <<'SHEOF'
+set -euo pipefail
+src="$1"
+
+# Exactly one marker, asserted before use. Two markers made `mark` hold an embedded
+# newline, which killed awk with a parse error before any of this script's own messages
+# could run -- loud, but undiagnosable. It is also the only assertion here that no control
+# could distinguish, because with mark empty the awk below did a STRING comparison in which
+# every line satisfies NR > m, so it fired instead and blamed lines inside the region.
+marks=$(grep -c '^# --- end field declaration ---$' "$src" || true)
+[ "$marks" -eq 1 ] || { echo "FAIL: expected exactly 1 end-of-declaration marker, found $marks; the pinned region has no unambiguous lower bound"; exit 1; }
+mark=$(grep -n '^# --- end field declaration ---$' "$src" | cut -d: -f1)
+
+# POSITION, not count. An earlier version asserted "CT_FIELDS is assigned exactly twice",
+# which fired on a legitimate second generated family spliced INSIDE the pinned region and
+# told the developer, falsely, that something had escaped it. The obvious repair to a wrong
+# diagnosis is to bump the number, which would permanently admit one real escape. A guard
+# whose message can be false teaches people to weaken it.
+# `m+0` forces a numeric compare; without it a non-integer m silently compares as a string.
+escaped=$(awk -v m="$mark" 'NR > m+0 && /^[[:space:]]*(export|readonly|declare|typeset|local)?[[:space:]]*(CT_FIELDS|CT_FIELD_ROLES)\+?=/ { print NR": "$0 }' "$src")
+[ -z "$escaped" ] || {
+  echo "FAIL: a schema assignment sits BELOW the pinned region, so the schema pin evaluates one value while a different one is provisioned:"
+  echo "$escaped"
+  exit 1
+}
+
+# FLOOR first. The per-call-site rule below only constrains lines that already match, so on
+# its own it is vacuous exactly when it matters most: rename CT_VARS and the set is empty,
+# every line "passes", and the pin governs nothing. Assert the pinned pair is read at all
+# before asserting where it is read.
+# Comment lines excluded: a stale comment mentioning the pair satisfied a bare count,
+# which reopened the exact vacuity this floor exists to close.
+uses=$(grep -F '"$CT_FIELDS" "$CT_FIELD_ROLES"' "$src" | grep -vc '^[[:space:]]*#' || true)
+[ "$uses" -ge 1 ] || { echo "FAIL: nothing in the script reads the pinned (CT_FIELDS, CT_FIELD_ROLES) pair, so the schema pin governs nothing that is actually provisioned"; exit 1; }
+
+# Then per call site, so extracting the two near-identical printf calls into one helper --
+# an obvious cleanup -- does not trip it. Continuations are joined first: the provisioning
+# lines are ~250 chars, so wrapping one is the likeliest edit of all, and matching per
+# PHYSICAL line would accuse a wrapped call of dropping a variable that is right there on
+# the next line. -F because the pattern contains $( , which is not a literal in a regex.
+logical=$(awk '{ buf = buf $0 } /\\[[:space:]]*$/ { sub(/\\[[:space:]]*$/, "", buf); next } { print NR": "buf; buf = "" } END { if (buf != "") print NR": "buf }' "$src")
+bad=$(printf '%s\n' "$logical" | grep -F 'CT_VARS=$(printf' | grep -vF '"$CT_FIELDS" "$CT_FIELD_ROLES"' || true)
+[ -z "$bad" ] || {
+  echo "FAIL: a provisioning call does not send the pinned (CT_FIELDS, CT_FIELD_ROLES) pair, so it bypasses the schema pin:"
+  echo "$bad"
+  exit 1
+}
+
+# SCOPE, stated honestly: this catches an assignment a future edit puts in the wrong place.
+# It is syntactic, so it does not catch deliberate evasion (eval, printf -v, declare -n, a
+# nameref) nor an assignment hidden after a semicolon on a shared line. That is the right
+# trade -- the risk here is a careless edit, not an attacker with commit access -- but the
+# limit belongs in writing rather than in someone's head.
+SHEOF
+echo "the pinned region actually reaches the provisioning call:"
+check_script "no schema assignment escapes the pinned region" 0 <(printf 'bash %q %q\n' "$WORK/boundary.check" "$SRC")
+
+# Controls for the boundary guard, so it is not itself a check that cannot go red.
+# A control must name WHICH assertion it expects to trip. Matching a bare "FAIL:" let a
+# control pass on a NEIGHBOUR's failure: an unanchored sed hit both provisioning branches,
+# emptied the floor, and the control scored the floor's message as proof that the
+# per-call-site rule works -- leaving that rule with no coverage at all. It could then be
+# deleted outright with the suite fully green. Requiring the expected message makes a
+# control incapable of borrowing another's evidence.
+boundary_control() { # name expected-message-fragment sed-expression
+  local name="$1" want="$2" expr="$3" out rc
+  sed "$expr" "$SRC" > "$WORK/bctl_src.sh"
+  if cmp -s "$SRC" "$WORK/bctl_src.sh"; then
+    printf '  FAIL  %s -- mutation did not apply, so this control tested nothing\n' "$name"
+    fails=$((fails+1)); return
+  fi
+  out=$(bash "$WORK/boundary.check" "$WORK/bctl_src.sh" 2>&1) && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf '  FAIL  %s -- the boundary guard did not notice\n' "$name"
+    fails=$((fails+1))
+  elif printf '%s' "$out" | grep -qF "$want"; then
+    printf '  ok    %s\n' "$name"
+  else
+    printf '  FAIL  %s -- rejected, but by a DIFFERENT assertion than this control covers (wanted %s): %s\n' \
+      "$name" "$want" "$(printf '%s' "$out" | head -1)"
+    fails=$((fails+1))
+  fi
+}
+
+boundary_control "CT_FIELDS re-assigned below the marker (media_url VIDEO -> STRING)" "sits BELOW the pinned region" 's|^# --- end field declaration ---$|&\nCT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
+boundary_control "CT_FIELD_ROLES re-assigned below the marker (creatorId unbound)" "sits BELOW the pinned region"    's|^# --- end field declaration ---$|&\nCT_FIELD_ROLES="${CT_FIELD_ROLES//author/null}"|'
+boundary_control "ONE provisioning branch sends a different variable" "does not send the pinned" '/"input":{"name":"nostr_event"/s|"\$CT_FIELDS" "\$CT_FIELD_ROLES"|"$OTHER_FIELDS" "$OTHER_ROLES"|'
+boundary_control "CT_VARS is renamed so no call site matches (guard would go vacuous)" "nothing in the script reads the pinned" 's/CT_VARS=\$(printf/CTV=$(printf/; s/"\$CT_FIELDS" "\$CT_FIELD_ROLES"/"$OTHER_A" "$OTHER_B"/'
+boundary_control "a schema assignment below the marker is exported" "sits BELOW the pinned region"                  's|^# --- end field declaration ---$|&\nexport CT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
+boundary_control "a second end-of-declaration marker appears" "end-of-declaration marker, found"                        's|^# --- end field declaration ---$|&\n# --- end field declaration ---|'
+boundary_control "the end-of-declaration marker is deleted" "end-of-declaration marker, found"                          '/^# --- end field declaration ---$/d'
+
+echo "positive controls: the schema pin discriminates:"
+# Seven controls, not nine. Three were provably redundant: a neuter matrix over partial
+# degradations of the pin showed "a whole prefix is dropped", "a field is removed from the
+# rule" and "CT_FIELDS is rewritten after the literal" went red in exactly the same cases as
+# controls kept below, so they cost maintenance and bought no detection. The ones kept are
+# each tied to one way the pin can weaken: name, type, ORDER, required, field roles, and
+# the splice never reaching the artifact.
+pin_control "the splice is deleted (generator correct, CT_FIELDS never gets it)" "shipped content fields differ" '/^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$/d'
+pin_control "a field is renamed" "shipped content fields differ"                                                 's/display_name:STRING/displayname:STRING/'
+pin_control "a field type changes (BOOLEAN -> STRING)" "shipped content fields differ"                           's/nip05_verified:BOOLEAN/nip05_verified:STRING/'
+pin_control "the emission ORDER changes" "shipped content fields differ"                                         's/profile_state:STRING profile_error:STRING/profile_error:STRING profile_state:STRING/'
+pin_control "displayName points at the event id instead of the post text" "shipped field roles differ" 's/"displayName":"text"/"displayName":"event_id"/'
+pin_control "creatorId is unbound from author (Associated User panel stops resolving)" "shipped field roles differ" 's/"creatorId":"author"/"creatorId":null/'
+# required:true would make Coop 400 every submission, because osprey omits six of the
+# seven suffixes whenever it has nothing to say.
+pin_control "the profile fields become required" "shipped content fields differ"                                 's/,\"required\":false}/,\"required\":true}/'
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"

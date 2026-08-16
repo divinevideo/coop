@@ -71,15 +71,74 @@ echo "==> Ensuring content type 'nostr_event'"
 # `pubkey`: the DB constraint valid_field_role_field_type requires creatorId to name a
 # RELATED_ITEM field, and `pubkey` is a STRING. The role and the field it names have to
 # arrive together, which is why they are in the same change.
-# NOT declared yet: profile/enrichment fields such as author_display_name,
-# confidence, model, follower counts, and vanish-request booleans. Declaring a
-# field is what turns producer output from ignored into rendered. Those fields
-# belong with the producer branch that proves exact names and omits unknown
-# values rather than sending defaults like "", 0, or false that moderators would
-# read as real facts.
+# The profile/enrichment fields ARE declared, below. NOT declared: the detector fields
+# `confidence` and `model`. Declaring a field is what turns producer output from ignored
+# into rendered, so a field may only be declared once its producer is proven to omit
+# unknown values rather than send defaults like "", 0 or false that a moderator would read
+# as real facts. The profile fields meet that bar (coop_profile.py omits; verified by
+# divine/check-profile-field-parity.sh). The detector path does NOT -- it emits defaults --
+# so declaring confidence/model would put junk on the card.
 #
 CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_event_id","type":"STRING","required":false},{"name":"pubkey","type":"STRING","required":false},{"name":"kind","type":"NUMBER","required":false},{"name":"created_at","type":"NUMBER","required":false},{"name":"verdict","type":"STRING","required":false},{"name":"action_name","type":"STRING","required":false},{"name":"report_reason","type":"STRING","required":false},{"name":"reported_pubkey","type":"STRING","required":false},{"name":"reported_event_id","type":"STRING","required":false},{"name":"label_value","type":"STRING","required":false},{"name":"label_namespace","type":"STRING","required":false},{"name":"text","type":"STRING","required":false},{"name":"media_url","type":"VIDEO","required":false},{"name":"media_thumbnail","type":"IMAGE","required":false},{"name":"media_sha256","type":"STRING","required":false},{"name":"reporter_pubkey","type":"STRING","required":false},{"name":"relay_manager_url","type":"URL","required":false},{"name":"author","type":"RELATED_ITEM","required":false}]'
+
+# Profile enrichment fields, GENERATED rather than hand-listed. Osprey builds every one of
+# these keys as f'{prefix}_{suffix}' (divine/plugins/src/coop_profile.py), so a hand-typed
+# list of 21 strings here would be a second copy of a rule, rotting independently of the
+# first. Derived from the same rule instead; divine/test-coop-setup-guards.sh pins the
+# result, and vendored for the same fail-loud-on-drift reason as CANONICAL_REASONS below:
+# coop and osprey share no runtime, so an explicit pin is the only protection.
+#
+# WHY THESE EXIST: without them Coop shows a moderator a 64-character hex string where a
+# person should be. On STAGING, osprey already performs the funnelcake lookups on every
+# submission -- DIVINE_RELAY_API_URL is set in the osprey-workers staging overlay only, and
+# confirmed on the running pod -- so there the enrichment is computed today and then dropped
+# on arrival, because Coop renders only the fields it declares. Declaring them does not add
+# work to the submission path; it stops work already being done going to waste. Production
+# and poc do NOT set that variable, so there these fields simply render nothing until it
+# lands; declaring them is harmless either way, because an absent key produces no row.
+#
+# OMISSION SEMANTICS -- what an ABSENT field means, which is what makes these readable:
+#   - `<prefix>_profile_state` is sent whenever a lookup is ATTEMPTED, so within an enriched
+#     item absence is never ambiguous: `resolved` with no display_name means the profile
+#     carries no name, `lookup_failed` means we do not know, and
+#     `no_profile_or_upstream_failure` means funnelcake answered but could not distinguish
+#     "this user published no kind-0" from "the upstream query failed" -- the genuinely
+#     ambiguous case, and the reason the state is sent at all. (Wire values are lowercase;
+#     the uppercase names in coop_profile.py are the Python constants.) Note the whole
+#     enrichment block is skipped when DIVINE_RELAY_API_URL is unset or a subject pubkey is
+#     empty, so profile_state itself is absent then -- absent-everything means no lookup was
+#     made, not that a lookup failed.
+#   - `<prefix>_nip05_verified` is sent even when false, so absent means "claimed no
+#     NIP-05" rather than "claimed one that failed verification".
+#   - `<prefix>_has_vanish_request` is sent ONLY when true; read with profile_state,
+#     RESOLVED-and-absent means no request.
+#   - display_name, nip05 and follower_count are omitted when empty rather than sent blank.
+#     A zero follower_count is omitted deliberately: funnelcake returns zero both for "no
+#     followers" and for a failed social sub-query, so the zero carries no information.
+#
+# The three prefixes are three DIFFERENT people and must not be collapsed: `author` is the
+# verified signer of the reported event and the account enforcement lands on, `reported` is
+# the reporter's unverified claim about who is responsible, `reporter` is who filed.
+PROFILE_PREFIXES="author reported reporter"
+# nip05 folds its verification status into the STRING on purpose (see coop_profile.py): the
+# queue preview drops BOOLEAN, so a separate boolean would be invisible exactly where a
+# moderator scans fastest, and a bare address reads as an established identity.
+PROFILE_SUFFIX_TYPES="profile_state:STRING profile_error:STRING has_vanish_request:BOOLEAN display_name:STRING nip05:STRING nip05_verified:BOOLEAN follower_count:NUMBER"
+profile_fields_json() {
+  local prefix st suffix ftype
+  for prefix in $PROFILE_PREFIXES; do
+    for st in $PROFILE_SUFFIX_TYPES; do
+      suffix="${st%%:*}"; ftype="${st##*:}"
+      printf ',{"name":"%s_%s","type":"%s","required":false}' "$prefix" "$suffix" "$ftype"
+    done
+  done
+}
+# Appended rather than interleaved: getPrimaryContentFields returns every STRING/URL/media
+# field and does not truncate (client/src/utils/itemUtils.ts), so ordering decides where
+# these read on the card but drops nothing. Reordering the existing 19 is a separate change.
+CT_FIELDS="${CT_FIELDS%]}$(profile_fields_json)]"
 CT_FIELD_ROLES='{"displayName":"text","creatorId":"author","threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
+# --- end field declaration ---
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
 CT_ID=$(type_id nostr_event)
 if [ -n "$CT_ID" ]; then
