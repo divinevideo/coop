@@ -498,6 +498,49 @@ pin_control() { # name sed-expression
   fi
 }
 
+# The schema pin evaluates CT_FIELDS as of the end marker, but the values that reach
+# updateContentItemType / createContentItemType are read further down. Anything in between
+# is outside the pin: re-assigning CT_FIELDS one line BELOW the marker downgrades media_url
+# to STRING, and re-assigning CT_FIELD_ROLES unbinds creatorId from author so the
+# Associated User panel stops resolving. Both left every check green.
+#
+# This is the same single-execution-point gap the CATROUTES count guard above exists to
+# close, and it gets the same treatment: assert there is no room for a second assignment
+# rather than trying to evaluate the script at the point of use.
+cat > "$WORK/boundary.check" <<'SHEOF'
+set -euo pipefail
+src="$1"
+n=$(grep -cE '^[[:space:]]*CT_FIELDS\+?=' "$src" || true)
+[ "$n" -eq 2 ] || { echo "FAIL: CT_FIELDS is assigned $n times, expected exactly 2 (the literal and the profile splice). An assignment after '# --- end field declaration ---' is invisible to the schema pin but IS what gets provisioned."; exit 1; }
+n=$(grep -cE '^[[:space:]]*CT_FIELD_ROLES\+?=' "$src" || true)
+[ "$n" -eq 1 ] || { echo "FAIL: CT_FIELD_ROLES is assigned $n times, expected exactly 1. A second assignment can unbind creatorId from author without the pin seeing it."; exit 1; }
+n=$(grep -cF '"$CT_FIELDS" "$CT_FIELD_ROLES"' "$src" || true)
+[ "$n" -eq 2 ] || { echo "FAIL: the (CT_FIELDS, CT_FIELD_ROLES) pair is consumed $n times, expected 2 (the update branch and the create branch). A provisioning call reading different variables would bypass the pin entirely."; exit 1; }
+SHEOF
+echo "the pinned region actually reaches the provisioning call:"
+check_script "no schema assignment escapes the pinned region" 0 <(printf 'bash %q %q\n' "$WORK/boundary.check" "$SRC")
+
+# Controls for the boundary guard, so it is not itself a check that cannot go red.
+boundary_control() { # name sed-expression
+  local name="$1" expr="$2" out rc
+  sed "$expr" "$SRC" > "$WORK/bctl_src.sh"
+  if cmp -s "$SRC" "$WORK/bctl_src.sh"; then
+    printf '  FAIL  %s -- mutation did not apply, so this control tested nothing\n' "$name"
+    fails=$((fails+1)); return
+  fi
+  out=$(bash "$WORK/boundary.check" "$WORK/bctl_src.sh" 2>&1) && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'FAIL:'; then
+    printf '  ok    %s\n' "$name"
+  else
+    printf '  FAIL  %s -- the boundary guard did not notice\n' "$name"
+    fails=$((fails+1))
+  fi
+}
+
+boundary_control "CT_FIELDS re-assigned below the marker (media_url VIDEO -> STRING)" 's|^# --- end field declaration ---$|&\nCT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
+boundary_control "CT_FIELD_ROLES re-assigned below the marker (creatorId unbound)"    's|^# --- end field declaration ---$|&\nCT_FIELD_ROLES="${CT_FIELD_ROLES//author/null}"|'
+boundary_control "a provisioning branch reads a different variable"                   's|"\$CT_FIELDS" "\$CT_FIELD_ROLES"|"$OTHER_FIELDS" "$CT_FIELD_ROLES"|'
+
 echo "positive controls: the schema pin discriminates:"
 pin_control "the splice is deleted (generator correct, CT_FIELDS never gets it)" '/^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$/d'
 pin_control "a whole prefix is dropped (card loses reporter identity)"           's/^PROFILE_PREFIXES="author reported reporter"$/PROFILE_PREFIXES="author reported"/'
