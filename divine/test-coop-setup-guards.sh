@@ -595,19 +595,20 @@ boundary_control "a second end-of-declaration marker appears" "end-of-declaratio
 boundary_control "the end-of-declaration marker is deleted" "end-of-declaration marker, found"                          '/^# --- end field declaration ---$/d'
 
 echo "positive controls: the schema pin discriminates:"
+# Six controls, not nine. Three were provably redundant: a neuter matrix over partial
+# degradations of the pin showed "a whole prefix is dropped", "a field is removed from the
+# rule" and "CT_FIELDS is rewritten after the literal" went red in exactly the same cases as
+# controls kept below, so they cost maintenance and bought no detection. The ones kept are
+# each uniquely red for one way the pin can weaken: name, type, ORDER, required, creatorId,
+# and the splice never reaching the artifact.
 pin_control "the splice is deleted (generator correct, CT_FIELDS never gets it)" "shipped content fields differ" '/^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$/d'
-pin_control "a whole prefix is dropped (card loses reporter identity)" "shipped content fields differ"           's/^PROFILE_PREFIXES="author reported reporter"$/PROFILE_PREFIXES="author reported"/'
 pin_control "a field is renamed" "shipped content fields differ"                                                 's/display_name:STRING/displayname:STRING/'
 pin_control "a field type changes (BOOLEAN -> STRING)" "shipped content fields differ"                           's/nip05_verified:BOOLEAN/nip05_verified:STRING/'
-pin_control "a field is removed from the rule" "shipped content fields differ"                                   's/ nip05:STRING//'
 pin_control "the emission ORDER changes" "shipped content fields differ"                                         's/profile_state:STRING profile_error:STRING/profile_error:STRING profile_state:STRING/'
 pin_control "creatorId is unbound from author (Associated User panel stops resolving)" "creatorId role does not reference author" 's/"creatorId":"author"/"creatorId":null/'
 # required:true would make Coop 400 every submission, because osprey omits six of the
 # seven suffixes whenever it has nothing to say.
 pin_control "the profile fields become required" "shipped content fields differ"                                 's/,\"required\":false}/,\"required\":true}/'
-# A rewrite between the literal and the splice: the shape that made regexing the literal
-# assignment stop being a check on the artifact.
-pin_control "CT_FIELDS is rewritten after the literal (media_url VIDEO -> STRING)" "shipped content fields differ" 's|^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$|CT_FIELDS="${CT_FIELDS//VIDEO/STRING}"\n&|'
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"

@@ -89,16 +89,25 @@ CT_FIELDS='[{"name":"event_id","type":"STRING","required":true},{"name":"source_
 # coop and osprey share no runtime, so an explicit pin is the only protection.
 #
 # WHY THESE EXIST: without them Coop shows a moderator a 64-character hex string where a
-# person should be. Osprey already performs the funnelcake lookups on every submission
-# (DIVINE_RELAY_API_URL is set on osprey-workers), so this enrichment is computed today and
-# then dropped on arrival, because Coop renders only the fields it declares. Declaring them
-# does not add work to the submission path; it stops the work already being done going to
-# waste.
+# person should be. On STAGING, osprey already performs the funnelcake lookups on every
+# submission -- DIVINE_RELAY_API_URL is set in the osprey-workers staging overlay only, and
+# confirmed on the running pod -- so there the enrichment is computed today and then dropped
+# on arrival, because Coop renders only the fields it declares. Declaring them does not add
+# work to the submission path; it stops work already being done going to waste. Production
+# and poc do NOT set that variable, so there these fields simply render nothing until it
+# lands; declaring them is harmless either way, because an absent key produces no row.
 #
 # OMISSION SEMANTICS -- what an ABSENT field means, which is what makes these readable:
-#   - `<prefix>_profile_state` is ALWAYS sent, so absence is never ambiguous: RESOLVED with
-#     no display_name means the profile carries no name, LOOKUP_FAILED means we do not
-#     know. Without it a moderator cannot tell "no name" from "no data".
+#   - `<prefix>_profile_state` is sent whenever a lookup is ATTEMPTED, so within an enriched
+#     item absence is never ambiguous: `resolved` with no display_name means the profile
+#     carries no name, `lookup_failed` means we do not know, and
+#     `no_profile_or_upstream_failure` means funnelcake answered but could not distinguish
+#     "this user published no kind-0" from "the upstream query failed" -- the genuinely
+#     ambiguous case, and the reason the state is sent at all. (Wire values are lowercase;
+#     the uppercase names in coop_profile.py are the Python constants.) Note the whole
+#     enrichment block is skipped when DIVINE_RELAY_API_URL is unset or a subject pubkey is
+#     empty, so profile_state itself is absent then -- absent-everything means no lookup was
+#     made, not that a lookup failed.
 #   - `<prefix>_nip05_verified` is sent even when false, so absent means "claimed no
 #     NIP-05" rather than "claimed one that failed verification".
 #   - `<prefix>_has_vanish_request` is sent ONLY when true; read with profile_state,
