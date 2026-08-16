@@ -426,20 +426,38 @@ check "newline inside a token list (wrapped array element)" 1 "label_value|CSAM|
 # The 21 profile fields are GENERATED in the setup script from a prefix x suffix rule,
 # because osprey generates them the same way (divine/plugins/src/coop_profile.py builds
 # every key as f'{prefix}_{suffix}'). A hand-typed list of 21 strings on the consumer side
-# is exactly what drifts from a generated list on the producer side.
+# is exactly what drifts from a generated list on the producer side. So the script derives
+# and this test PINS: the script cannot rot by typo, and the derivation cannot change
+# silently, because changing PROFILE_PREFIXES or PROFILE_SUFFIX_TYPES makes the pin go red.
 #
-# So the script derives and this test PINS. That split is the point: the script cannot rot
-# by typo, and the derivation cannot change silently, because changing PROFILE_PREFIXES or
-# PROFILE_SUFFIX_TYPES makes the pinned set below go red.
-#
-# The extraction runs the SHIPPED CT_FIELDS assignment, not a copy, so what is asserted is
-# the artifact actually provisioned to Coop.
-awk '/^CT_FIELDS=/{flag=1} flag{print} flag && /^# --- end field declaration/{exit}' "$SRC" > "$WORK/fields.sh"
-grep -q '^profile_fields_json()' "$WORK/fields.sh" || { echo "FATAL: profile field generator not captured"; exit 1; }
-grep -q 'end field declaration' "$WORK/fields.sh"  || { echo "FATAL: field declaration range never terminated"; exit 1; }
+# READ THE ARTIFACT, NOT THE GENERATOR. An earlier version of this block called
+# profile_fields_json directly. That proved the generator produced 21 correct names and
+# proved NOTHING about whether they reached CT_FIELDS -- the string actually POSTed to
+# Coop. Deleting the splice line left this suite entirely green while provisioning a
+# 19-field org, and the well-formedness check printed "19 fields" without asserting it.
+# Everything below extracts from $CT_FIELDS after the shipped assignment has run.
+extract_fields() { # src dest -- capture the shipped field declaration from a source file
+  awk '/^CT_FIELDS=/{f=1} f{print} f && /^# --- end field declaration/{exit}' "$1" > "$2"
+  grep -q '^profile_fields_json()' "$2" || { echo "FATAL: profile field generator not captured from $1"; exit 1; }
+  grep -q 'end field declaration' "$2"  || { echo "FATAL: field declaration range never terminated in $1"; exit 1; }
+}
 
-# Pinned by construction: 3 prefixes x 7 suffixes. Written out longhand on purpose -- a
-# pin that recomputes the rule it is pinning proves nothing.
+# name:TYPE, not name alone. Type is load-bearing: the queue preview selects on type, so a
+# BOOLEAN declared STRING moves where a moderator sees it, and follower_count as STRING
+# sorts lexically. A name-only pin let nip05_verified BOOLEAN -> STRING through.
+# The three identifier fields are excluded: osprey sets them directly, they are not built
+# by the prefix x suffix rule, and including them would make this pin drift-blind to the
+# rule it exists to pin.
+PF_EXTRACT='printf "%s" "$CT_FIELDS" | grep -oE "\"name\":\"(author|reported|reporter)_[a-z0-9_]+\",\"type\":\"[A-Z_]+\"" | grep -vE "\"name\":\"(reported_pubkey|reported_event_id|reporter_pubkey)\"" | sed "s/\"name\":\"//; s/\",\"type\":\"/:/; s/\"\$//" | LC_ALL=C sort'
+
+profile_names_from() { # src -> sorted "name:TYPE" lines from the SHIPPED CT_FIELDS
+  extract_fields "$1" "$WORK/pf_fields.sh"
+  { cat "$WORK/pf_fields.sh"; printf '%s\n' "$PF_EXTRACT"; } > "$WORK/pf_names.sh"
+  run "$WORK/pf_names.sh"
+}
+
+# Pinned by construction: 3 prefixes x 7 suffixes. Written longhand on purpose -- a pin
+# that recomputes the rule it is pinning proves nothing.
 EXPECTED_PROFILE=$(cat <<'PFIELDS'
 author_display_name:STRING
 author_follower_count:NUMBER
@@ -465,45 +483,46 @@ reporter_profile_state:STRING
 PFIELDS
 )
 
-# Pin name:TYPE, not name alone. A type change is silent to a name-only pin, and type is
-# load-bearing: follower_count as STRING sorts lexically, and the queue preview selects on
-# type, so a BOOLEAN declared STRING changes where a moderator sees it.
-PF_EXTRACT='profile_fields_json | grep -oE "\"name\":\"[a-z0-9_]+\",\"type\":\"[A-Z_]+\"" | sed "s/\"name\":\"//; s/\",\"type\":\"/:/; s/\"\$//" | LC_ALL=C sort'
-
-# Emit every generated profile field name from the shipped assignment.
-{ cat "$WORK/fields.sh"
-  printf '%s\n' "$PF_EXTRACT"
-} > "$WORK/names.sh"
-
-echo "the shipped profile fields match the pinned set:"
-ACTUAL_PROFILE=$(run "$WORK/names.sh") || { echo "  FAIL  generator errored: $ACTUAL_PROFILE"; fails=$((fails+1)); ACTUAL_PROFILE=''; }
+echo "the shipped CT_FIELDS carries the pinned profile fields:"
+ACTUAL_PROFILE=$(profile_names_from "$SRC") || { echo "  FAIL  extraction errored"; fails=$((fails+1)); ACTUAL_PROFILE=''; }
 if [ "$ACTUAL_PROFILE" = "$EXPECTED_PROFILE" ]; then
-  echo "  ok    21 profile fields, names exactly as osprey builds them"
+  echo "  ok    21 profile fields reach CT_FIELDS, names and types as osprey builds them"
 else
-  echo "  FAIL  profile field set drifted from the pin"
+  echo "  FAIL  profile fields in CT_FIELDS drifted from the pin"
   diff <(printf '%s\n' "$EXPECTED_PROFILE") <(printf '%s\n' "$ACTUAL_PROFILE") | sed 's/^/        /'
   fails=$((fails+1))
 fi
 
-# Positive control. The pin above is only a guard if it can go red; a set comparison that
-# has never been seen to fail is indistinguishable from one that compares nothing.
-echo "positive control: the pin discriminates:"
-{ cat "$WORK/fields.sh"
-  printf '%s\n' 'PROFILE_PREFIXES="author reported"'
-  printf '%s\n' "$PF_EXTRACT"
-} > "$WORK/mutant.sh"
-MUTANT=$(run "$WORK/mutant.sh") || MUTANT=''
-if [ "$MUTANT" != "$EXPECTED_PROFILE" ] && [ -n "$MUTANT" ]; then
-  echo "  ok    dropping a prefix is caught (would ship a card with no reporter identity)"
-else
-  echo "  FAIL  dropping a whole prefix did NOT change the field set -- the pin is vacuous"
-  fails=$((fails+1))
-fi
+# Positive controls. A pin that has never been seen to go red is indistinguishable from one
+# that compares nothing. Each control asserts its OWN mutation applied first -- a sed that
+# silently matches nothing would otherwise "pass" by testing the unmodified file.
+pin_control() { # name sed-expression
+  local name="$1" expr="$2" got
+  sed "$expr" "$SRC" > "$WORK/pf_mut.sh"
+  if cmp -s "$SRC" "$WORK/pf_mut.sh"; then
+    printf '  FAIL  %s -- mutation did not apply, so this control tested nothing\n' "$name"
+    fails=$((fails+1)); return
+  fi
+  got=$(profile_names_from "$WORK/pf_mut.sh" 2>/dev/null) || got=''
+  if [ "$got" != "$EXPECTED_PROFILE" ]; then printf '  ok    %s\n' "$name"
+  else printf '  FAIL  %s -- the pin did not notice\n' "$name"; fails=$((fails+1)); fi
+}
+
+echo "positive controls: the pin discriminates:"
+# The one that matters most: the generator is correct but its output never reaches the
+# artifact. This is what the previous version of this test could not see.
+pin_control "the splice is deleted (generator fine, CT_FIELDS unchanged)" '/^CT_FIELDS="${CT_FIELDS%]}\$(profile_fields_json)]"$/d'
+pin_control "a whole prefix is dropped (card loses reporter identity)"    's/^PROFILE_PREFIXES="author reported reporter"$/PROFILE_PREFIXES="author reported"/'
+pin_control "a field is renamed"                                          's/display_name:STRING/displayname:STRING/'
+pin_control "a field type changes (BOOLEAN -> STRING)"                    's/nip05_verified:BOOLEAN/nip05_verified:STRING/'
+pin_control "a field is removed from the rule"                            's/ nip05:STRING//'
 
 # Every field Coop is given is rendered, and a duplicate name is a field defined twice with
-# no indication which definition wins. Cheap to assert, silent and confusing if it happens.
+# no indication which wins. The COUNT is asserted, not merely printed: printing it is how a
+# 19-field org read as healthy.
 echo "the shipped CT_FIELDS is well-formed:"
-{ cat "$WORK/fields.sh"
+extract_fields "$SRC" "$WORK/wf_fields.sh"
+{ cat "$WORK/wf_fields.sh"
   printf '%s\n' 'printf "%s" "$CT_FIELDS" | python3 -c "
 import json,sys
 fields = json.load(sys.stdin)
@@ -513,11 +532,12 @@ assert not dupes, f\"duplicate field names: {sorted(dupes)}\"
 allowed = {\"STRING\",\"NUMBER\",\"BOOLEAN\",\"URL\",\"IMAGE\",\"VIDEO\",\"RELATED_ITEM\"}
 bad = {f[\"name\"]: f[\"type\"] for f in fields if f[\"type\"] not in allowed}
 assert not bad, f\"unknown field types: {bad}\"
+assert len(fields) == 40, f\"expected 40 fields (19 core + 21 profile), got {len(fields)}\"
 print(len(fields))
 "'
 } > "$WORK/wellformed.sh"
 COUNT=$(run "$WORK/wellformed.sh") && rc=0 || rc=$?
-if [ "${rc:-0}" -eq 0 ]; then echo "  ok    valid JSON, no duplicate names, all types known ($COUNT fields)"
+if [ "${rc:-0}" -eq 0 ]; then echo "  ok    valid JSON, no duplicate names, all types known, $COUNT fields"
 else echo "  FAIL  CT_FIELDS malformed: $COUNT"; fails=$((fails+1)); fi
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
