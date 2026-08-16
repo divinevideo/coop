@@ -506,25 +506,42 @@ cat > "$WORK/boundary.check" <<'SHEOF'
 set -euo pipefail
 src="$1"
 
+# Exactly one marker, asserted before use. Two markers made `mark` hold an embedded
+# newline, which killed awk with a parse error before any of this script's own messages
+# could run -- loud, but undiagnosable. It is also the only assertion here that no control
+# could distinguish, because with mark empty the awk below did a STRING comparison in which
+# every line satisfies NR > m, so it fired instead and blamed lines inside the region.
+marks=$(grep -c '^# --- end field declaration ---$' "$src" || true)
+[ "$marks" -eq 1 ] || { echo "FAIL: expected exactly 1 end-of-declaration marker, found $marks; the pinned region has no unambiguous lower bound"; exit 1; }
+mark=$(grep -n '^# --- end field declaration ---$' "$src" | cut -d: -f1)
+
 # POSITION, not count. An earlier version asserted "CT_FIELDS is assigned exactly twice",
 # which fired on a legitimate second generated family spliced INSIDE the pinned region and
 # told the developer, falsely, that something had escaped it. The obvious repair to a wrong
 # diagnosis is to bump the number, which would permanently admit one real escape. A guard
 # whose message can be false teaches people to weaken it.
-mark=$(grep -n '^# --- end field declaration ---$' "$src" | cut -d: -f1 || true)
-[ -n "$mark" ] || { echo "FAIL: the end-of-declaration marker is missing, so the pinned region has no lower bound"; exit 1; }
-
-escaped=$(awk -v m="$mark" 'NR > m && /^[[:space:]]*(CT_FIELDS|CT_FIELD_ROLES)\+?=/ { print NR": "$0 }' "$src")
+# `m+0` forces a numeric compare; without it a non-integer m silently compares as a string.
+escaped=$(awk -v m="$mark" 'NR > m+0 && /^[[:space:]]*(export|readonly|declare|typeset|local)?[[:space:]]*(CT_FIELDS|CT_FIELD_ROLES)\+?=/ { print NR": "$0 }' "$src")
 [ -z "$escaped" ] || {
   echo "FAIL: a schema assignment sits BELOW the pinned region, so the schema pin evaluates one value while a different one is provisioned:"
   echo "$escaped"
   exit 1
 }
 
-# Both provisioning branches must send the variables the pin actually checked. Phrased per
-# call site rather than as a total, so extracting the two near-identical printf calls into
-# one helper -- an obvious cleanup -- does not trip it.
-bad=$(grep -n 'CT_VARS=$(printf' "$src" | grep -vF '"$CT_FIELDS" "$CT_FIELD_ROLES"' || true)
+# FLOOR first. The per-call-site rule below only constrains lines that already match, so on
+# its own it is vacuous exactly when it matters most: rename CT_VARS and the set is empty,
+# every line "passes", and the pin governs nothing. Assert the pinned pair is read at all
+# before asserting where it is read.
+uses=$(grep -cF '"$CT_FIELDS" "$CT_FIELD_ROLES"' "$src" || true)
+[ "$uses" -ge 1 ] || { echo "FAIL: nothing in the script reads the pinned (CT_FIELDS, CT_FIELD_ROLES) pair, so the schema pin governs nothing that is actually provisioned"; exit 1; }
+
+# Then per call site, so extracting the two near-identical printf calls into one helper --
+# an obvious cleanup -- does not trip it. Continuations are joined first: the provisioning
+# lines are ~250 chars, so wrapping one is the likeliest edit of all, and matching per
+# PHYSICAL line would accuse a wrapped call of dropping a variable that is right there on
+# the next line. -F because the pattern contains $( , which is not a literal in a regex.
+logical=$(awk '{ buf = buf $0 } /\\[[:space:]]*$/ { sub(/\\[[:space:]]*$/, "", buf); next } { print NR": "buf; buf = "" } END { if (buf != "") print NR": "buf }' "$src")
+bad=$(printf '%s\n' "$logical" | grep -F 'CT_VARS=$(printf' | grep -vF '"$CT_FIELDS" "$CT_FIELD_ROLES"' || true)
 [ -z "$bad" ] || {
   echo "FAIL: a provisioning call does not send the pinned (CT_FIELDS, CT_FIELD_ROLES) pair, so it bypasses the schema pin:"
   echo "$bad"
@@ -532,9 +549,10 @@ bad=$(grep -n 'CT_VARS=$(printf' "$src" | grep -vF '"$CT_FIELDS" "$CT_FIELD_ROLE
 }
 
 # SCOPE, stated honestly: this catches an assignment a future edit puts in the wrong place.
-# It is syntactic, so it does not catch deliberate evasion (eval, printf -v, declare -n,
-# a nameref). That is the right trade -- the risk here is a careless edit, not an attacker
-# with commit access -- but the limit belongs in writing rather than in someone's head.
+# It is syntactic, so it does not catch deliberate evasion (eval, printf -v, declare -n, a
+# nameref) nor an assignment hidden after a semicolon on a shared line. That is the right
+# trade -- the risk here is a careless edit, not an attacker with commit access -- but the
+# limit belongs in writing rather than in someone's head.
 SHEOF
 echo "the pinned region actually reaches the provisioning call:"
 check_script "no schema assignment escapes the pinned region" 0 <(printf 'bash %q %q\n' "$WORK/boundary.check" "$SRC")
@@ -559,6 +577,9 @@ boundary_control() { # name sed-expression
 boundary_control "CT_FIELDS re-assigned below the marker (media_url VIDEO -> STRING)" 's|^# --- end field declaration ---$|&\nCT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
 boundary_control "CT_FIELD_ROLES re-assigned below the marker (creatorId unbound)"    's|^# --- end field declaration ---$|&\nCT_FIELD_ROLES="${CT_FIELD_ROLES//author/null}"|'
 boundary_control "a provisioning branch sends a different variable"                   's|"\$CT_FIELDS" "\$CT_FIELD_ROLES"|"$OTHER_FIELDS" "$CT_FIELD_ROLES"|'
+boundary_control "CT_VARS is renamed so no call site matches (guard would go vacuous)" 's/CT_VARS=\$(printf/CTV=$(printf/; s/"\$CT_FIELDS" "\$CT_FIELD_ROLES"/"$OTHER_A" "$OTHER_B"/'
+boundary_control "a schema assignment below the marker is exported"                  's|^# --- end field declaration ---$|&\nexport CT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
+boundary_control "a second end-of-declaration marker appears"                        's|^# --- end field declaration ---$|&\n# --- end field declaration ---|'
 boundary_control "the end-of-declaration marker is deleted"                          '/^# --- end field declaration ---$/d'
 
 echo "positive controls: the schema pin discriminates:"
@@ -570,6 +591,7 @@ pin_control "a field is removed from the rule"                                  
 pin_control "the emission ORDER changes"                                         's/profile_state:STRING profile_error:STRING/profile_error:STRING profile_state:STRING/'
 # required:true would make Coop 400 every submission, because osprey omits six of the
 # seven suffixes whenever it has nothing to say.
+pin_control "creatorId is unbound from author (Associated User panel stops resolving)" 's/"creatorId":"author"/"creatorId":null/'
 pin_control "the profile fields become required"                                 's/,\"required\":false}/,\"required\":true}/'
 # A rewrite between the literal and the splice: the shape that made regexing the literal
 # assignment stop being a check on the artifact.
