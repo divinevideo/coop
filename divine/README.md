@@ -15,7 +15,7 @@ does not travel between environments on its own. These scripts are that missing 
 |--------|---------|
 | `coop-setup-org.sh` | Idempotently bootstrap an org's moderation config: the `nostr_event` content type and `nostr_user` user type, review queues mirroring relay-manager's category tiers, routing, and (when `WEBHOOK_SECRET` is set) the enforcement CUSTOM_ACTION webhooks pointing at the deployed adapter. Needs an **admin user session** (login email/password), not just the org API key. |
 | `test-coop-setup-guards.sh` | Guard tests for `coop-setup-org.sh`'s routing vocabulary, charset, route table, and priority checks. Runs in CI for `divine/` changes; run locally after editing the routing config: `bash divine/test-coop-setup-guards.sh`. No credentials or network needed. |
-| `check-profile-field-parity.sh` | Cross-repo drift check: executes osprey's real `coop_profile.py` over every branch and compares the keys it emits to the profile fields `coop-setup-org.sh` declares. Not in CI (no osprey checkout there); run it when either side's field list changes and before provisioning a new org: `divine/check-profile-field-parity.sh ../osprey origin/main`. |
+| `check-profile-field-parity.sh` | Cross-repo drift check: executes osprey's real `coop_profile.py` over every branch and compares the keys it emits to the profile fields `coop-setup-org.sh` declares, on BOTH the `nostr_event` content type and the `nostr_user` account type. Not in CI (no osprey checkout there); run it when either side's field list changes and before provisioning a new org: `divine/check-profile-field-parity.sh ../osprey origin/main`. |
 | `coop-bridge-import.sh` | Pull live kind-1984 reports from relay-manager and submit them to COOP for review (demo bridge). |
 
 ## Usage

@@ -138,6 +138,47 @@ profile_fields_json() {
 # these read on the card but drops nothing. Reordering the existing 19 is a separate change.
 CT_FIELDS="${CT_FIELDS%]}$(profile_fields_json)]"
 CT_FIELD_ROLES='{"displayName":"text","creatorId":"author","threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
+
+# User item type fields (step 1b provisions them). Declared HERE, beside the content
+# fields, because both are generated from PROFILE_SUFFIX_TYPES above and a reader
+# comparing them should not have to hold 60 lines in their head to do it.
+#
+# UNPREFIXED, and that is the whole point of the difference. The content item carries
+# THREE people -- author, reported, reporter -- so it namespaces them or one person's
+# identity shows against another's actions. A `nostr_user` item IS one person, so there
+# is nothing to disambiguate; `author_display_name` on an account card would read as a
+# claim about some other account.
+#
+# WHY THE ACCOUNT CARD NEEDS ITS OWN COPY AT ALL. The Associated User panel does not
+# read the content item to describe the account. It resolves the account as an item in
+# its own right (latestItemSubmissions -> ItemInvestigationService) and renders THIS
+# type's declared fields against that item's data
+# (client/src/webpages/dashboard/mrt/manual_review_job/v2/user/ManualReviewJobRelatedUserComponent.tsx).
+# The content item's `author` reference is only {id, typeId, name} (types/index.ts
+# RelatedItem), so nothing hung off it can populate the panel. Undeclared here means the
+# moderator keeps reading "No user information found" over a 64-character pubkey while
+# deciding whether to ban that account.
+#
+# Same "declare only what a producer is proven to omit" bar as the content fields: these
+# come from the same coop_profile.py mapping, via osprey's user_item_fields(), which
+# derives the unprefixed names from the prefixed ones rather than restating them. So the
+# omission semantics documented above hold identically here, and an unresolved lookup
+# still renders no row rather than a misleading blank one.
+#
+# NOT declared: `picture` for the profileIcon role. funnelcake returns one, but osprey
+# does not send it yet, and a declared field no producer fills is the exact thing the
+# rule above forbids.
+user_profile_fields_json() {
+  local st suffix ftype
+  for st in $PROFILE_SUFFIX_TYPES; do
+    suffix="${st%%:*}"; ftype="${st##*:}"
+    printf ',{"name":"%s","type":"%s","required":false}' "$suffix" "$ftype"
+  done
+}
+# `pubkey` stays required: Coop 400s a submission that omits a required field, which is
+# what makes it the one field osprey must always send for an account item.
+UT_FIELDS='[{"name":"pubkey","type":"STRING","required":true},{"name":"npub","type":"STRING","required":false},{"name":"first_seen_at","type":"DATETIME","required":false}]'
+UT_FIELDS="${UT_FIELDS%]}$(user_profile_fields_json)]"
 # --- end field declaration ---
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
 CT_ID=$(type_id nostr_event)
@@ -175,11 +216,18 @@ fi
 # history, and bulk actions over a pasted pubkey list. Without it, Coop can only
 # ever be searched by item id.
 #
-# displayName is the pubkey itself. We have no username to show, and a moderator
-# recognises an npub; an empty display name renders as a blank row.
+# displayName stays the pubkey, deliberately, now that `display_name` exists as a
+# field. The panel RESERVES the displayName-role field for its header and drops it
+# from the field list, and the header falls back to "User <64 hex>" when that field is
+# absent -- and `display_name` IS absent whenever a profile carries no name, which is
+# common. Pointing the role at it would trade a pubkey a moderator can recognise for a
+# longer string that says less, on exactly the accounts we know least about. The name
+# still renders, as its own labelled row.
+#
+# Its fields are declared with the content type's, above; see the block ending at
+# "--- end field declaration ---".
 # ---------------------------------------------------------------------------
 echo "==> Ensuring user type 'nostr_user'"
-UT_FIELDS='[{"name":"pubkey","type":"STRING","required":true},{"name":"npub","type":"STRING","required":false},{"name":"first_seen_at","type":"DATETIME","required":false}]'
 UT_ID=$(type_id nostr_user)
 UT_EXISTS=false
 if [ -n "$UT_ID" ]; then

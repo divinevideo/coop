@@ -168,12 +168,13 @@ cat > "$WORK/schema.check" <<'SHEOF'
 set -euo pipefail
 # shellcheck disable=SC1090
 . "$1"
-python3 - "$CT_FIELDS" "$CT_FIELD_ROLES" <<'PYEOF'
+python3 - "$CT_FIELDS" "$CT_FIELD_ROLES" "$UT_FIELDS" <<'PYEOF'
 import json
 import sys
 
 fields = json.loads(sys.argv[1])
 roles = json.loads(sys.argv[2])
+user_fields = json.loads(sys.argv[3])
 
 expected_fields = [
     ("event_id", "STRING", True),
@@ -233,6 +234,29 @@ expected_roles = {
 }
 if roles != expected_roles:
     raise SystemExit("FAIL: shipped field roles differ from the reviewed schema: %r" % (roles,))
+
+# The nostr_user type, pinned for the same reasons. `pubkey` required:True is the one
+# osprey must always send; every profile field must stay optional, because osprey omits
+# each of them whenever it has nothing to say and Coop rejects the WHOLE item when a
+# required field is absent -- which here would strand the account card, not just a row.
+expected_user_fields = [
+    ("pubkey", "STRING", True),
+    ("npub", "STRING", False),
+    ("first_seen_at", "DATETIME", False),
+    # UNPREFIXED, in the same emission order as one prefix family above. These are what
+    # the Associated User panel renders; prefixed names here would describe some other
+    # account and show nothing.
+    ("profile_state", "STRING", False),
+    ("profile_error", "STRING", False),
+    ("has_vanish_request", "BOOLEAN", False),
+    ("display_name", "STRING", False),
+    ("nip05", "STRING", False),
+    ("nip05_verified", "BOOLEAN", False),
+    ("follower_count", "NUMBER", False),
+]
+actual_user_fields = [(f["name"], f["type"], f["required"]) for f in user_fields]
+if actual_user_fields != expected_user_fields:
+    raise SystemExit("FAIL: shipped nostr_user fields differ from the reviewed schema: %r" % (actual_user_fields,))
 
 PYEOF
 SHEOF
@@ -529,7 +553,7 @@ mark=$(grep -n '^# --- end field declaration ---$' "$src" | cut -d: -f1)
 # diagnosis is to bump the number, which would permanently admit one real escape. A guard
 # whose message can be false teaches people to weaken it.
 # `m+0` forces a numeric compare; without it a non-integer m silently compares as a string.
-escaped=$(awk -v m="$mark" 'NR > m+0 && /^[[:space:]]*(export|readonly|declare|typeset|local)?[[:space:]]*(CT_FIELDS|CT_FIELD_ROLES)\+?=/ { print NR": "$0 }' "$src")
+escaped=$(awk -v m="$mark" 'NR > m+0 && /^[[:space:]]*(export|readonly|declare|typeset|local)?[[:space:]]*(CT_FIELDS|CT_FIELD_ROLES|UT_FIELDS)\+?=/ { print NR": "$0 }' "$src")
 [ -z "$escaped" ] || {
   echo "FAIL: a schema assignment sits BELOW the pinned region, so the schema pin evaluates one value while a different one is provisioned:"
   echo "$escaped"
@@ -544,6 +568,12 @@ escaped=$(awk -v m="$mark" 'NR > m+0 && /^[[:space:]]*(export|readonly|declare|t
 # which reopened the exact vacuity this floor exists to close.
 uses=$(grep -F '"$CT_FIELDS" "$CT_FIELD_ROLES"' "$src" | grep -vc '^[[:space:]]*#' || true)
 [ "$uses" -ge 1 ] || { echo "FAIL: nothing in the script reads the pinned (CT_FIELDS, CT_FIELD_ROLES) pair, so the schema pin governs nothing that is actually provisioned"; exit 1; }
+
+# Same floor for the user type. UT_FIELDS is pinned too now, so it needs its own proof that
+# the pinned value is the provisioned one; without this the nostr_user half of the pin goes
+# vacuous the moment the variable is renamed, in exactly the way described above.
+ut_uses=$(grep -F '"$UT_FIELDS"' "$src" | grep -vc '^[[:space:]]*#' || true)
+[ "$ut_uses" -ge 1 ] || { echo "FAIL: nothing in the script reads the pinned UT_FIELDS, so the nostr_user schema pin governs nothing that is actually provisioned"; exit 1; }
 
 # Then per call site, so extracting the two near-identical printf calls into one helper --
 # an obvious cleanup -- does not trip it. Continuations are joined first: the provisioning
@@ -599,6 +629,8 @@ boundary_control "CT_FIELD_ROLES re-assigned below the marker (creatorId unbound
 boundary_control "ONE provisioning branch sends a different variable" "does not send the pinned" '/"input":{"name":"nostr_event"/s|"\$CT_FIELDS" "\$CT_FIELD_ROLES"|"$OTHER_FIELDS" "$OTHER_ROLES"|'
 boundary_control "CT_VARS is renamed so no call site matches (guard would go vacuous)" "nothing in the script reads the pinned" 's/CT_VARS=\$(printf/CTV=$(printf/; s/"\$CT_FIELDS" "\$CT_FIELD_ROLES"/"$OTHER_A" "$OTHER_B"/'
 boundary_control "a schema assignment below the marker is exported" "sits BELOW the pinned region"                  's|^# --- end field declaration ---$|&\nexport CT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
+boundary_control "UT_FIELDS re-assigned below the marker (account card types downgraded)" "sits BELOW the pinned region" 's|^# --- end field declaration ---$|&\nUT_FIELDS="${UT_FIELDS//BOOLEAN/STRING}"|'
+boundary_control "nothing reads the pinned UT_FIELDS (guard would go vacuous)" "nothing in the script reads the pinned UT_FIELDS" 's/"\$UT_FIELDS"/"$OTHER_UT"/g'
 boundary_control "a second end-of-declaration marker appears" "end-of-declaration marker, found"                        's|^# --- end field declaration ---$|&\n# --- end field declaration ---|'
 boundary_control "the end-of-declaration marker is deleted" "end-of-declaration marker, found"                          '/^# --- end field declaration ---$/d'
 
@@ -618,6 +650,15 @@ pin_control "creatorId is unbound from author (Associated User panel stops resol
 # required:true would make Coop 400 every submission, because osprey omits six of the
 # seven suffixes whenever it has nothing to say.
 pin_control "the profile fields become required" "shipped content fields differ"                                 's/,\"required\":false}/,\"required\":true}/'
+
+# The same three ways the ACCOUNT card can silently lose its fields. Each of these leaves
+# the content type completely intact, so the controls above stay green while the
+# Associated User panel goes back to "No user information found".
+pin_control "the nostr_user splice is deleted (account card loses every profile field)" "shipped nostr_user fields differ" '/user_profile_fields_json)]"$/d'
+pin_control "the nostr_user fields are prefixed (they would describe another account)" "shipped nostr_user fields differ"  's/user_profile_fields_json)]/profile_fields_json)]/'
+# pubkey is the one field osprey must always send; optional here means a submission that
+# omits it is accepted and the account item carries no identity at all.
+pin_control "pubkey stops being required on nostr_user" "shipped nostr_user fields differ" 's/{"name":"pubkey","type":"STRING","required":true}/{"name":"pubkey","type":"STRING","required":false}/'
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"
