@@ -215,8 +215,11 @@ else:
         executed_user |= set(user_builder(case, error='e'))
 
     # Identity fields osprey sets directly or that predate enrichment; not built by the
-    # suffix rule, so they are not expected to appear in it.
-    USER_IDENTIFIERS = {'pubkey', 'npub', 'first_seen_at'}
+    # suffix rule, so they are not expected to appear in it. `report_reason` is a ROUTING
+    # field the sink emits directly in `_submit_reported_account` (a profile-only report's
+    # reason, matched by the step 5b nostr_user routes) -- also not a profile suffix, so it
+    # is excluded from the suffix-parity comparison rather than read as a blank row.
+    USER_IDENTIFIERS = {'pubkey', 'npub', 'first_seen_at', 'report_reason'}
     declared_user = {f['name'] for f in json.loads((work / 'coop_ut_fields.json').read_text())}
     declared_user_profile = declared_user - USER_IDENTIFIERS
 

@@ -150,6 +150,62 @@ else
   fails=$((fails+1))
 fi
 
+echo "the nostr_user (profile-only report) routing is present and ordered:"
+# Pins the whole (queue, token) set of the nostr_user report_reason routes, plus the
+# ordering invariant (CSAM first, the nostr_user match-all default LAST), plus that the
+# rule NAMES are type-prefixed so they cannot collide org-wide with the nostr_event
+# routes of the same field/queue. Derived from BASH like CATROUTES, so an added or
+# dropped row cannot hide.
+{ awk '/^USER_CATROUTES=\(/,/^\)/' "$SRC"; echo 'printf "%s\n" "${USER_CATROUTES[@]}"'; } > "$WORK/user_routes.sh"
+USER_ACTUAL=$(bash -euo pipefail "$WORK/user_routes.sh" 2>/dev/null | LC_ALL=C sort)
+USER_EXPECTED=$(printf '%s\n' \
+  'CSAM|csam' \
+  'Child Safety|child_safety' \
+  'Sexual Content|nudity' \
+  'Violence & Extremism|violence' \
+  'Harassment, Threats & Safety|harassment' | LC_ALL=C sort)
+if [ "$USER_ACTUAL" = "$USER_EXPECTED" ]; then
+  echo "  ok    $(printf '%s\n' "$USER_ACTUAL" | grep -c .) nostr_user report_reason routes, each to its intended queue"
+else
+  echo "  FAIL  shipped USER_CATROUTES differs from the expected (queue, token) set:"
+  diff <(printf '%s\n' "$USER_EXPECTED") <(printf '%s\n' "$USER_ACTUAL") | sed 's/^/        /' || true
+  fails=$((fails+1))
+fi
+# underage_user must NOT be routed for nostr_user either (age review is relay-manager's).
+if printf '%s\n' "$USER_ACTUAL" | grep -q 'underage_user'; then
+  echo "  FAIL  nostr_user routes must not include underage_user (age review is relay-manager's)"
+  fails=$((fails+1))
+else
+  echo "  ok    nostr_user routing excludes underage_user"
+fi
+# user_priority: CSAM first, nostr_user General Review last.
+USER_PRIORITY=$(python3 - "$SRC" <<'PY'
+import ast, re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"user_priority = \[(.*?)\]", src, re.S)
+if not m:
+    raise SystemExit("user_priority list not found")
+print("\n".join(ast.literal_eval("[" + m.group(1) + "]")))
+PY
+)
+FIRST=$(printf '%s\n' "$USER_PRIORITY" | head -1)
+LAST=$(printf '%s\n' "$USER_PRIORITY" | tail -1)
+if [ "$FIRST" = "nostr_user: report_reason -> CSAM" ] && [ "$LAST" = "nostr_user -> General Review" ]; then
+  echo "  ok    nostr_user order is CSAM first, General Review last"
+else
+  echo "  FAIL  nostr_user ordering wrong (first='$FIRST' last='$LAST')"
+  echo "        CSAM must be first (sticky, NCMEC-bound) and the match-all default last (first-match-wins)."
+  fails=$((fails+1))
+fi
+# Name collision: every nostr_user route name must be type-prefixed so it is distinct
+# org-wide from the nostr_event route of the same field/queue.
+if printf '%s\n' "$USER_PRIORITY" | grep -vq '^nostr_user'; then
+  echo "  FAIL  a nostr_user priority entry is not type-prefixed; it could collide with a nostr_event rule name"
+  fails=$((fails+1))
+else
+  echo "  ok    nostr_user route names are type-prefixed (no org-wide collision)"
+fi
+
 echo "the shipped account-moderation config is internally consistent:"
 # Pins the COMPLETE shipped schema: name, type, required, IN ORDER.
 #
@@ -241,6 +297,10 @@ if roles != expected_roles:
 # required field is absent -- which here would strand the account card, not just a row.
 expected_user_fields = [
     ("pubkey", "STRING", True),
+    # report_reason: STRING, optional. Present so a PROFILE-ONLY report can be
+    # ROUTED as a nostr_user item by the step 5b routes; absent means "not a
+    # reported account here" (enrichment), which must be fine rather than a 400.
+    ("report_reason", "STRING", False),
     ("npub", "STRING", False),
     ("first_seen_at", "DATETIME", False),
     # UNPREFIXED, in the same emission order as one prefix family above. These are what

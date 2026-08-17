@@ -177,7 +177,15 @@ user_profile_fields_json() {
 }
 # `pubkey` stays required: Coop 400s a submission that omits a required field, which is
 # what makes it the one field osprey must always send for an account item.
-UT_FIELDS='[{"name":"pubkey","type":"STRING","required":true},{"name":"npub","type":"STRING","required":false},{"name":"first_seen_at","type":"DATETIME","required":false}]'
+#
+# `report_reason` is declared here so a PROFILE-ONLY report (a `p` tag with no `e` tag)
+# can be queued as a nostr_user item and ROUTED by reason. COOPSink submits the reported
+# account carrying report_reason (coop_sink.py `_submit_reported_account`), and the
+# nostr_user routing rules in step 5b match this field into the existing reason queues.
+# Optional: an account submitted for enrichment (the Associated User panel of a content
+# item) carries no reason, and an absent field must mean "not a reported account here",
+# not a 400. STRING so the anchored ^token$ routing regex can match it.
+UT_FIELDS='[{"name":"pubkey","type":"STRING","required":true},{"name":"report_reason","type":"STRING","required":false},{"name":"npub","type":"STRING","required":false},{"name":"first_seen_at","type":"DATETIME","required":false}]'
 UT_FIELDS="${UT_FIELDS%]}$(user_profile_fields_json)]"
 # --- end field declaration ---
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
@@ -436,6 +444,48 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4b) Content rule for nostr_user: enqueue every nostr_user item to the MRT so a
+#     PROFILE-ONLY report (a reported account with no content event) SURFACES as a
+#     review job, exactly as 4) does for nostr_event. Without this, COOPSink's
+#     nostr_user submission is stored but never becomes a job.
+#
+#     ENRICHMENT accounts (the Associated User panel of a content item) are also
+#     nostr_user items, so this enqueues them too. That is harmless: they carry no
+#     report_reason, fall through the reason routes to General Review, and are the
+#     same account a moderator is already looking at on the content job. The signal
+#     that an account was REPORTED is report_reason being present; a dedicated
+#     reported-users queue (out of scope) would later separate the two by that field.
+# ---------------------------------------------------------------------------
+USER_CONTENT_RULE_NAME="nostr_user -> review queue"
+echo "==> Ensuring content rule ($USER_CONTENT_RULE_NAME)"
+UT_ID_NOW=$(type_id nostr_user)
+[ -z "$UT_ID_NOW" ] && { echo "    ERROR: cannot resolve nostr_user type id for the content rule"; exit 1; }
+EXISTING_UCR=$(gql 'query { myOrg { rules { id name status ... on ContentRule { itemTypes { __typename ... on ItemTypeBase { name } } actions { __typename } } } } }')
+UCR_SATISFIED=$(echo "$EXISTING_UCR" | python3 -c "
+import json,sys
+rs = json.load(sys.stdin)['data']['myOrg']['rules']
+def targets(r): return any(t.get('name')=='nostr_user' for t in (r.get('itemTypes') or []))
+def enqueues(r): return any(a.get('__typename')=='EnqueueToMrtAction' for a in (r.get('actions') or []))
+print('yes' if any(targets(r) and r.get('status')=='LIVE' and enqueues(r) for r in rs) else 'no')
+" 2>/dev/null || echo no)
+if [ "$UCR_SATISFIED" = "yes" ]; then
+  echo "    a LIVE content rule already enqueues nostr_user to the MRT, skipping"
+else
+  ENQUEUE_ID=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }' \
+    | python3 -c "import json,sys;a=json.load(sys.stdin)['data']['myOrg']['actions'];print(next((x['id'] for x in a if x.get('__typename')=='EnqueueToMrtAction'),''))" 2>/dev/null || true)
+  [ -z "$ENQUEUE_ID" ] && { echo "    ERROR: no built-in ENQUEUE_TO_MRT action found — run create-org-and-user.js first."; exit 1; }
+  UCRV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Surface every reported nostr_user account for moderator review","status":"LIVE","contentTypeIds":[sys.argv[2]],"conditionSet":{"conditions":[],"conjunction":"AND"},"actionIds":[sys.argv[3]],"policyIds":[],"tags":[]}}))' "$USER_CONTENT_RULE_NAME" "$UT_ID_NOW" "$ENQUEUE_ID")
+  RESP=$(gql 'mutation CR($input: CreateContentRuleInput!){ createContentRule(input:$input){ __typename } }' "$UCRV")
+  if echo "$RESP" | grep -q '"__typename":"MutateContentRuleSuccessResponse"'; then
+    echo "    created"
+  elif echo "$RESP" | grep -q 'RuleNameExistsError'; then
+    echo "    exists (created concurrently); re-run to reconcile it to LIVE+enqueue"
+  else
+    echo "    ERROR: nostr_user content rule create failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 5) Category routing rules: CONTENT_FIELD matches <canonical token> -> category queue.
 #    First-match-wins by sequence, so CSAM is ordered FIRST (sticky, one-way, must
 #    reach NCMEC — docs/moderation/moderation-category-handling-principles.md), then
@@ -614,6 +664,89 @@ print(json.dumps({"input":inp}))' "$TID" "$QID" "$CR_NAME" "$KEYWORDS" "$FIELD")
   fi
 done
 
+# ---------------------------------------------------------------------------
+# 5b) Category routing rules for nostr_user: route a REPORTED ACCOUNT (a profile-only
+#     report) by report_reason into the SAME reason queues as content. A dedicated
+#     "Reported Users" queue is out of scope; these routes reuse the existing queues
+#     under the current rules, and a future dedicated queue is a one-line re-point of
+#     the default below plus/instead of these specifics.
+#
+#     Same anchored ^token$ EXACT-match discipline as step 5. Names are prefixed with
+#     the item type because Coop rule names are unique ORG-WIDE, so they must not
+#     collide with the nostr_event routes of the same field/queue. underage_user is
+#     NOT routed: age review is relay-manager's, and Osprey excludes it upstream, so a
+#     nostr_user underage report never reaches this path.
+# ---------------------------------------------------------------------------
+echo "==> Ensuring category routing rules for nostr_user"
+TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
+UT_ID_ROUTE=$(type_id nostr_user)
+[ -z "$UT_ID_ROUTE" ] && { echo "    ERROR: cannot resolve nostr_user type id for routing"; exit 1; }
+# queue|comma-separated report_reason tokens. Same tokens (and thus same canonical
+# vocabulary) as the nostr_event report_reason routes in CATROUTES.
+USER_CATROUTES=(
+  "CSAM|csam"
+  "Child Safety|child_safety"
+  "Sexual Content|nudity"
+  "Violence & Extremism|violence"
+  "Harassment, Threats & Safety|harassment"
+)
+EXISTING_UR=$(gql 'query { myOrg { routingRules { id name } } }')
+for row in "${USER_CATROUTES[@]}"; do
+  UQUEUE="${row%%|*}"; UKEYWORDS="${row#*|}"
+  UCR_NAME="nostr_user: report_reason -> $UQUEUE"
+  UQID=$(qid "$UQUEUE")
+  [ -z "$UQID" ] && { echo "    ERROR: queue '$UQUEUE' not found (run step 2 first)"; exit 1; }
+  # Guard the token here too, so this array cannot drift from the canonical vocabulary
+  # any more quietly than CATROUTES can. Same charset and vocabulary as report_reason.
+  if [[ ! "$UKEYWORDS" =~ ^[a-z_]+$ ]]; then
+    echo "    ERROR: nostr_user route token '$UKEYWORDS' is not [a-z_]+"; exit 1
+  fi
+  case "$CANONICAL_REASONS" in
+    *" $UKEYWORDS "*) ;;
+    *) echo "    ERROR: nostr_user route token '$UKEYWORDS' is not in the canonical report_reason vocabulary"; exit 1 ;;
+  esac
+  URID=$(echo "$EXISTING_UR" | python3 -c 'import json,sys; org=(json.load(sys.stdin).get("data") or {}).get("myOrg") or {}; print(next((r["id"] for r in (org.get("routingRules") or []) if r.get("name")==sys.argv[1]), ""))' "$UCR_NAME")
+  UIN=$(URID="$URID" python3 -c '
+import json,os,sys
+tid,qid,name,kw = sys.argv[1],sys.argv[2],sys.argv[3],["^"+sys.argv[4]+"$"]
+cond = {"input":{"type":"CONTENT_FIELD","name":"report_reason","contentTypeId":tid},
+        "signal":{"id":json.dumps({"type":"TEXT_MATCHING_CONTAINS_REGEX"}),"type":"TEXT_MATCHING_CONTAINS_REGEX"},
+        "matchingValues":{"strings":kw}}
+inp = {"name":name,"conditionSet":{"conditions":[cond],"conjunction":"AND"},
+       "destinationQueueId":qid,"itemTypeIds":[tid],"status":"LIVE"}
+rid = os.environ.get("URID","")
+if rid: inp["id"] = rid
+print(json.dumps({"input":inp}))' "$UT_ID_ROUTE" "$UQID" "$UCR_NAME" "$UKEYWORDS")
+  if [ -n "$URID" ]; then
+    RESP=$(gql 'mutation UR($input: UpdateRoutingRuleInput!){ updateRoutingRule(input:$input){ __typename } }' "$UIN"); UACT=reconciled
+  else
+    RESP=$(gql 'mutation CR($input: CreateRoutingRuleInput!){ createRoutingRule(input:$input){ __typename } }' "$UIN"); UACT=created
+  fi
+  if echo "$RESP" | grep -q '"__typename":"MutateRoutingRuleSuccessResponse"'; then
+    echo "    $UACT '$UCR_NAME' -> $UQID"
+  else
+    echo "    ERROR: nostr_user routing rule $UACT failed for '$UCR_NAME': $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+  fi
+done
+# Default nostr_user route: match-all -> General Review, ordered LAST among nostr_user
+# routes (see reorder below).
+USER_DEFAULT_NAME="nostr_user -> General Review"
+if echo "$EXISTING_UR" | grep -qF "\"$USER_DEFAULT_NAME\""; then
+  echo "    exists, skipping ($USER_DEFAULT_NAME)"
+else
+  GQID=$(qid "General Review")
+  [ -z "$GQID" ] && { echo "    ERROR: General Review queue not found"; exit 1; }
+  UDV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"conditionSet":{"conditions":[],"conjunction":"AND"},"destinationQueueId":sys.argv[2],"itemTypeIds":[sys.argv[3]],"status":"LIVE"}}))' "$USER_DEFAULT_NAME" "$GQID" "$UT_ID_ROUTE")
+  RESP=$(gql 'mutation R($input: CreateRoutingRuleInput!){ createRoutingRule(input:$input){ __typename } }' "$UDV")
+  if echo "$RESP" | grep -q '"__typename":"MutateRoutingRuleSuccessResponse"'; then
+    echo "    created ($USER_DEFAULT_NAME)"
+  elif echo "$RESP" | grep -q 'RoutingRuleNameExistsError'; then
+    echo "    exists, skipping ($USER_DEFAULT_NAME)"
+  else
+    echo "    ERROR: nostr_user default routing rule failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+  fi
+fi
+
 echo "==> Ordering routing rules (CSAM first, General Review last)"
 RR=$(gql 'query { myOrg { routingRules { id name } } }')
 ORDER=$(echo "$RR" | python3 -c '
@@ -635,8 +768,22 @@ priority = [
   "label_value -> Violence & Extremism",
   "report_reason -> Harassment, Threats & Safety",
 ]
+# nostr_user routes, ordered WITHIN their own item type: CSAM first, the nostr_user
+# match-all default LAST. Routing is per-item-type first-match-wins, so what matters is
+# that a nostr_user specific precedes the nostr_user default; where these sit relative to
+# the nostr_event routes does not affect either type. Kept as its own list so the guard
+# that pins `priority` against CATROUTES stays valid (that regex reads only the first list).
+user_priority = [
+  "nostr_user: report_reason -> CSAM",
+  "nostr_user: report_reason -> Child Safety",
+  "nostr_user: report_reason -> Sexual Content",
+  "nostr_user: report_reason -> Violence & Extremism",
+  "nostr_user: report_reason -> Harassment, Threats & Safety",
+  "nostr_user -> General Review",
+]
 gen = by.get(GENERAL)
 ordered = [by[n] for n in priority if n in by]
+ordered += [by[n] for n in user_priority if n in by and by[n] not in ordered]
 # Then any other rules (manually added / renamed) -- but never after the catch-all.
 ordered += [r["id"] for r in rules if r["id"] not in ordered and r["id"] != gen]
 # General Review LAST: it is a match-all (empty conditionSet) and routing is
