@@ -292,6 +292,17 @@ else
   echo "  FAIL  the 4b skip accepts ANY foreign nostr_user enqueue rule; a match-all foreign rule would be silently satisfied"
   fails=$((fails+1))
 fi
+# And the query the predicate reads must be VALID GraphQL: conditionSet is a composite
+# type (type ConditionSet { conjunction, conditions }), so selecting it without a
+# subselection makes the server reject the whole document -- the decision pipeline then
+# hits its 2>/dev/null fallback and degrades to 'create' on EVERY run, silently. The
+# identifier checks above stay green through that, so the query shape is pinned separately.
+if grep -qF 'conditionSet { conditions' "$SRC"; then
+  echo "  ok    the 4b rules query selects conditionSet with a subselection (a composite field without one is invalid GraphQL)"
+else
+  echo "  FAIL  the 4b rules query selects conditionSet without a subselection; the server rejects the document and the skip degrades to create every run"
+  fails=$((fails+1))
+fi
 
 echo "the shipped account-moderation config is internally consistent:"
 # Pins the COMPLETE shipped schema: name, type, required, IN ORDER.
@@ -836,6 +847,9 @@ routing_control "a middle user_priority entry is dropped (that route is shadowed
 # Renaming the marker away restores the silent existence-only skip a foreign match-all
 # rule could hide behind (the containment check above goes red, not the schema pin).
 routing_control "the foreign-rule conditioning check is removed (silent match-all skip returns)" "silently satisfied" 's/foreign_unconditioned/satisfied2/g'
+# Bare `conditionSet` (no subselection) is invalid GraphQL for a composite type; the
+# server rejects the whole query and the F3 fallback degrades 4b to create on every run.
+routing_control "the 4b query loses its conditionSet subselection (invalid GraphQL, silent create-fallback)" "selects conditionSet without a subselection" 's/conditionSet { conditions/conditionSet/'
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"

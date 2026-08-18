@@ -498,15 +498,20 @@ UT_ID_NOW=$(type_id nostr_user)
 # warning below, never a silent skip: while an unconditional foreign enqueue rule is LIVE,
 # every enrichment account also gets its own review job, which is the exact harm step 4b
 # exists to prevent.
-EXISTING_UCR=$(gql 'query { myOrg { rules { id name status ... on ContentRule { conditionSet itemTypes { __typename ... on ItemTypeBase { name } } actions { __typename } } } } }')
+EXISTING_UCR=$(gql 'query { myOrg { rules { id name status ... on ContentRule { conditionSet { conditions { ... on LeafCondition { input { type name contentTypeId } signal { type } matchingValues { strings } } } } itemTypes { __typename ... on ItemTypeBase { name } } actions { __typename } } } } }')
 UCR_DECISION=$(echo "$EXISTING_UCR" | python3 -c "
 import json,sys
 rs = json.load(sys.stdin)['data']['myOrg']['rules']
+tid = sys.argv[2]
 def targets(r): return any(t.get('name')=='nostr_user' for t in (r.get('itemTypes') or []))
 def enqueues(r): return any(a.get('__typename')=='EnqueueToMrtAction' for a in (r.get('actions') or []))
 # Same predicate the guard pins on OUR conditionSet: fires only when report_reason is
 # present (CONTENT_FIELD report_reason + regex ^.+\$). A rule that satisfies it cannot
 # enqueue an enrichment account, so its existence really does satisfy step 4b.
+# contentTypeId must match the nostr_user type id: a condition scoped to another type
+# never evaluates for nostr_user items (CONTENT_FIELD extraction requires
+# inputSpecifier.contentTypeId === itemTypeId, else INAPPLICABLE), so a rule whose only
+# report_reason condition points elsewhere can never fire here and must not satisfy 4b.
 def conditioned(r):
     conds = (r.get('conditionSet') or {}).get('conditions') or []
     def ok(c):
@@ -514,6 +519,7 @@ def conditioned(r):
         strings = (c.get('matchingValues') or {}).get('strings') or []
         signal = (c.get('signal') or {}).get('type')
         return (field.get('type')=='CONTENT_FIELD' and field.get('name')=='report_reason'
+                and field.get('contentTypeId')==tid
                 and signal=='TEXT_MATCHING_CONTAINS_REGEX' and strings==['^.+\$'])
     return bool(conds) and any(ok(c) for c in conds)
 ours = next((r['id'] for r in rs if r.get('name')==sys.argv[1]), '')
@@ -526,7 +532,7 @@ elif foreign:
     print('foreign_unconditioned|'+','.join(r['name'] for r in foreign))
 else:
     print('create|')
-" "$USER_CONTENT_RULE_NAME" 2>/dev/null || echo 'create|')
+" "$USER_CONTENT_RULE_NAME" "$UT_ID_NOW" 2>/dev/null || echo 'create|')
 UCR_MODE="${UCR_DECISION%%|*}"; UCR_DETAIL="${UCR_DECISION#*|}"
 if [ "$UCR_MODE" = "satisfied" ]; then
   echo "    a LIVE content rule already enqueues nostr_user only when report_reason is present, skipping"
