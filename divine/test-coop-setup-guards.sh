@@ -225,16 +225,23 @@ def report_reason_present(c):
     strings = (c.get("matchingValues") or {}).get("strings") or []
     # "^.+$" and friends require >=1 char, so an absent/empty report_reason does not match.
     # A '+'-quantified anchored pattern is the non-empty signal; '^$' / '' would match empty.
-    nonempty = [p for p in strings if isinstance(p, str) and p.startswith("^") and p.endswith("$") and "+" in p]
-    return field.get("type") == "CONTENT_FIELD" and field.get("name") == "report_reason" and bool(nonempty)
+    signal = (c.get("signal") or {}).get("type")
+    # EXACT shipped pattern, not a heuristic. A heuristic (anchored AND "+" present) would
+    # pass a functionally broken pattern like "^+$"; require the precise "^.+$", which matches
+    # any NON-EMPTY value and nothing empty, on the report_reason CONTENT_FIELD via the regex
+    # signal. Anything else -- a broken pattern, "^$", a different field -- is a bug.
+    return (field.get("type") == "CONTENT_FIELD"
+            and field.get("name") == "report_reason"
+            and signal == "TEXT_MATCHING_CONTAINS_REGEX"
+            and strings == ["^.+$"])
 print("OK" if (conds and any(report_reason_present(c) for c in conds)) else "FAIL")
 PY
 { awk '/^nostr_user_review_condition_set\(\)/{flag=1} flag{print} flag && /^}/{exit}' "$SRC"; echo 'nostr_user_review_condition_set nostr-user-type'; } > "$WORK/uc_cond.sh"
 UC_REAL=$(bash "$WORK/uc_cond.sh" 2>/dev/null | python3 "$WORK/uc_check.py" 2>/dev/null || echo FAIL)
 if [ "$UC_REAL" = "OK" ]; then
-  echo "  ok    nostr_user enqueue rule fires only when report_reason is present"
+  echo "  ok    nostr_user enqueue rule ships the exact report_reason-present pattern ^.+$"
 else
-  echo "  FAIL  the shipped nostr_user enqueue conditionSet is match-all or not keyed on a non-empty report_reason"
+  echo "  FAIL  the shipped nostr_user enqueue conditionSet is not the exact report_reason ^.+$ condition"
   fails=$((fails+1))
 fi
 # Positive control: the SAME check must REJECT a match-all (empty) conditionSet, or a revert
@@ -244,6 +251,16 @@ if [ "$UC_MATCHALL" = "FAIL" ]; then
   echo "  ok    the check rejects a match-all conditionSet (positive control)"
 else
   echo "  FAIL  the conditioned-rule check passed a match-all conditionSet; it is vacuous"
+  fails=$((fails+1))
+fi
+# Positive control 2: a report_reason condition whose pattern is functionally BROKEN ("^+$"
+# quantifies nothing) must be rejected -- exactly what the old anchored-and-"+" heuristic let
+# through. The exact-pattern check must not.
+UC_BROKEN=$(printf '%s' '{"conditions":[{"input":{"type":"CONTENT_FIELD","name":"report_reason","contentTypeId":"x"},"signal":{"type":"TEXT_MATCHING_CONTAINS_REGEX"},"matchingValues":{"strings":["^+$"]}}],"conjunction":"AND"}' | python3 "$WORK/uc_check.py" 2>/dev/null || echo FAIL)
+if [ "$UC_BROKEN" = "FAIL" ]; then
+  echo "  ok    the check rejects a broken '^+$' pattern (positive control)"
+else
+  echo "  FAIL  the check accepted a broken '^+$' pattern; the exact-pattern assertion is not enforced"
   fails=$((fails+1))
 fi
 

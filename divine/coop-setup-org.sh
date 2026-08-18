@@ -827,6 +827,14 @@ priority = [
 # that a nostr_user specific precedes the nostr_user default; where these sit relative to
 # the nostr_event routes does not affect either type. Kept as its own list so the guard
 # that pins `priority` against CATROUTES stays valid (that regex reads only the first list).
+#
+# INVARIANT: every nostr_user route MUST be listed here, before the "nostr_user -> General
+# Review" default. A route omitted from this list is NOT dropped -- the
+# `ordered += [... not in ordered ...]` fallback below appends it AFTER the match-all
+# default, and first-match-wins then shadows it so it never fires. So when you add a
+# USER_CATROUTES entry, add its rule name here too, ahead of the General Review default.
+# The guard pins the shipped USER_CATROUTES SET; the ORDERING that keeps a new route
+# reachable lives here.
 user_priority = [
   "nostr_user: report_reason -> CSAM",
   "nostr_user: report_reason -> Child Safety",
