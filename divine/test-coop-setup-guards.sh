@@ -157,7 +157,8 @@ echo "the nostr_user (profile-only report) routing is present and ordered:"
 # routes of the same field/queue. Derived from BASH like CATROUTES, so an added or
 # dropped row cannot hide.
 { awk '/^USER_CATROUTES=\(/,/^\)/' "$SRC"; echo 'printf "%s\n" "${USER_CATROUTES[@]}"'; } > "$WORK/user_routes.sh"
-USER_ACTUAL=$(bash -euo pipefail "$WORK/user_routes.sh" 2>/dev/null | LC_ALL=C sort)
+USER_ROWS=$(bash -euo pipefail "$WORK/user_routes.sh" 2>/dev/null)
+USER_ACTUAL=$(printf '%s\n' "$USER_ROWS" | LC_ALL=C sort)
 USER_EXPECTED=$(printf '%s\n' \
   'CSAM|csam' \
   'Child Safety|child_safety' \
@@ -204,6 +205,22 @@ if printf '%s\n' "$USER_PRIORITY" | grep -vq '^nostr_user'; then
   fails=$((fails+1))
 else
   echo "  ok    nostr_user route names are type-prefixed (no org-wide collision)"
+fi
+# user_priority COMPLETENESS, derived like the nostr_event priority check above: every
+# USER_CATROUTES row must appear, in the provisioning order, ahead of the match-all
+# default. FIRST/LAST above cannot catch the documented shadowing hazard on their own --
+# a route added to USER_CATROUTES (and pinned here) but forgotten in user_priority is
+# appended AFTER the default by the reorder fallback and never fires (first-match-wins).
+USER_PRIO_EXPECTED=$(printf '%s\n' "$USER_ROWS" | awk -F'|' '{ print "nostr_user: report_reason -> " $1 }'
+  echo 'nostr_user -> General Review')
+if [ "$USER_PRIORITY" = "$USER_PRIO_EXPECTED" ]; then
+  echo "  ok    user_priority lists every USER_CATROUTES route, default last"
+else
+  echo "  FAIL  user_priority differs from USER_CATROUTES-derived route names:"
+  diff <(printf '%s\n' "$USER_PRIO_EXPECTED") <(printf '%s\n' "$USER_PRIORITY") | sed 's/^/        /' || true
+  echo "        Every USER_CATROUTES row needs a user_priority entry ahead of the General Review"
+  echo "        default, or first-match-wins shadows it permanently."
+  fails=$((fails+1))
 fi
 
 echo "the nostr_user enqueue rule is conditioned on report_reason (enrichment accounts get no job):"
@@ -261,6 +278,18 @@ if [ "$UC_BROKEN" = "FAIL" ]; then
   echo "  ok    the check rejects a broken '^+$' pattern (positive control)"
 else
   echo "  FAIL  the check accepted a broken '^+$' pattern; the exact-pattern assertion is not enforced"
+  fails=$((fails+1))
+fi
+# The 4b SKIP must distinguish a foreign rule that is report_reason-conditioned from one
+# that is not. "Some LIVE rule enqueues nostr_user" is the guarantee for nostr_event (step
+# 4, match-all is correct there); for nostr_user the guarantee is narrower, and an
+# unconditional foreign rule means every enrichment account gets its own job. A revert to
+# existence-only skipping (no conditionSet in the rules query, no conditioned() predicate,
+# no foreign_unconditioned branch) must go red here, not silently green.
+if grep -q 'def conditioned' "$SRC" && grep -q 'foreign_unconditioned' "$SRC"; then
+  echo "  ok    the 4b skip verifies the foreign rule's conditioning and warns when it is unconditional"
+else
+  echo "  FAIL  the 4b skip accepts ANY foreign nostr_user enqueue rule; a match-all foreign rule would be silently satisfied"
   fails=$((fails+1))
 fi
 
@@ -777,6 +806,36 @@ pin_control "the nostr_user fields are prefixed (they would describe another acc
 # pubkey is the one field osprey must always send; optional here means a submission that
 # omits it is accepted and the account item carries no identity at all.
 pin_control "pubkey stops being required on nostr_user" "shipped nostr_user fields differ" 's/{"name":"pubkey","type":"STRING","required":true}/{"name":"pubkey","type":"STRING","required":false}/'
+
+# The two ways the nostr_user ROUTING invariants can silently weaken. Unlike the schema
+# pin controls above, these re-run the WHOLE guard against a mutated copy of the setup
+# script in a throwaway tree (pin_control only re-runs schema.check, which does not read
+# routing config at all). The env var stops a control-of-controls recursing: the child
+# suite's own routing_controls become no-ops, so each control runs exactly one level deep.
+routing_control() { # name expected-message-fragment sed-expression
+  local name="$1" want="$2" expr="$3" out rc
+  [ -n "${COOP_GUARD_IN_ROUTING_CTL:-}" ] && return 0
+  mkdir -p "$WORK/ctl_repo/divine"
+  sed "$expr" "$SRC" > "$WORK/ctl_repo/divine/coop-setup-org.sh"
+  cp divine/test-coop-setup-guards.sh "$WORK/ctl_repo/divine/"
+  out=$(COOP_GUARD_IN_ROUTING_CTL=1 bash "$WORK/ctl_repo/divine/test-coop-setup-guards.sh" 2>&1) && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$want"; then
+    printf '  ok    %s (rejected by the guard)\n' "$name"
+  elif [ "$rc" -ne 0 ]; then
+    printf '  FAIL  %s -- rejected, but NOT with the expected message: %s\n' "$name" "$(printf '%s' "$out" | tail -1)"
+    fails=$((fails+1))
+  else
+    printf '  FAIL  %s -- the guard did not notice\n' "$name"
+    fails=$((fails+1))
+  fi
+}
+# Dropping a middle user_priority entry is the shadowing hazard the reorder fallback
+# creates (a route appended after the match-all default never fires); FIRST/LAST stay
+# green, so only the derived completeness comparison catches it.
+routing_control "a middle user_priority entry is dropped (that route is shadowed after the default)" "user_priority differs from USER_CATROUTES-derived" '/^  "nostr_user: report_reason -> Sexual Content",$/d'
+# Renaming the marker away restores the silent existence-only skip a foreign match-all
+# rule could hide behind (the containment check above goes red, not the schema pin).
+routing_control "the foreign-rule conditioning check is removed (silent match-all skip returns)" "silently satisfied" 's/foreign_unconditioned/satisfied2/g'
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"
