@@ -499,9 +499,20 @@ UT_ID_NOW=$(type_id nostr_user)
 # every enrichment account also gets its own review job, which is the exact harm step 4b
 # exists to prevent.
 EXISTING_UCR=$(gql 'query { myOrg { rules { id name status ... on ContentRule { conditionSet { conditions { ... on LeafCondition { input { type name contentTypeId } signal { type } matchingValues { strings } } } } itemTypes { __typename ... on ItemTypeBase { name } } actions { __typename } } } } }')
+# 'unknown' is its own outcome: a rules query that errored or returned no data must not
+# collapse into 'create' ("no rule exists"), because create-then-RuleNameExistsError ends
+# the run at exit 0 with re-run advice that can never work if the query keeps failing.
+# The 2>/dev/null fallback had exactly that effect; it now degrades to unknown instead.
 UCR_DECISION=$(echo "$EXISTING_UCR" | python3 -c "
 import json,sys
-rs = json.load(sys.stdin)['data']['myOrg']['rules']
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print('unknown|rules query returned unparseable output'); raise SystemExit
+if payload.get('errors') or not ((payload.get('data') or {}).get('myOrg') or {}).get('rules'):
+    detail = json.dumps(payload.get('errors'))[:200] if payload.get('errors') else 'no data.myOrg.rules'
+    print('unknown|rules query failed: ' + detail); raise SystemExit
+rs = payload['data']['myOrg']['rules']
 tid = sys.argv[2]
 def targets(r): return any(t.get('name')=='nostr_user' for t in (r.get('itemTypes') or []))
 def enqueues(r): return any(a.get('__typename')=='EnqueueToMrtAction' for a in (r.get('actions') or []))
@@ -532,10 +543,17 @@ elif foreign:
     print('foreign_unconditioned|'+','.join(r['name'] for r in foreign))
 else:
     print('create|')
-" "$USER_CONTENT_RULE_NAME" "$UT_ID_NOW" 2>/dev/null || echo 'create|')
+" "$USER_CONTENT_RULE_NAME" "$UT_ID_NOW" 2>/dev/null || echo 'unknown|decision pipeline failed')
 UCR_MODE="${UCR_DECISION%%|*}"; UCR_DETAIL="${UCR_DECISION#*|}"
 if [ "$UCR_MODE" = "satisfied" ]; then
   echo "    a LIVE content rule already enqueues nostr_user only when report_reason is present, skipping"
+elif [ "$UCR_MODE" = "unknown" ]; then
+  # Not exit 1 (matches the foreign-rule reasoning above: the rest of the run still
+  # provisions), but no mutation either: on unknown state, creating risks the
+  # exit-0 RuleNameExistsError loop and reconciling needs an id we do not have.
+  UNRESOLVED_USER_RULE_STATE="$UCR_DETAIL"
+  echo "    WARNING: could not determine the existing nostr_user rules ($UCR_DETAIL), so the"
+  echo "    conditioned enqueue rule was NOT provisioned this run. Re-run once the query succeeds."
 elif [ "$UCR_MODE" = "foreign_unconditioned" ]; then
   # Not an exit-1 error: this is org state another admin owns, and failing here would
   # leave the rest of the run (routing, ordering, actions) unprovisioned. But it must
@@ -926,6 +944,10 @@ print_done_banner() {
     echo "    report_reason condition, so every enrichment account also gets its own review job."
     echo "    Step 4b did not create or modify that rule; reconcile it in Coop before trusting"
     echo "    this org's nostr_user job stream."
+  fi
+  if [ -n "${UNRESOLVED_USER_RULE_STATE:-}" ]; then
+    echo "    WARNING: the nostr_user rules could not be read ($UNRESOLVED_USER_RULE_STATE), so the"
+    echo "    conditioned enqueue rule was NOT provisioned this run. Re-run once the query succeeds."
   fi
   echo "    Items surface in the COOP Review"
   echo "    Console once the ItemProcessingWorker (Scylla) is live; moderator"

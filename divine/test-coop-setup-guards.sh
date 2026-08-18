@@ -286,8 +286,8 @@ fi
 # unconditional foreign rule means every enrichment account gets its own job. A revert to
 # existence-only skipping (no conditionSet in the rules query, no conditioned() predicate,
 # no foreign_unconditioned branch) must go red here, not silently green.
-if grep -q 'def conditioned' "$SRC" && grep -q 'foreign_unconditioned' "$SRC"; then
-  echo "  ok    the 4b skip verifies the foreign rule's conditioning and warns when it is unconditional"
+if grep -q 'def conditioned' "$SRC" && grep -q 'foreign_unconditioned' "$SRC" && grep -qF "echo 'unknown|" "$SRC"; then
+  echo "  ok    the 4b skip verifies the foreign rule's conditioning, warns when it is unconditional, and degrades a failed query to unknown (not create)"
 else
   echo "  FAIL  the 4b skip accepts ANY foreign nostr_user enqueue rule; a match-all foreign rule would be silently satisfied"
   fails=$((fails+1))
