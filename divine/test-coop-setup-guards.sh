@@ -286,7 +286,7 @@ fi
 # unconditional foreign rule means every enrichment account gets its own job. A revert to
 # existence-only skipping (no conditionSet in the rules query, no conditioned() predicate,
 # no foreign_unconditioned branch) must go red here, not silently green.
-if grep -q 'def conditioned' "$SRC" && grep -q 'foreign_unconditioned' "$SRC" && grep -qF "echo 'unknown|" "$SRC"; then
+if grep -q 'def conditioned' "$SRC" && grep -q 'foreign_unconditioned' "$SRC" && grep -qF "echo 'unknown|" "$SRC" && grep -qF 'rules is None' "$SRC"; then
   echo "  ok    the 4b skip verifies the foreign rule's conditioning, warns when it is unconditional, and degrades a failed query to unknown (not create)"
 else
   echo "  FAIL  the 4b skip accepts ANY foreign nostr_user enqueue rule; a match-all foreign rule would be silently satisfied"
@@ -303,6 +303,39 @@ else
   echo "  FAIL  the 4b rules query selects conditionSet without a subselection; the server rejects the document and the skip degrades to create every run"
   fails=$((fails+1))
 fi
+# EXECUTE the 4b decision against canonical payloads. String pins above cannot see a
+# predicate that mis-executes: the empty-rules case below was a real defect (an empty
+# list is a SUCCESSFUL answer meaning \"no rules exist\" and must yield create, but the
+# unknown-detection's truthiness test swallowed it and 4b never provisioned a fresh org).
+# Extraction mirrors how bash runs it: the python between `python3 -c "` and the closing
+# quote, with bash's \$ escapes undone.
+python3 - "$SRC" "$WORK/ucr_decision.py" <<'PY'
+import sys
+src = open(sys.argv[1], encoding='utf-8').read()
+start = src.index('UCR_DECISION=$(echo "$EXISTING_UCR" | python3 -c')
+start = src.index('python3 -c "', start) + len('python3 -c "')
+end = src.index('" "$USER_CONTENT_RULE_NAME"', start)
+code = src[start:end].replace('\\\n', '\n').replace('\\$', '$')
+compile(code, 'ucr_decision', 'exec')
+open(sys.argv[2], 'w', encoding='utf-8').write(code)
+PY
+UCR_COND_OK='{"conditions":[{"input":{"type":"CONTENT_FIELD","name":"report_reason","contentTypeId":"utid"},"signal":{"id":"{}","type":"TEXT_MATCHING_CONTAINS_REGEX"},"matchingValues":{"strings":["^.+$"]}}],"conjunction":"AND"}'
+ucr_case() { # name expected-token payload-json
+  local name="$1" want="$2" payload="$3" got
+  got=$(printf '%s' "$payload" | python3 "$WORK/ucr_decision.py" "nostr_user -> review queue" "utid" 2>/dev/null | cut -d'|' -f1)
+  if [ "$got" = "$want" ]; then
+    echo "  ok    $name -> $want"
+  else
+    echo "  FAIL  $name: expected '$want', got '${got:-<none>}'"
+    fails=$((fails+1))
+  fi
+}
+ucr_case "a conditioned foreign rule satisfies 4b"            "satisfied"              "{\"data\":{\"myOrg\":{\"rules\":[{\"id\":\"r1\",\"name\":\"other\",\"status\":\"LIVE\",\"conditionSet\":$UCR_COND_OK,\"itemTypes\":[{\"name\":\"nostr_user\"}],\"actions\":[{\"__typename\":\"EnqueueToMrtAction\"}]}]}}}"
+ucr_case "a match-all foreign rule warns (foreign_unconditioned)" "foreign_unconditioned" "{\"data\":{\"myOrg\":{\"rules\":[{\"id\":\"r1\",\"name\":\"evil\",\"status\":\"LIVE\",\"conditionSet\":{\"conditions\":[],\"conjunction\":\"AND\"},\"itemTypes\":[{\"name\":\"nostr_user\"}],\"actions\":[{\"__typename\":\"EnqueueToMrtAction\"}]}]}}}"
+ucr_case "an EMPTY rules list is a successful answer (create)" "create"                 '{"data":{"myOrg":{"rules":[]}}}'
+ucr_case "an errors payload degrades to unknown"              "unknown"                '{"errors":[{"message":"bad"}]}'
+ucr_case "null data degrades to unknown"                      "unknown"                '{"data":null}'
+ucr_case "our own rule present reconciles"                    "reconcile"              "{\"data\":{\"myOrg\":{\"rules\":[{\"id\":\"r1\",\"name\":\"nostr_user -> review queue\",\"status\":\"LIVE\",\"conditionSet\":{\"conditions\":[],\"conjunction\":\"AND\"},\"itemTypes\":[{\"name\":\"nostr_user\"}],\"actions\":[{\"__typename\":\"EnqueueToMrtAction\"}]}]}}}"
 
 echo "the shipped account-moderation config is internally consistent:"
 # Pins the COMPLETE shipped schema: name, type, required, IN ORDER.
@@ -850,6 +883,9 @@ routing_control "the foreign-rule conditioning check is removed (silent match-al
 # Bare `conditionSet` (no subselection) is invalid GraphQL for a composite type; the
 # server rejects the whole query and the F3 fallback degrades 4b to create on every run.
 routing_control "the 4b query loses its conditionSet subselection (invalid GraphQL, silent create-fallback)" "selects conditionSet without a subselection" 's/conditionSet { conditions/conditionSet/'
+# The truthiness form of the round-4 defect: `not rules` swallows the empty list, so a
+# fresh org (no rules yet) is reported as a failed query and 4b never provisions.
+routing_control "an empty rules list is swallowed by the unknown-detection again (truthiness bug)" "expected 'create', got 'unknown'" 's/rules is None/not rules/'
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"

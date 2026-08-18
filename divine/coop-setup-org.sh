@@ -509,10 +509,14 @@ try:
     payload = json.load(sys.stdin)
 except Exception:
     print('unknown|rules query returned unparseable output'); raise SystemExit
-if payload.get('errors') or not ((payload.get('data') or {}).get('myOrg') or {}).get('rules'):
+# rules is [Rule!]! (non-nullable) in the SDL, so rules is None means data/myOrg was
+# absent -- the query did not answer. An EMPTY list is a successful answer meaning
+# \"no rules exist\" and must fall through to the normal decision (create), not here.
+rules = ((payload.get('data') or {}).get('myOrg') or {}).get('rules')
+if payload.get('errors') or rules is None:
     detail = json.dumps(payload.get('errors'))[:200] if payload.get('errors') else 'no data.myOrg.rules'
     print('unknown|rules query failed: ' + detail); raise SystemExit
-rs = payload['data']['myOrg']['rules']
+rs = rules
 tid = sys.argv[2]
 def targets(r): return any(t.get('name')=='nostr_user' for t in (r.get('itemTypes') or []))
 def enqueues(r): return any(a.get('__typename')=='EnqueueToMrtAction' for a in (r.get('actions') or []))
