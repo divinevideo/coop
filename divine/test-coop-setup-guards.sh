@@ -315,7 +315,7 @@ src = open(sys.argv[1], encoding='utf-8').read()
 start = src.index('UCR_DECISION=$(echo "$EXISTING_UCR" | python3 -c')
 start = src.index('python3 -c "', start) + len('python3 -c "')
 end = src.index('" "$USER_CONTENT_RULE_NAME"', start)
-code = src[start:end].replace('\\\n', '\n').replace('\\$', '$')
+code = src[start:end].replace('\\\n', '\n').replace('\\$', '$').replace('\\"', '"')
 compile(code, 'ucr_decision', 'exec')
 open(sys.argv[2], 'w', encoding='utf-8').write(code)
 PY
@@ -331,6 +331,12 @@ ucr_case() { # name expected-token payload-json
   fi
 }
 ucr_case "a conditioned foreign rule satisfies 4b"            "satisfied"              "{\"data\":{\"myOrg\":{\"rules\":[{\"id\":\"r1\",\"name\":\"other\",\"status\":\"LIVE\",\"conditionSet\":$UCR_COND_OK,\"itemTypes\":[{\"name\":\"nostr_user\"}],\"actions\":[{\"__typename\":\"EnqueueToMrtAction\"}]}]}}}"
+# Same payload with the condition scoped to ANOTHER item type: CONTENT_FIELD extraction
+# requires inputSpecifier.contentTypeId === itemTypeId (leafCondition.ts), so such a rule
+# can never fire for nostr_user and must not satisfy 4b. Deleting the contentTypeId clause
+# from the shipped predicate turns this case red -- that mutation passed the whole suite
+# green before this case existed.
+ucr_case "a foreign rule scoped to another item type does not satisfy 4b" "foreign_unconditioned" "{\"data\":{\"myOrg\":{\"rules\":[{\"id\":\"r1\",\"name\":\"other\",\"status\":\"LIVE\",\"conditionSet\":{\"conditions\":[{\"input\":{\"type\":\"CONTENT_FIELD\",\"name\":\"report_reason\",\"contentTypeId\":\"othertid\"},\"signal\":{\"id\":\"{}\",\"type\":\"TEXT_MATCHING_CONTAINS_REGEX\"},\"matchingValues\":{\"strings\":[\"^.+\$\"]}}],\"conjunction\":\"AND\"},\"itemTypes\":[{\"name\":\"nostr_user\"}],\"actions\":[{\"__typename\":\"EnqueueToMrtAction\"}]}]}}}"
 ucr_case "a match-all foreign rule warns (foreign_unconditioned)" "foreign_unconditioned" "{\"data\":{\"myOrg\":{\"rules\":[{\"id\":\"r1\",\"name\":\"evil\",\"status\":\"LIVE\",\"conditionSet\":{\"conditions\":[],\"conjunction\":\"AND\"},\"itemTypes\":[{\"name\":\"nostr_user\"}],\"actions\":[{\"__typename\":\"EnqueueToMrtAction\"}]}]}}}"
 ucr_case "an EMPTY rules list is a successful answer (create)" "create"                 '{"data":{"myOrg":{"rules":[]}}}'
 ucr_case "an errors payload degrades to unknown"              "unknown"                '{"errors":[{"message":"bad"}]}'
