@@ -206,6 +206,47 @@ else
   echo "  ok    nostr_user route names are type-prefixed (no org-wide collision)"
 fi
 
+echo "the nostr_user enqueue rule is conditioned on report_reason (enrichment accounts get no job):"
+# The 4b 'nostr_user -> review queue' content rule must fire ONLY when report_reason is
+# present, so an ENRICHMENT account (COOPSink._submit_user_item, no report_reason) is NOT
+# enqueued as its own review job -- only a REPORTED account (COOPSink._submit_reported_account,
+# report_reason set) is. Extract the SHIPPED conditionSet builder and run it, then assert a
+# CONTENT_FIELD report_reason condition whose pattern requires at least one character. A
+# match-all (empty conditions) conditionSet must be REJECTED.
+#
+# The same predicate is applied to the real conditionSet AND to a match-all one, so the
+# positive control cannot drift from the check it controls.
+cat > "$WORK/uc_check.py" <<'PY'
+import json, sys
+cs = json.load(sys.stdin)
+conds = cs.get("conditions") or []
+def report_reason_present(c):
+    field = c.get("input") or {}
+    strings = (c.get("matchingValues") or {}).get("strings") or []
+    # "^.+$" and friends require >=1 char, so an absent/empty report_reason does not match.
+    # A '+'-quantified anchored pattern is the non-empty signal; '^$' / '' would match empty.
+    nonempty = [p for p in strings if isinstance(p, str) and p.startswith("^") and p.endswith("$") and "+" in p]
+    return field.get("type") == "CONTENT_FIELD" and field.get("name") == "report_reason" and bool(nonempty)
+print("OK" if (conds and any(report_reason_present(c) for c in conds)) else "FAIL")
+PY
+{ awk '/^nostr_user_review_condition_set\(\)/{flag=1} flag{print} flag && /^}/{exit}' "$SRC"; echo 'nostr_user_review_condition_set nostr-user-type'; } > "$WORK/uc_cond.sh"
+UC_REAL=$(bash "$WORK/uc_cond.sh" 2>/dev/null | python3 "$WORK/uc_check.py" 2>/dev/null || echo FAIL)
+if [ "$UC_REAL" = "OK" ]; then
+  echo "  ok    nostr_user enqueue rule fires only when report_reason is present"
+else
+  echo "  FAIL  the shipped nostr_user enqueue conditionSet is match-all or not keyed on a non-empty report_reason"
+  fails=$((fails+1))
+fi
+# Positive control: the SAME check must REJECT a match-all (empty) conditionSet, or a revert
+# to enqueuing every nostr_user item would slip through green.
+UC_MATCHALL=$(printf '%s' '{"conditions":[],"conjunction":"AND"}' | python3 "$WORK/uc_check.py" 2>/dev/null || echo FAIL)
+if [ "$UC_MATCHALL" = "FAIL" ]; then
+  echo "  ok    the check rejects a match-all conditionSet (positive control)"
+else
+  echo "  FAIL  the conditioned-rule check passed a match-all conditionSet; it is vacuous"
+  fails=$((fails+1))
+fi
+
 echo "the shipped account-moderation config is internally consistent:"
 # Pins the COMPLETE shipped schema: name, type, required, IN ORDER.
 #

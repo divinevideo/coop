@@ -444,44 +444,98 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4b) Content rule for nostr_user: enqueue every nostr_user item to the MRT so a
-#     PROFILE-ONLY report (a reported account with no content event) SURFACES as a
-#     review job, exactly as 4) does for nostr_event. Without this, COOPSink's
-#     nostr_user submission is stored but never becomes a job.
+# 4b) Content rule for nostr_user: enqueue a nostr_user item to the MRT ONLY when it
+#     carries a report_reason, so a PROFILE-ONLY report (a reported account with no
+#     content event) SURFACES as its own review job, exactly as 4) does for
+#     nostr_event. Without this, COOPSink's nostr_user submission is stored but never
+#     becomes a job.
 #
-#     ENRICHMENT accounts (the Associated User panel of a content item) are also
-#     nostr_user items, so this enqueues them too. That is harmless: they carry no
-#     report_reason, fall through the reason routes to General Review, and are the
-#     same account a moderator is already looking at on the content job. The signal
-#     that an account was REPORTED is report_reason being present; a dedicated
-#     reported-users queue (out of scope) would later separate the two by that field.
+#     WHY CONDITIONED, not match-all. ENRICHMENT accounts (the Associated User panel of
+#     a content item) are ALSO nostr_user items, submitted by COOPSink for every content
+#     report. They carry NO report_reason. A match-all enqueue rule would give each of
+#     them its own review job in General Review -- a second job for an account a
+#     moderator is already looking at on the content job. So this fires only when
+#     report_reason is PRESENT, which is exactly what distinguishes a REPORTED account
+#     (COOPSink._submit_reported_account sets report_reason) from an ENRICHMENT account
+#     (COOPSink._submit_user_item never sets it). Enrichment accounts still render as the
+#     associated user on the content card; they are simply not enqueued as their own job.
+#
+#     HOW "present" is expressed: the same CONTENT_FIELD + TEXT_MATCHING_CONTAINS_REGEX
+#     vocabulary as the 5b reason routes, with an anchored ^.+$ (at least one character).
+#     Coop compiles the pattern and matches against the field's value, so an ABSENT or
+#     EMPTY report_reason does not match and is not enqueued. This is the SAME anchoring
+#     discipline that keeps ^token$ from matching an empty field in step 5.
 # ---------------------------------------------------------------------------
+
+# The conditionSet that makes the nostr_user -> review queue rule fire ONLY on a
+# report_reason-present item. Factored out as a function with a stable name so
+# divine/test-coop-setup-guards.sh can extract it and assert the rule is conditioned
+# (not match-all). $1 = the nostr_user content type id.
+nostr_user_review_condition_set() {
+  python3 -c '
+import json,sys
+tid = sys.argv[1]
+# Anchored ^.+$ = "any non-empty value". Absent/empty report_reason (every enrichment
+# account) does NOT match, so only a reported account gets enqueued. No regex
+# metacharacters to escape; the value is matched, not the pattern.
+cond = {"input":{"type":"CONTENT_FIELD","name":"report_reason","contentTypeId":tid},
+        "signal":{"id":json.dumps({"type":"TEXT_MATCHING_CONTAINS_REGEX"}),"type":"TEXT_MATCHING_CONTAINS_REGEX"},
+        "matchingValues":{"strings":["^.+$"]}}
+print(json.dumps({"conditions":[cond],"conjunction":"AND"}))' "$1"
+}
+
 USER_CONTENT_RULE_NAME="nostr_user -> review queue"
 echo "==> Ensuring content rule ($USER_CONTENT_RULE_NAME)"
 UT_ID_NOW=$(type_id nostr_user)
 [ -z "$UT_ID_NOW" ] && { echo "    ERROR: cannot resolve nostr_user type id for the content rule"; exit 1; }
+# Reconcile OUR named rule in place if it exists (an earlier match-all version must be
+# healed to the conditioned one, not skipped past); else skip if a foreign rule already
+# enqueues nostr_user; else create. Mirrors the nostr_event reconcile in step 4.
 EXISTING_UCR=$(gql 'query { myOrg { rules { id name status ... on ContentRule { itemTypes { __typename ... on ItemTypeBase { name } } actions { __typename } } } } }')
-UCR_SATISFIED=$(echo "$EXISTING_UCR" | python3 -c "
+UCR_DECISION=$(echo "$EXISTING_UCR" | python3 -c "
 import json,sys
 rs = json.load(sys.stdin)['data']['myOrg']['rules']
 def targets(r): return any(t.get('name')=='nostr_user' for t in (r.get('itemTypes') or []))
 def enqueues(r): return any(a.get('__typename')=='EnqueueToMrtAction' for a in (r.get('actions') or []))
-print('yes' if any(targets(r) and r.get('status')=='LIVE' and enqueues(r) for r in rs) else 'no')
-" 2>/dev/null || echo no)
-if [ "$UCR_SATISFIED" = "yes" ]; then
+ours = next((r['id'] for r in rs if r.get('name')==sys.argv[1]), '')
+foreign = any(targets(r) and r.get('status')=='LIVE' and enqueues(r) and r.get('name')!=sys.argv[1] for r in rs)
+print('reconcile|'+ours if ours else ('satisfied|' if foreign else 'create|'))
+" "$USER_CONTENT_RULE_NAME" 2>/dev/null || echo 'create|')
+UCR_MODE="${UCR_DECISION%%|*}"; UCR_OURS_ID="${UCR_DECISION#*|}"
+if [ "$UCR_MODE" = "satisfied" ]; then
   echo "    a LIVE content rule already enqueues nostr_user to the MRT, skipping"
 else
   ENQUEUE_ID=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }' \
     | python3 -c "import json,sys;a=json.load(sys.stdin)['data']['myOrg']['actions'];print(next((x['id'] for x in a if x.get('__typename')=='EnqueueToMrtAction'),''))" 2>/dev/null || true)
   [ -z "$ENQUEUE_ID" ] && { echo "    ERROR: no built-in ENQUEUE_TO_MRT action found — run create-org-and-user.js first."; exit 1; }
-  UCRV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"description":"Surface every reported nostr_user account for moderator review","status":"LIVE","contentTypeIds":[sys.argv[2]],"conditionSet":{"conditions":[],"conjunction":"AND"},"actionIds":[sys.argv[3]],"policyIds":[],"tags":[]}}))' "$USER_CONTENT_RULE_NAME" "$UT_ID_NOW" "$ENQUEUE_ID")
-  RESP=$(gql 'mutation CR($input: CreateContentRuleInput!){ createContentRule(input:$input){ __typename } }' "$UCRV")
-  if echo "$RESP" | grep -q '"__typename":"MutateContentRuleSuccessResponse"'; then
-    echo "    created"
-  elif echo "$RESP" | grep -q 'RuleNameExistsError'; then
-    echo "    exists (created concurrently); re-run to reconcile it to LIVE+enqueue"
+  # Build the input once; create and reconcile share the same conditioned conditionSet.
+  # RID empty -> create shape (name/description/policyIds/tags); RID set -> update shape.
+  UCRV=$(RID="$UCR_OURS_ID" python3 -c '
+import json,os,sys
+name,tid,act,condset = sys.argv[1],sys.argv[2],sys.argv[3],json.loads(sys.argv[4])
+rid = os.environ.get("RID","")
+if rid:
+    inp = {"id":rid,"status":"LIVE","contentTypeIds":[tid],"actionIds":[act],"conditionSet":condset}
+else:
+    inp = {"name":name,"description":"Surface a reported nostr_user account (report_reason present) for moderator review",
+           "status":"LIVE","contentTypeIds":[tid],"conditionSet":condset,"actionIds":[act],"policyIds":[],"tags":[]}
+print(json.dumps({"input":inp}))' "$USER_CONTENT_RULE_NAME" "$UT_ID_NOW" "$ENQUEUE_ID" "$(nostr_user_review_condition_set "$UT_ID_NOW")")
+  if [ "$UCR_MODE" = "reconcile" ]; then
+    RESP=$(gql 'mutation UCR($input: UpdateContentRuleInput!){ updateContentRule(input:$input){ __typename } }' "$UCRV")
+    if echo "$RESP" | grep -q '"__typename":"MutateContentRuleSuccessResponse"'; then
+      echo "    reconciled '$USER_CONTENT_RULE_NAME' to report_reason-present + enqueue"
+    else
+      echo "    ERROR: nostr_user content rule reconcile failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+    fi
   else
-    echo "    ERROR: nostr_user content rule create failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+    RESP=$(gql 'mutation CR($input: CreateContentRuleInput!){ createContentRule(input:$input){ __typename } }' "$UCRV")
+    if echo "$RESP" | grep -q '"__typename":"MutateContentRuleSuccessResponse"'; then
+      echo "    created"
+    elif echo "$RESP" | grep -q 'RuleNameExistsError'; then
+      echo "    exists (created concurrently); re-run to reconcile it to report_reason-present+enqueue"
+    else
+      echo "    ERROR: nostr_user content rule create failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+    fi
   fi
 fi
 
