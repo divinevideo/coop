@@ -490,27 +490,62 @@ UT_ID_NOW=$(type_id nostr_user)
 [ -z "$UT_ID_NOW" ] && { echo "    ERROR: cannot resolve nostr_user type id for the content rule"; exit 1; }
 # Reconcile OUR named rule in place if it exists (an earlier match-all version must be
 # healed to the conditioned one, not skipped past); else skip if a foreign rule already
-# enqueues nostr_user; else create. Mirrors the nostr_event reconcile in step 4.
-EXISTING_UCR=$(gql 'query { myOrg { rules { id name status ... on ContentRule { itemTypes { __typename ... on ItemTypeBase { name } } actions { __typename } } } } }')
+# enqueues nostr_user ONLY-WHEN-report_reason (verified from its conditionSet, not assumed);
+# else create. Mirrors the nostr_event reconcile in step 4, with one deliberate difference:
+# for nostr_event "some LIVE rule enqueues" IS the guarantee (match-all is correct there),
+# but for nostr_user the guarantee is NARROWER -- enqueue only when report_reason is present.
+# A foreign rule whose existence does NOT establish that narrower guarantee gets a loud
+# warning below, never a silent skip: while an unconditional foreign enqueue rule is LIVE,
+# every enrichment account also gets its own review job, which is the exact harm step 4b
+# exists to prevent.
+EXISTING_UCR=$(gql 'query { myOrg { rules { id name status ... on ContentRule { conditionSet itemTypes { __typename ... on ItemTypeBase { name } } actions { __typename } } } } }')
 UCR_DECISION=$(echo "$EXISTING_UCR" | python3 -c "
 import json,sys
 rs = json.load(sys.stdin)['data']['myOrg']['rules']
 def targets(r): return any(t.get('name')=='nostr_user' for t in (r.get('itemTypes') or []))
 def enqueues(r): return any(a.get('__typename')=='EnqueueToMrtAction' for a in (r.get('actions') or []))
+# Same predicate the guard pins on OUR conditionSet: fires only when report_reason is
+# present (CONTENT_FIELD report_reason + regex ^.+\$). A rule that satisfies it cannot
+# enqueue an enrichment account, so its existence really does satisfy step 4b.
+def conditioned(r):
+    conds = (r.get('conditionSet') or {}).get('conditions') or []
+    def ok(c):
+        field = c.get('input') or {}
+        strings = (c.get('matchingValues') or {}).get('strings') or []
+        signal = (c.get('signal') or {}).get('type')
+        return (field.get('type')=='CONTENT_FIELD' and field.get('name')=='report_reason'
+                and signal=='TEXT_MATCHING_CONTAINS_REGEX' and strings==['^.+\$'])
+    return bool(conds) and any(ok(c) for c in conds)
 ours = next((r['id'] for r in rs if r.get('name')==sys.argv[1]), '')
-foreign = any(targets(r) and r.get('status')=='LIVE' and enqueues(r) and r.get('name')!=sys.argv[1] for r in rs)
-print('reconcile|'+ours if ours else ('satisfied|' if foreign else 'create|'))
+foreign = [r for r in rs if targets(r) and r.get('status')=='LIVE' and enqueues(r) and r.get('name')!=sys.argv[1]]
+if ours:
+    print('reconcile|'+ours)
+elif any(conditioned(r) for r in foreign):
+    print('satisfied|')
+elif foreign:
+    print('foreign_unconditioned|'+','.join(r['name'] for r in foreign))
+else:
+    print('create|')
 " "$USER_CONTENT_RULE_NAME" 2>/dev/null || echo 'create|')
-UCR_MODE="${UCR_DECISION%%|*}"; UCR_OURS_ID="${UCR_DECISION#*|}"
+UCR_MODE="${UCR_DECISION%%|*}"; UCR_DETAIL="${UCR_DECISION#*|}"
 if [ "$UCR_MODE" = "satisfied" ]; then
-  echo "    a LIVE content rule already enqueues nostr_user to the MRT, skipping"
+  echo "    a LIVE content rule already enqueues nostr_user only when report_reason is present, skipping"
+elif [ "$UCR_MODE" = "foreign_unconditioned" ]; then
+  # Not an exit-1 error: this is org state another admin owns, and failing here would
+  # leave the rest of the run (routing, ordering, actions) unprovisioned. But it must
+  # not read as success either -- surface it again in the done banner below.
+  UNCONDITIONED_USER_RULES="$UCR_DETAIL"
+  echo "    WARNING: a LIVE content rule ($UCR_DETAIL) already enqueues nostr_user WITHOUT the"
+  echo "    report_reason condition, so every ENRICHMENT account would also get its own review job."
+  echo "    This script did not create that rule and will not modify it; reconcile or disable it in"
+  echo "    Coop (or rename/delete it, then re-run) before this org's nostr_user jobs are trustworthy."
 else
   ENQUEUE_ID=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }' \
     | python3 -c "import json,sys;a=json.load(sys.stdin)['data']['myOrg']['actions'];print(next((x['id'] for x in a if x.get('__typename')=='EnqueueToMrtAction'),''))" 2>/dev/null || true)
   [ -z "$ENQUEUE_ID" ] && { echo "    ERROR: no built-in ENQUEUE_TO_MRT action found — run create-org-and-user.js first."; exit 1; }
   # Build the input once; create and reconcile share the same conditioned conditionSet.
   # RID empty -> create shape (name/description/policyIds/tags); RID set -> update shape.
-  UCRV=$(RID="$UCR_OURS_ID" python3 -c '
+  UCRV=$(RID="$UCR_DETAIL" python3 -c '
 import json,os,sys
 name,tid,act,condset = sys.argv[1],sys.argv[2],sys.argv[3],json.loads(sys.argv[4])
 rid = os.environ.get("RID","")
@@ -879,6 +914,12 @@ print_done_banner() {
     echo "    NOTE: the actions above were written to Coop successfully, but $UNVERIFIED_CALLBACKS,"
     echo "    so none of their callbacks is confirmed to reach the adapter. Coop answers a moderator"
     echo "    202 whether or not the callback lands, so verify the adapter separately."
+  fi
+  if [ -n "${UNCONDITIONED_USER_RULES:-}" ]; then
+    echo "    WARNING: a LIVE rule ($UNCONDITIONED_USER_RULES) enqueues nostr_user WITHOUT the"
+    echo "    report_reason condition, so every enrichment account also gets its own review job."
+    echo "    Step 4b did not create or modify that rule; reconcile it in Coop before trusting"
+    echo "    this org's nostr_user job stream."
   fi
   echo "    Items surface in the COOP Review"
   echo "    Console once the ItemProcessingWorker (Scylla) is live; moderator"
