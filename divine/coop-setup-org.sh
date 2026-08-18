@@ -138,6 +138,55 @@ profile_fields_json() {
 # these read on the card but drops nothing. Reordering the existing 19 is a separate change.
 CT_FIELDS="${CT_FIELDS%]}$(profile_fields_json)]"
 CT_FIELD_ROLES='{"displayName":"text","creatorId":"author","threadId":null,"parentId":null,"createdAt":null,"isDeleted":null}'
+
+# User item type fields (step 1b provisions them). Declared HERE, beside the content
+# fields, because both are generated from PROFILE_SUFFIX_TYPES above and a reader
+# comparing them should not have to hold 60 lines in their head to do it.
+#
+# UNPREFIXED, and that is the whole point of the difference. The content item carries
+# THREE people -- author, reported, reporter -- so it namespaces them or one person's
+# identity shows against another's actions. A `nostr_user` item IS one person, so there
+# is nothing to disambiguate; `author_display_name` on an account card would read as a
+# claim about some other account.
+#
+# WHY THE ACCOUNT CARD NEEDS ITS OWN COPY AT ALL. The Associated User panel does not
+# read the content item to describe the account. It resolves the account as an item in
+# its own right (latestItemSubmissions -> ItemInvestigationService) and renders THIS
+# type's declared fields against that item's data
+# (client/src/webpages/dashboard/mrt/manual_review_job/v2/user/ManualReviewJobRelatedUserComponent.tsx).
+# The content item's `author` reference is only {id, typeId, name} (types/index.ts
+# RelatedItem), so nothing hung off it can populate the panel. Undeclared here means the
+# moderator keeps reading "No user information found" over a 64-character pubkey while
+# deciding whether to ban that account.
+#
+# Same "declare only what a producer is proven to omit" bar as the content fields: these
+# come from the same coop_profile.py mapping, via osprey's user_item_fields(), which
+# derives the unprefixed names from the prefixed ones rather than restating them. So the
+# omission semantics documented above hold identically here, and an unresolved lookup
+# still renders no row rather than a misleading blank one.
+#
+# NOT declared: `picture` for the profileIcon role. funnelcake returns one, but osprey
+# does not send it yet, and a declared field no producer fills is the exact thing the
+# rule above forbids.
+user_profile_fields_json() {
+  local st suffix ftype
+  for st in $PROFILE_SUFFIX_TYPES; do
+    suffix="${st%%:*}"; ftype="${st##*:}"
+    printf ',{"name":"%s","type":"%s","required":false}' "$suffix" "$ftype"
+  done
+}
+# `pubkey` stays required: Coop 400s a submission that omits a required field, which is
+# what makes it the one field osprey must always send for an account item.
+#
+# `report_reason` is declared here so a PROFILE-ONLY report (a `p` tag with no `e` tag)
+# can be queued as a nostr_user item and ROUTED by reason. COOPSink submits the reported
+# account carrying report_reason (coop_sink.py `_submit_reported_account`), and the
+# nostr_user routing rules in step 5b match this field into the existing reason queues.
+# Optional: an account submitted for enrichment (the Associated User panel of a content
+# item) carries no reason, and an absent field must mean "not a reported account here",
+# not a 400. STRING so the anchored ^token$ routing regex can match it.
+UT_FIELDS='[{"name":"pubkey","type":"STRING","required":true},{"name":"report_reason","type":"STRING","required":false},{"name":"npub","type":"STRING","required":false},{"name":"first_seen_at","type":"DATETIME","required":false}]'
+UT_FIELDS="${UT_FIELDS%]}$(user_profile_fields_json)]"
 # --- end field declaration ---
 TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
 CT_ID=$(type_id nostr_event)
@@ -175,11 +224,18 @@ fi
 # history, and bulk actions over a pasted pubkey list. Without it, Coop can only
 # ever be searched by item id.
 #
-# displayName is the pubkey itself. We have no username to show, and a moderator
-# recognises an npub; an empty display name renders as a blank row.
+# displayName stays the pubkey, deliberately, now that `display_name` exists as a
+# field. The panel RESERVES the displayName-role field for its header and drops it
+# from the field list, and the header falls back to "User <64 hex>" when that field is
+# absent -- and `display_name` IS absent whenever a profile carries no name, which is
+# common. Pointing the role at it would trade a pubkey a moderator can recognise for a
+# longer string that says less, on exactly the accounts we know least about. The name
+# still renders, as its own labelled row.
+#
+# Its fields are declared with the content type's, above; see the block ending at
+# "--- end field declaration ---".
 # ---------------------------------------------------------------------------
 echo "==> Ensuring user type 'nostr_user'"
-UT_FIELDS='[{"name":"pubkey","type":"STRING","required":true},{"name":"npub","type":"STRING","required":false},{"name":"first_seen_at","type":"DATETIME","required":false}]'
 UT_ID=$(type_id nostr_user)
 UT_EXISTS=false
 if [ -n "$UT_ID" ]; then
@@ -388,6 +444,165 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4b) Content rule for nostr_user: enqueue a nostr_user item to the MRT ONLY when it
+#     carries a report_reason, so a PROFILE-ONLY report (a reported account with no
+#     content event) SURFACES as its own review job, exactly as 4) does for
+#     nostr_event. Without this, COOPSink's nostr_user submission is stored but never
+#     becomes a job.
+#
+#     WHY CONDITIONED, not match-all. ENRICHMENT accounts (the Associated User panel of
+#     a content item) are ALSO nostr_user items, submitted by COOPSink for every content
+#     report. They carry NO report_reason. A match-all enqueue rule would give each of
+#     them its own review job in General Review -- a second job for an account a
+#     moderator is already looking at on the content job. So this fires only when
+#     report_reason is PRESENT, which is exactly what distinguishes a REPORTED account
+#     (COOPSink._submit_reported_account sets report_reason) from an ENRICHMENT account
+#     (COOPSink._submit_user_item never sets it). Enrichment accounts still render as the
+#     associated user on the content card; they are simply not enqueued as their own job.
+#
+#     HOW "present" is expressed: the same CONTENT_FIELD + TEXT_MATCHING_CONTAINS_REGEX
+#     vocabulary as the 5b reason routes, with an anchored ^.+$ (at least one character).
+#     Coop compiles the pattern and matches against the field's value, so an ABSENT or
+#     EMPTY report_reason does not match and is not enqueued. This is the SAME anchoring
+#     discipline that keeps ^token$ from matching an empty field in step 5.
+# ---------------------------------------------------------------------------
+
+# The conditionSet that makes the nostr_user -> review queue rule fire ONLY on a
+# report_reason-present item. Factored out as a function with a stable name so
+# divine/test-coop-setup-guards.sh can extract it and assert the rule is conditioned
+# (not match-all). $1 = the nostr_user content type id.
+nostr_user_review_condition_set() {
+  python3 -c '
+import json,sys
+tid = sys.argv[1]
+# Anchored ^.+$ = "any non-empty value". Absent/empty report_reason (every enrichment
+# account) does NOT match, so only a reported account gets enqueued. No regex
+# metacharacters to escape; the value is matched, not the pattern.
+cond = {"input":{"type":"CONTENT_FIELD","name":"report_reason","contentTypeId":tid},
+        "signal":{"id":json.dumps({"type":"TEXT_MATCHING_CONTAINS_REGEX"}),"type":"TEXT_MATCHING_CONTAINS_REGEX"},
+        "matchingValues":{"strings":["^.+$"]}}
+print(json.dumps({"conditions":[cond],"conjunction":"AND"}))' "$1"
+}
+
+USER_CONTENT_RULE_NAME="nostr_user -> review queue"
+echo "==> Ensuring content rule ($USER_CONTENT_RULE_NAME)"
+UT_ID_NOW=$(type_id nostr_user)
+[ -z "$UT_ID_NOW" ] && { echo "    ERROR: cannot resolve nostr_user type id for the content rule"; exit 1; }
+# Reconcile OUR named rule in place if it exists (an earlier match-all version must be
+# healed to the conditioned one, not skipped past); else skip if a foreign rule already
+# enqueues nostr_user ONLY-WHEN-report_reason (verified from its conditionSet, not assumed);
+# else create. Mirrors the nostr_event reconcile in step 4, with one deliberate difference:
+# for nostr_event "some LIVE rule enqueues" IS the guarantee (match-all is correct there),
+# but for nostr_user the guarantee is NARROWER -- enqueue only when report_reason is present.
+# A foreign rule whose existence does NOT establish that narrower guarantee gets a loud
+# warning below, never a silent skip: while an unconditional foreign enqueue rule is LIVE,
+# every enrichment account also gets its own review job, which is the exact harm step 4b
+# exists to prevent.
+EXISTING_UCR=$(gql 'query { myOrg { rules { id name status ... on ContentRule { conditionSet { conditions { ... on LeafCondition { input { type name contentTypeId } signal { type } matchingValues { strings } } } } itemTypes { __typename ... on ItemTypeBase { name } } actions { __typename } } } } }')
+# 'unknown' is its own outcome: a rules query that errored or returned no data must not
+# collapse into 'create' ("no rule exists"), because create-then-RuleNameExistsError ends
+# the run at exit 0 with re-run advice that can never work if the query keeps failing.
+# The 2>/dev/null fallback had exactly that effect; it now degrades to unknown instead.
+UCR_DECISION=$(echo "$EXISTING_UCR" | python3 -c "
+import json,sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print('unknown|rules query returned unparseable output'); raise SystemExit
+# rules is [Rule!]! (non-nullable) in the SDL, so rules is None means data/myOrg was
+# absent -- the query did not answer. An EMPTY list is a successful answer meaning
+# \"no rules exist\" and must fall through to the normal decision (create), not here.
+rules = ((payload.get('data') or {}).get('myOrg') or {}).get('rules')
+if payload.get('errors') or rules is None:
+    detail = json.dumps(payload.get('errors'))[:200] if payload.get('errors') else 'no data.myOrg.rules'
+    print('unknown|rules query failed: ' + detail); raise SystemExit
+rs = rules
+tid = sys.argv[2]
+def targets(r): return any(t.get('name')=='nostr_user' for t in (r.get('itemTypes') or []))
+def enqueues(r): return any(a.get('__typename')=='EnqueueToMrtAction' for a in (r.get('actions') or []))
+# Same predicate the guard pins on OUR conditionSet: fires only when report_reason is
+# present (CONTENT_FIELD report_reason + regex ^.+\$). A rule that satisfies it cannot
+# enqueue an enrichment account, so its existence really does satisfy step 4b.
+# contentTypeId must match the nostr_user type id: a condition scoped to another type
+# never evaluates for nostr_user items (CONTENT_FIELD extraction requires
+# inputSpecifier.contentTypeId === itemTypeId, else INAPPLICABLE), so a rule whose only
+# report_reason condition points elsewhere can never fire here and must not satisfy 4b.
+def conditioned(r):
+    conds = (r.get('conditionSet') or {}).get('conditions') or []
+    def ok(c):
+        field = c.get('input') or {}
+        strings = (c.get('matchingValues') or {}).get('strings') or []
+        signal = (c.get('signal') or {}).get('type')
+        return (field.get('type')=='CONTENT_FIELD' and field.get('name')=='report_reason'
+                and field.get('contentTypeId')==tid
+                and signal=='TEXT_MATCHING_CONTAINS_REGEX' and strings==['^.+\$'])
+    return bool(conds) and any(ok(c) for c in conds)
+ours = next((r['id'] for r in rs if r.get('name')==sys.argv[1]), '')
+foreign = [r for r in rs if targets(r) and r.get('status')=='LIVE' and enqueues(r) and r.get('name')!=sys.argv[1]]
+if ours:
+    print('reconcile|'+ours)
+elif any(conditioned(r) for r in foreign):
+    print('satisfied|')
+elif foreign:
+    print('foreign_unconditioned|'+','.join(r['name'] for r in foreign))
+else:
+    print('create|')
+" "$USER_CONTENT_RULE_NAME" "$UT_ID_NOW" 2>/dev/null || echo 'unknown|decision pipeline failed')
+UCR_MODE="${UCR_DECISION%%|*}"; UCR_DETAIL="${UCR_DECISION#*|}"
+if [ "$UCR_MODE" = "satisfied" ]; then
+  echo "    a LIVE content rule already enqueues nostr_user only when report_reason is present, skipping"
+elif [ "$UCR_MODE" = "unknown" ]; then
+  # Not exit 1 (matches the foreign-rule reasoning above: the rest of the run still
+  # provisions), but no mutation either: on unknown state, creating risks the
+  # exit-0 RuleNameExistsError loop and reconciling needs an id we do not have.
+  UNRESOLVED_USER_RULE_STATE="$UCR_DETAIL"
+  echo "    WARNING: could not determine the existing nostr_user rules ($UCR_DETAIL), so the"
+  echo "    conditioned enqueue rule was NOT provisioned this run. Re-run once the query succeeds."
+elif [ "$UCR_MODE" = "foreign_unconditioned" ]; then
+  # Not an exit-1 error: this is org state another admin owns, and failing here would
+  # leave the rest of the run (routing, ordering, actions) unprovisioned. But it must
+  # not read as success either -- surface it again in the done banner below.
+  UNCONDITIONED_USER_RULES="$UCR_DETAIL"
+  echo "    WARNING: a LIVE content rule ($UCR_DETAIL) already enqueues nostr_user WITHOUT the"
+  echo "    report_reason condition, so every ENRICHMENT account would also get its own review job."
+  echo "    This script did not create that rule and will not modify it; reconcile or disable it in"
+  echo "    Coop (or rename/delete it, then re-run) before this org's nostr_user jobs are trustworthy."
+else
+  ENQUEUE_ID=$(gql 'query { myOrg { actions { __typename ... on ActionBase { id name } } } }' \
+    | python3 -c "import json,sys;a=json.load(sys.stdin)['data']['myOrg']['actions'];print(next((x['id'] for x in a if x.get('__typename')=='EnqueueToMrtAction'),''))" 2>/dev/null || true)
+  [ -z "$ENQUEUE_ID" ] && { echo "    ERROR: no built-in ENQUEUE_TO_MRT action found — run create-org-and-user.js first."; exit 1; }
+  # Build the input once; create and reconcile share the same conditioned conditionSet.
+  # RID empty -> create shape (name/description/policyIds/tags); RID set -> update shape.
+  UCRV=$(RID="$UCR_DETAIL" python3 -c '
+import json,os,sys
+name,tid,act,condset = sys.argv[1],sys.argv[2],sys.argv[3],json.loads(sys.argv[4])
+rid = os.environ.get("RID","")
+if rid:
+    inp = {"id":rid,"status":"LIVE","contentTypeIds":[tid],"actionIds":[act],"conditionSet":condset}
+else:
+    inp = {"name":name,"description":"Surface a reported nostr_user account (report_reason present) for moderator review",
+           "status":"LIVE","contentTypeIds":[tid],"conditionSet":condset,"actionIds":[act],"policyIds":[],"tags":[]}
+print(json.dumps({"input":inp}))' "$USER_CONTENT_RULE_NAME" "$UT_ID_NOW" "$ENQUEUE_ID" "$(nostr_user_review_condition_set "$UT_ID_NOW")")
+  if [ "$UCR_MODE" = "reconcile" ]; then
+    RESP=$(gql 'mutation UCR($input: UpdateContentRuleInput!){ updateContentRule(input:$input){ __typename } }' "$UCRV")
+    if echo "$RESP" | grep -q '"__typename":"MutateContentRuleSuccessResponse"'; then
+      echo "    reconciled '$USER_CONTENT_RULE_NAME' to report_reason-present + enqueue"
+    else
+      echo "    ERROR: nostr_user content rule reconcile failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+    fi
+  else
+    RESP=$(gql 'mutation CR($input: CreateContentRuleInput!){ createContentRule(input:$input){ __typename } }' "$UCRV")
+    if echo "$RESP" | grep -q '"__typename":"MutateContentRuleSuccessResponse"'; then
+      echo "    created"
+    elif echo "$RESP" | grep -q 'RuleNameExistsError'; then
+      echo "    exists (created concurrently); re-run to reconcile it to report_reason-present+enqueue"
+    else
+      echo "    ERROR: nostr_user content rule create failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 5) Category routing rules: CONTENT_FIELD matches <canonical token> -> category queue.
 #    First-match-wins by sequence, so CSAM is ordered FIRST (sticky, one-way, must
 #    reach NCMEC — docs/moderation/moderation-category-handling-principles.md), then
@@ -566,6 +781,89 @@ print(json.dumps({"input":inp}))' "$TID" "$QID" "$CR_NAME" "$KEYWORDS" "$FIELD")
   fi
 done
 
+# ---------------------------------------------------------------------------
+# 5b) Category routing rules for nostr_user: route a REPORTED ACCOUNT (a profile-only
+#     report) by report_reason into the SAME reason queues as content. A dedicated
+#     "Reported Users" queue is out of scope; these routes reuse the existing queues
+#     under the current rules, and a future dedicated queue is a one-line re-point of
+#     the default below plus/instead of these specifics.
+#
+#     Same anchored ^token$ EXACT-match discipline as step 5. Names are prefixed with
+#     the item type because Coop rule names are unique ORG-WIDE, so they must not
+#     collide with the nostr_event routes of the same field/queue. underage_user is
+#     NOT routed: age review is relay-manager's, and Osprey excludes it upstream, so a
+#     nostr_user underage report never reaches this path.
+# ---------------------------------------------------------------------------
+echo "==> Ensuring category routing rules for nostr_user"
+TYPES=$(gql 'query { myOrg { itemTypes { __typename ... on ItemTypeBase { id name } } } }')
+UT_ID_ROUTE=$(type_id nostr_user)
+[ -z "$UT_ID_ROUTE" ] && { echo "    ERROR: cannot resolve nostr_user type id for routing"; exit 1; }
+# queue|comma-separated report_reason tokens. Same tokens (and thus same canonical
+# vocabulary) as the nostr_event report_reason routes in CATROUTES.
+USER_CATROUTES=(
+  "CSAM|csam"
+  "Child Safety|child_safety"
+  "Sexual Content|nudity"
+  "Violence & Extremism|violence"
+  "Harassment, Threats & Safety|harassment"
+)
+EXISTING_UR=$(gql 'query { myOrg { routingRules { id name } } }')
+for row in "${USER_CATROUTES[@]}"; do
+  UQUEUE="${row%%|*}"; UKEYWORDS="${row#*|}"
+  UCR_NAME="nostr_user: report_reason -> $UQUEUE"
+  UQID=$(qid "$UQUEUE")
+  [ -z "$UQID" ] && { echo "    ERROR: queue '$UQUEUE' not found (run step 2 first)"; exit 1; }
+  # Guard the token here too, so this array cannot drift from the canonical vocabulary
+  # any more quietly than CATROUTES can. Same charset and vocabulary as report_reason.
+  if [[ ! "$UKEYWORDS" =~ ^[a-z_]+$ ]]; then
+    echo "    ERROR: nostr_user route token '$UKEYWORDS' is not [a-z_]+"; exit 1
+  fi
+  case "$CANONICAL_REASONS" in
+    *" $UKEYWORDS "*) ;;
+    *) echo "    ERROR: nostr_user route token '$UKEYWORDS' is not in the canonical report_reason vocabulary"; exit 1 ;;
+  esac
+  URID=$(echo "$EXISTING_UR" | python3 -c 'import json,sys; org=(json.load(sys.stdin).get("data") or {}).get("myOrg") or {}; print(next((r["id"] for r in (org.get("routingRules") or []) if r.get("name")==sys.argv[1]), ""))' "$UCR_NAME")
+  UIN=$(URID="$URID" python3 -c '
+import json,os,sys
+tid,qid,name,kw = sys.argv[1],sys.argv[2],sys.argv[3],["^"+sys.argv[4]+"$"]
+cond = {"input":{"type":"CONTENT_FIELD","name":"report_reason","contentTypeId":tid},
+        "signal":{"id":json.dumps({"type":"TEXT_MATCHING_CONTAINS_REGEX"}),"type":"TEXT_MATCHING_CONTAINS_REGEX"},
+        "matchingValues":{"strings":kw}}
+inp = {"name":name,"conditionSet":{"conditions":[cond],"conjunction":"AND"},
+       "destinationQueueId":qid,"itemTypeIds":[tid],"status":"LIVE"}
+rid = os.environ.get("URID","")
+if rid: inp["id"] = rid
+print(json.dumps({"input":inp}))' "$UT_ID_ROUTE" "$UQID" "$UCR_NAME" "$UKEYWORDS")
+  if [ -n "$URID" ]; then
+    RESP=$(gql 'mutation UR($input: UpdateRoutingRuleInput!){ updateRoutingRule(input:$input){ __typename } }' "$UIN"); UACT=reconciled
+  else
+    RESP=$(gql 'mutation CR($input: CreateRoutingRuleInput!){ createRoutingRule(input:$input){ __typename } }' "$UIN"); UACT=created
+  fi
+  if echo "$RESP" | grep -q '"__typename":"MutateRoutingRuleSuccessResponse"'; then
+    echo "    $UACT '$UCR_NAME' -> $UQID"
+  else
+    echo "    ERROR: nostr_user routing rule $UACT failed for '$UCR_NAME': $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+  fi
+done
+# Default nostr_user route: match-all -> General Review, ordered LAST among nostr_user
+# routes (see reorder below).
+USER_DEFAULT_NAME="nostr_user -> General Review"
+if echo "$EXISTING_UR" | grep -qF "\"$USER_DEFAULT_NAME\""; then
+  echo "    exists, skipping ($USER_DEFAULT_NAME)"
+else
+  GQID=$(qid "General Review")
+  [ -z "$GQID" ] && { echo "    ERROR: General Review queue not found"; exit 1; }
+  UDV=$(python3 -c 'import json,sys;print(json.dumps({"input":{"name":sys.argv[1],"conditionSet":{"conditions":[],"conjunction":"AND"},"destinationQueueId":sys.argv[2],"itemTypeIds":[sys.argv[3]],"status":"LIVE"}}))' "$USER_DEFAULT_NAME" "$GQID" "$UT_ID_ROUTE")
+  RESP=$(gql 'mutation R($input: CreateRoutingRuleInput!){ createRoutingRule(input:$input){ __typename } }' "$UDV")
+  if echo "$RESP" | grep -q '"__typename":"MutateRoutingRuleSuccessResponse"'; then
+    echo "    created ($USER_DEFAULT_NAME)"
+  elif echo "$RESP" | grep -q 'RoutingRuleNameExistsError'; then
+    echo "    exists, skipping ($USER_DEFAULT_NAME)"
+  else
+    echo "    ERROR: nostr_user default routing rule failed: $(echo "$RESP" | tr '\n' ' ' | head -c 300)"; exit 1
+  fi
+fi
+
 echo "==> Ordering routing rules (CSAM first, General Review last)"
 RR=$(gql 'query { myOrg { routingRules { id name } } }')
 ORDER=$(echo "$RR" | python3 -c '
@@ -587,8 +885,30 @@ priority = [
   "label_value -> Violence & Extremism",
   "report_reason -> Harassment, Threats & Safety",
 ]
+# nostr_user routes, ordered WITHIN their own item type: CSAM first, the nostr_user
+# match-all default LAST. Routing is per-item-type first-match-wins, so what matters is
+# that a nostr_user specific precedes the nostr_user default; where these sit relative to
+# the nostr_event routes does not affect either type. Kept as its own list so the guard
+# that pins `priority` against CATROUTES stays valid (that regex reads only the first list).
+#
+# INVARIANT: every nostr_user route MUST be listed here, before the "nostr_user -> General
+# Review" default. A route omitted from this list is NOT dropped -- the
+# `ordered += [... not in ordered ...]` fallback below appends it AFTER the match-all
+# default, and first-match-wins then shadows it so it never fires. So when you add a
+# USER_CATROUTES entry, add its rule name here too, ahead of the General Review default.
+# The guard pins the shipped USER_CATROUTES SET; the ORDERING that keeps a new route
+# reachable lives here.
+user_priority = [
+  "nostr_user: report_reason -> CSAM",
+  "nostr_user: report_reason -> Child Safety",
+  "nostr_user: report_reason -> Sexual Content",
+  "nostr_user: report_reason -> Violence & Extremism",
+  "nostr_user: report_reason -> Harassment, Threats & Safety",
+  "nostr_user -> General Review",
+]
 gen = by.get(GENERAL)
 ordered = [by[n] for n in priority if n in by]
+ordered += [by[n] for n in user_priority if n in by and by[n] not in ordered]
 # Then any other rules (manually added / renamed) -- but never after the catch-all.
 ordered += [r["id"] for r in rules if r["id"] not in ordered and r["id"] != gen]
 # General Review LAST: it is a match-all (empty conditionSet) and routing is
@@ -622,6 +942,16 @@ print_done_banner() {
     echo "    NOTE: the actions above were written to Coop successfully, but $UNVERIFIED_CALLBACKS,"
     echo "    so none of their callbacks is confirmed to reach the adapter. Coop answers a moderator"
     echo "    202 whether or not the callback lands, so verify the adapter separately."
+  fi
+  if [ -n "${UNCONDITIONED_USER_RULES:-}" ]; then
+    echo "    WARNING: a LIVE rule ($UNCONDITIONED_USER_RULES) enqueues nostr_user WITHOUT the"
+    echo "    report_reason condition, so every enrichment account also gets its own review job."
+    echo "    Step 4b did not create or modify that rule; reconcile it in Coop before trusting"
+    echo "    this org's nostr_user job stream."
+  fi
+  if [ -n "${UNRESOLVED_USER_RULE_STATE:-}" ]; then
+    echo "    WARNING: the nostr_user rules could not be read ($UNRESOLVED_USER_RULE_STATE), so the"
+    echo "    conditioned enqueue rule was NOT provisioned this run. Re-run once the query succeeds."
   fi
   echo "    Items surface in the COOP Review"
   echo "    Console once the ItemProcessingWorker (Scylla) is live; moderator"

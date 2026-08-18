@@ -17,6 +17,10 @@
 #   - coop's PROFILE_PREFIXES / PROFILE_SUFFIX_TYPES, read from the shipped setup script.
 #   - coop's actual CT_FIELDS, so a correct rule whose output never reaches the artifact
 #     is still caught.
+#   - coop's actual UT_FIELDS against osprey's user_item_fields(), which is the same
+#     check for the ACCOUNT card. The Associated User panel renders the nostr_user type's
+#     declared fields, so a suffix missing there is dropped just as silently, and the
+#     CT_FIELDS comparison above cannot see it.
 # Comparing only the emitted key sets would be blind to a prefix added on ONE side, since
 # each side's filter would quietly exclude the other's. Comparing the rules is not.
 #
@@ -64,7 +68,8 @@ grep -q 'end field declaration'  "$WORK/fields.sh" || { echo "ERROR: field decla
 ( set -euo pipefail; . "$WORK/fields.sh"
   printf '%s\n' "$PROFILE_PREFIXES" > "$WORK/coop_prefixes.txt"
   printf '%s\n' "$PROFILE_SUFFIX_TYPES" > "$WORK/coop_suffixes.txt"
-  printf '%s'   "$CT_FIELDS" > "$WORK/coop_ct_fields.json" )
+  printf '%s'   "$CT_FIELDS" > "$WORK/coop_ct_fields.json"
+  printf '%s'   "$UT_FIELDS" > "$WORK/coop_ut_fields.json" )
 
 python3 - "$WORK" "$REF" <<'PY'
 import ast, json, pathlib, sys
@@ -189,13 +194,56 @@ if missing:
 if extra:
     problems.append(f"Coop declares but osprey never sends (permanently blank row): {extra}")
 
+# --- the nostr_user item type ----------------------------------------------------------
+# The SAME failure, one item type over. The Associated User panel renders the USER type's
+# declared fields against the account's own submission, so a suffix missing from UT_FIELDS
+# is enrichment computed and dropped exactly as it would be on the content card -- and the
+# content-side check above cannot see it, because it only ever reads CT_FIELDS.
+#
+# Compared by EXECUTION, not by name: osprey derives the unprefixed names from the
+# prefixed ones (user_item_fields -> profile_fields), so running it is what proves the two
+# sets still agree. A reimplementation that drifts shows up here as a mismatch rather than
+# as a card that silently loses a field.
+user_builder = getattr(cp, 'user_item_fields', None)
+if user_builder is None:
+    problems.append(f"osprey ({ref}) has no coop_profile.user_item_fields, so nothing "
+                    "populates the nostr_user item; the fields Coop declares on it would "
+                    "stay permanently blank")
+else:
+    executed_user = set()
+    for case in CASES:
+        executed_user |= set(user_builder(case, error='e'))
+
+    # Identity fields osprey sets directly or that predate enrichment; not built by the
+    # suffix rule, so they are not expected to appear in it. `report_reason` is a ROUTING
+    # field the sink emits directly in `_submit_reported_account` (a profile-only report's
+    # reason, matched by the step 5b nostr_user routes) -- also not a profile suffix, so it
+    # is excluded from the suffix-parity comparison rather than read as a blank row.
+    USER_IDENTIFIERS = {'pubkey', 'npub', 'first_seen_at', 'report_reason'}
+    declared_user = {f['name'] for f in json.loads((work / 'coop_ut_fields.json').read_text())}
+    declared_user_profile = declared_user - USER_IDENTIFIERS
+
+    if executed_user != suffixes:
+        problems.append("osprey's user_item_fields is no longer the unprefixed twin of "
+                        f"profile_fields: builds {sorted(executed_user)}, suffix rule says "
+                        f"{sorted(suffixes)}")
+    user_missing = sorted(executed_user - declared_user_profile)
+    user_extra = sorted(declared_user_profile - executed_user)
+    if user_missing:
+        problems.append("osprey emits on the nostr_user item but Coop DROPS (Associated "
+                        f"User panel never shows it): {user_missing}")
+    if user_extra:
+        problems.append("Coop declares on nostr_user but osprey never sends (permanently "
+                        f"blank row): {user_extra}")
+
 if problems:
     print(f"DRIFT: osprey ({ref}) and coop disagree")
     for p in problems:
         print(f"  - {p}")
     raise SystemExit(1)
 
-print(f"OK: {len(expected)} profile fields "
-      f"({len(prefixes)} prefixes x {len(suffixes)} suffixes), osprey ({ref}) and coop "
-      f"agree on the rule AND on the shipped field list")
+print(f"OK: {len(expected)} content profile fields "
+      f"({len(prefixes)} prefixes x {len(suffixes)} suffixes) and {len(suffixes)} unprefixed "
+      f"nostr_user fields, osprey ({ref}) and coop agree on the rule AND on both shipped "
+      f"field lists")
 PY

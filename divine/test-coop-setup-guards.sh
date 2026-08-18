@@ -150,6 +150,199 @@ else
   fails=$((fails+1))
 fi
 
+echo "the nostr_user (profile-only report) routing is present and ordered:"
+# Pins the whole (queue, token) set of the nostr_user report_reason routes, plus the
+# ordering invariant (CSAM first, the nostr_user match-all default LAST), plus that the
+# rule NAMES are type-prefixed so they cannot collide org-wide with the nostr_event
+# routes of the same field/queue. Derived from BASH like CATROUTES, so an added or
+# dropped row cannot hide.
+{ awk '/^USER_CATROUTES=\(/,/^\)/' "$SRC"; echo 'printf "%s\n" "${USER_CATROUTES[@]}"'; } > "$WORK/user_routes.sh"
+USER_ROWS=$(bash -euo pipefail "$WORK/user_routes.sh" 2>/dev/null)
+USER_ACTUAL=$(printf '%s\n' "$USER_ROWS" | LC_ALL=C sort)
+USER_EXPECTED=$(printf '%s\n' \
+  'CSAM|csam' \
+  'Child Safety|child_safety' \
+  'Sexual Content|nudity' \
+  'Violence & Extremism|violence' \
+  'Harassment, Threats & Safety|harassment' | LC_ALL=C sort)
+if [ "$USER_ACTUAL" = "$USER_EXPECTED" ]; then
+  echo "  ok    $(printf '%s\n' "$USER_ACTUAL" | grep -c .) nostr_user report_reason routes, each to its intended queue"
+else
+  echo "  FAIL  shipped USER_CATROUTES differs from the expected (queue, token) set:"
+  diff <(printf '%s\n' "$USER_EXPECTED") <(printf '%s\n' "$USER_ACTUAL") | sed 's/^/        /' || true
+  fails=$((fails+1))
+fi
+# underage_user must NOT be routed for nostr_user either (age review is relay-manager's).
+if printf '%s\n' "$USER_ACTUAL" | grep -q 'underage_user'; then
+  echo "  FAIL  nostr_user routes must not include underage_user (age review is relay-manager's)"
+  fails=$((fails+1))
+else
+  echo "  ok    nostr_user routing excludes underage_user"
+fi
+# user_priority: CSAM first, nostr_user General Review last.
+USER_PRIORITY=$(python3 - "$SRC" <<'PY'
+import ast, re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"user_priority = \[(.*?)\]", src, re.S)
+if not m:
+    raise SystemExit("user_priority list not found")
+print("\n".join(ast.literal_eval("[" + m.group(1) + "]")))
+PY
+)
+FIRST=$(printf '%s\n' "$USER_PRIORITY" | head -1)
+LAST=$(printf '%s\n' "$USER_PRIORITY" | tail -1)
+if [ "$FIRST" = "nostr_user: report_reason -> CSAM" ] && [ "$LAST" = "nostr_user -> General Review" ]; then
+  echo "  ok    nostr_user order is CSAM first, General Review last"
+else
+  echo "  FAIL  nostr_user ordering wrong (first='$FIRST' last='$LAST')"
+  echo "        CSAM must be first (sticky, NCMEC-bound) and the match-all default last (first-match-wins)."
+  fails=$((fails+1))
+fi
+# Name collision: every nostr_user route name must be type-prefixed so it is distinct
+# org-wide from the nostr_event route of the same field/queue.
+if printf '%s\n' "$USER_PRIORITY" | grep -vq '^nostr_user'; then
+  echo "  FAIL  a nostr_user priority entry is not type-prefixed; it could collide with a nostr_event rule name"
+  fails=$((fails+1))
+else
+  echo "  ok    nostr_user route names are type-prefixed (no org-wide collision)"
+fi
+# user_priority COMPLETENESS, derived like the nostr_event priority check above: every
+# USER_CATROUTES row must appear, in the provisioning order, ahead of the match-all
+# default. FIRST/LAST above cannot catch the documented shadowing hazard on their own --
+# a route added to USER_CATROUTES (and pinned here) but forgotten in user_priority is
+# appended AFTER the default by the reorder fallback and never fires (first-match-wins).
+USER_PRIO_EXPECTED=$(printf '%s\n' "$USER_ROWS" | awk -F'|' '{ print "nostr_user: report_reason -> " $1 }'
+  echo 'nostr_user -> General Review')
+if [ "$USER_PRIORITY" = "$USER_PRIO_EXPECTED" ]; then
+  echo "  ok    user_priority lists every USER_CATROUTES route, default last"
+else
+  echo "  FAIL  user_priority differs from USER_CATROUTES-derived route names:"
+  diff <(printf '%s\n' "$USER_PRIO_EXPECTED") <(printf '%s\n' "$USER_PRIORITY") | sed 's/^/        /' || true
+  echo "        Every USER_CATROUTES row needs a user_priority entry ahead of the General Review"
+  echo "        default, or first-match-wins shadows it permanently."
+  fails=$((fails+1))
+fi
+
+echo "the nostr_user enqueue rule is conditioned on report_reason (enrichment accounts get no job):"
+# The 4b 'nostr_user -> review queue' content rule must fire ONLY when report_reason is
+# present, so an ENRICHMENT account (COOPSink._submit_user_item, no report_reason) is NOT
+# enqueued as its own review job -- only a REPORTED account (COOPSink._submit_reported_account,
+# report_reason set) is. Extract the SHIPPED conditionSet builder and run it, then assert a
+# CONTENT_FIELD report_reason condition whose pattern requires at least one character. A
+# match-all (empty conditions) conditionSet must be REJECTED.
+#
+# The same predicate is applied to the real conditionSet AND to a match-all one, so the
+# positive control cannot drift from the check it controls.
+cat > "$WORK/uc_check.py" <<'PY'
+import json, sys
+cs = json.load(sys.stdin)
+conds = cs.get("conditions") or []
+def report_reason_present(c):
+    field = c.get("input") or {}
+    strings = (c.get("matchingValues") or {}).get("strings") or []
+    # "^.+$" and friends require >=1 char, so an absent/empty report_reason does not match.
+    # A '+'-quantified anchored pattern is the non-empty signal; '^$' / '' would match empty.
+    signal = (c.get("signal") or {}).get("type")
+    # EXACT shipped pattern, not a heuristic. A heuristic (anchored AND "+" present) would
+    # pass a functionally broken pattern like "^+$"; require the precise "^.+$", which matches
+    # any NON-EMPTY value and nothing empty, on the report_reason CONTENT_FIELD via the regex
+    # signal. Anything else -- a broken pattern, "^$", a different field -- is a bug.
+    return (field.get("type") == "CONTENT_FIELD"
+            and field.get("name") == "report_reason"
+            and signal == "TEXT_MATCHING_CONTAINS_REGEX"
+            and strings == ["^.+$"])
+print("OK" if (conds and any(report_reason_present(c) for c in conds)) else "FAIL")
+PY
+{ awk '/^nostr_user_review_condition_set\(\)/{flag=1} flag{print} flag && /^}/{exit}' "$SRC"; echo 'nostr_user_review_condition_set nostr-user-type'; } > "$WORK/uc_cond.sh"
+UC_REAL=$(bash "$WORK/uc_cond.sh" 2>/dev/null | python3 "$WORK/uc_check.py" 2>/dev/null || echo FAIL)
+if [ "$UC_REAL" = "OK" ]; then
+  echo "  ok    nostr_user enqueue rule ships the exact report_reason-present pattern ^.+$"
+else
+  echo "  FAIL  the shipped nostr_user enqueue conditionSet is not the exact report_reason ^.+$ condition"
+  fails=$((fails+1))
+fi
+# Positive control: the SAME check must REJECT a match-all (empty) conditionSet, or a revert
+# to enqueuing every nostr_user item would slip through green.
+UC_MATCHALL=$(printf '%s' '{"conditions":[],"conjunction":"AND"}' | python3 "$WORK/uc_check.py" 2>/dev/null || echo FAIL)
+if [ "$UC_MATCHALL" = "FAIL" ]; then
+  echo "  ok    the check rejects a match-all conditionSet (positive control)"
+else
+  echo "  FAIL  the conditioned-rule check passed a match-all conditionSet; it is vacuous"
+  fails=$((fails+1))
+fi
+# Positive control 2: a report_reason condition whose pattern is functionally BROKEN ("^+$"
+# quantifies nothing) must be rejected -- exactly what the old anchored-and-"+" heuristic let
+# through. The exact-pattern check must not.
+UC_BROKEN=$(printf '%s' '{"conditions":[{"input":{"type":"CONTENT_FIELD","name":"report_reason","contentTypeId":"x"},"signal":{"type":"TEXT_MATCHING_CONTAINS_REGEX"},"matchingValues":{"strings":["^+$"]}}],"conjunction":"AND"}' | python3 "$WORK/uc_check.py" 2>/dev/null || echo FAIL)
+if [ "$UC_BROKEN" = "FAIL" ]; then
+  echo "  ok    the check rejects a broken '^+$' pattern (positive control)"
+else
+  echo "  FAIL  the check accepted a broken '^+$' pattern; the exact-pattern assertion is not enforced"
+  fails=$((fails+1))
+fi
+# The 4b SKIP must distinguish a foreign rule that is report_reason-conditioned from one
+# that is not. "Some LIVE rule enqueues nostr_user" is the guarantee for nostr_event (step
+# 4, match-all is correct there); for nostr_user the guarantee is narrower, and an
+# unconditional foreign rule means every enrichment account gets its own job. A revert to
+# existence-only skipping (no conditionSet in the rules query, no conditioned() predicate,
+# no foreign_unconditioned branch) must go red here, not silently green.
+if grep -q 'def conditioned' "$SRC" && grep -q 'foreign_unconditioned' "$SRC" && grep -qF "echo 'unknown|" "$SRC" && grep -qF 'rules is None' "$SRC"; then
+  echo "  ok    the 4b skip verifies the foreign rule's conditioning, warns when it is unconditional, and degrades a failed query to unknown (not create)"
+else
+  echo "  FAIL  the 4b skip accepts ANY foreign nostr_user enqueue rule; a match-all foreign rule would be silently satisfied"
+  fails=$((fails+1))
+fi
+# And the query the predicate reads must be VALID GraphQL: conditionSet is a composite
+# type (type ConditionSet { conjunction, conditions }), so selecting it without a
+# subselection makes the server reject the whole document -- the decision pipeline then
+# hits its 2>/dev/null fallback and degrades to 'create' on EVERY run, silently. The
+# identifier checks above stay green through that, so the query shape is pinned separately.
+if grep -qF 'conditionSet { conditions' "$SRC"; then
+  echo "  ok    the 4b rules query selects conditionSet with a subselection (a composite field without one is invalid GraphQL)"
+else
+  echo "  FAIL  the 4b rules query selects conditionSet without a subselection; the server rejects the document and the skip degrades to create every run"
+  fails=$((fails+1))
+fi
+# EXECUTE the 4b decision against canonical payloads. String pins above cannot see a
+# predicate that mis-executes: the empty-rules case below was a real defect (an empty
+# list is a SUCCESSFUL answer meaning \"no rules exist\" and must yield create, but the
+# unknown-detection's truthiness test swallowed it and 4b never provisioned a fresh org).
+# Extraction mirrors how bash runs it: the python between `python3 -c "` and the closing
+# quote, with bash's \$ escapes undone.
+python3 - "$SRC" "$WORK/ucr_decision.py" <<'PY'
+import sys
+src = open(sys.argv[1], encoding='utf-8').read()
+start = src.index('UCR_DECISION=$(echo "$EXISTING_UCR" | python3 -c')
+start = src.index('python3 -c "', start) + len('python3 -c "')
+end = src.index('" "$USER_CONTENT_RULE_NAME"', start)
+code = src[start:end].replace('\\\n', '\n').replace('\\$', '$').replace('\\"', '"')
+compile(code, 'ucr_decision', 'exec')
+open(sys.argv[2], 'w', encoding='utf-8').write(code)
+PY
+UCR_COND_OK='{"conditions":[{"input":{"type":"CONTENT_FIELD","name":"report_reason","contentTypeId":"utid"},"signal":{"id":"{}","type":"TEXT_MATCHING_CONTAINS_REGEX"},"matchingValues":{"strings":["^.+$"]}}],"conjunction":"AND"}'
+ucr_case() { # name expected-token payload-json
+  local name="$1" want="$2" payload="$3" got
+  got=$(printf '%s' "$payload" | python3 "$WORK/ucr_decision.py" "nostr_user -> review queue" "utid" 2>/dev/null | cut -d'|' -f1)
+  if [ "$got" = "$want" ]; then
+    echo "  ok    $name -> $want"
+  else
+    echo "  FAIL  $name: expected '$want', got '${got:-<none>}'"
+    fails=$((fails+1))
+  fi
+}
+ucr_case "a conditioned foreign rule satisfies 4b"            "satisfied"              "{\"data\":{\"myOrg\":{\"rules\":[{\"id\":\"r1\",\"name\":\"other\",\"status\":\"LIVE\",\"conditionSet\":$UCR_COND_OK,\"itemTypes\":[{\"name\":\"nostr_user\"}],\"actions\":[{\"__typename\":\"EnqueueToMrtAction\"}]}]}}}"
+# Same payload with the condition scoped to ANOTHER item type: CONTENT_FIELD extraction
+# requires inputSpecifier.contentTypeId === itemTypeId (leafCondition.ts), so such a rule
+# can never fire for nostr_user and must not satisfy 4b. Deleting the contentTypeId clause
+# from the shipped predicate turns this case red -- that mutation passed the whole suite
+# green before this case existed.
+ucr_case "a foreign rule scoped to another item type does not satisfy 4b" "foreign_unconditioned" "{\"data\":{\"myOrg\":{\"rules\":[{\"id\":\"r1\",\"name\":\"other\",\"status\":\"LIVE\",\"conditionSet\":{\"conditions\":[{\"input\":{\"type\":\"CONTENT_FIELD\",\"name\":\"report_reason\",\"contentTypeId\":\"othertid\"},\"signal\":{\"id\":\"{}\",\"type\":\"TEXT_MATCHING_CONTAINS_REGEX\"},\"matchingValues\":{\"strings\":[\"^.+\$\"]}}],\"conjunction\":\"AND\"},\"itemTypes\":[{\"name\":\"nostr_user\"}],\"actions\":[{\"__typename\":\"EnqueueToMrtAction\"}]}]}}}"
+ucr_case "a match-all foreign rule warns (foreign_unconditioned)" "foreign_unconditioned" "{\"data\":{\"myOrg\":{\"rules\":[{\"id\":\"r1\",\"name\":\"evil\",\"status\":\"LIVE\",\"conditionSet\":{\"conditions\":[],\"conjunction\":\"AND\"},\"itemTypes\":[{\"name\":\"nostr_user\"}],\"actions\":[{\"__typename\":\"EnqueueToMrtAction\"}]}]}}}"
+ucr_case "an EMPTY rules list is a successful answer (create)" "create"                 '{"data":{"myOrg":{"rules":[]}}}'
+ucr_case "an errors payload degrades to unknown"              "unknown"                '{"errors":[{"message":"bad"}]}'
+ucr_case "null data degrades to unknown"                      "unknown"                '{"data":null}'
+ucr_case "our own rule present reconciles"                    "reconcile"              "{\"data\":{\"myOrg\":{\"rules\":[{\"id\":\"r1\",\"name\":\"nostr_user -> review queue\",\"status\":\"LIVE\",\"conditionSet\":{\"conditions\":[],\"conjunction\":\"AND\"},\"itemTypes\":[{\"name\":\"nostr_user\"}],\"actions\":[{\"__typename\":\"EnqueueToMrtAction\"}]}]}}}"
+
 echo "the shipped account-moderation config is internally consistent:"
 # Pins the COMPLETE shipped schema: name, type, required, IN ORDER.
 #
@@ -168,12 +361,13 @@ cat > "$WORK/schema.check" <<'SHEOF'
 set -euo pipefail
 # shellcheck disable=SC1090
 . "$1"
-python3 - "$CT_FIELDS" "$CT_FIELD_ROLES" <<'PYEOF'
+python3 - "$CT_FIELDS" "$CT_FIELD_ROLES" "$UT_FIELDS" <<'PYEOF'
 import json
 import sys
 
 fields = json.loads(sys.argv[1])
 roles = json.loads(sys.argv[2])
+user_fields = json.loads(sys.argv[3])
 
 expected_fields = [
     ("event_id", "STRING", True),
@@ -233,6 +427,33 @@ expected_roles = {
 }
 if roles != expected_roles:
     raise SystemExit("FAIL: shipped field roles differ from the reviewed schema: %r" % (roles,))
+
+# The nostr_user type, pinned for the same reasons. `pubkey` required:True is the one
+# osprey must always send; every profile field must stay optional, because osprey omits
+# each of them whenever it has nothing to say and Coop rejects the WHOLE item when a
+# required field is absent -- which here would strand the account card, not just a row.
+expected_user_fields = [
+    ("pubkey", "STRING", True),
+    # report_reason: STRING, optional. Present so a PROFILE-ONLY report can be
+    # ROUTED as a nostr_user item by the step 5b routes; absent means "not a
+    # reported account here" (enrichment), which must be fine rather than a 400.
+    ("report_reason", "STRING", False),
+    ("npub", "STRING", False),
+    ("first_seen_at", "DATETIME", False),
+    # UNPREFIXED, in the same emission order as one prefix family above. These are what
+    # the Associated User panel renders; prefixed names here would describe some other
+    # account and show nothing.
+    ("profile_state", "STRING", False),
+    ("profile_error", "STRING", False),
+    ("has_vanish_request", "BOOLEAN", False),
+    ("display_name", "STRING", False),
+    ("nip05", "STRING", False),
+    ("nip05_verified", "BOOLEAN", False),
+    ("follower_count", "NUMBER", False),
+]
+actual_user_fields = [(f["name"], f["type"], f["required"]) for f in user_fields]
+if actual_user_fields != expected_user_fields:
+    raise SystemExit("FAIL: shipped nostr_user fields differ from the reviewed schema: %r" % (actual_user_fields,))
 
 PYEOF
 SHEOF
@@ -529,7 +750,7 @@ mark=$(grep -n '^# --- end field declaration ---$' "$src" | cut -d: -f1)
 # diagnosis is to bump the number, which would permanently admit one real escape. A guard
 # whose message can be false teaches people to weaken it.
 # `m+0` forces a numeric compare; without it a non-integer m silently compares as a string.
-escaped=$(awk -v m="$mark" 'NR > m+0 && /^[[:space:]]*(export|readonly|declare|typeset|local)?[[:space:]]*(CT_FIELDS|CT_FIELD_ROLES)\+?=/ { print NR": "$0 }' "$src")
+escaped=$(awk -v m="$mark" 'NR > m+0 && /^[[:space:]]*(export|readonly|declare|typeset|local)?[[:space:]]*(CT_FIELDS|CT_FIELD_ROLES|UT_FIELDS)\+?=/ { print NR": "$0 }' "$src")
 [ -z "$escaped" ] || {
   echo "FAIL: a schema assignment sits BELOW the pinned region, so the schema pin evaluates one value while a different one is provisioned:"
   echo "$escaped"
@@ -544,6 +765,12 @@ escaped=$(awk -v m="$mark" 'NR > m+0 && /^[[:space:]]*(export|readonly|declare|t
 # which reopened the exact vacuity this floor exists to close.
 uses=$(grep -F '"$CT_FIELDS" "$CT_FIELD_ROLES"' "$src" | grep -vc '^[[:space:]]*#' || true)
 [ "$uses" -ge 1 ] || { echo "FAIL: nothing in the script reads the pinned (CT_FIELDS, CT_FIELD_ROLES) pair, so the schema pin governs nothing that is actually provisioned"; exit 1; }
+
+# Same floor for the user type. UT_FIELDS is pinned too now, so it needs its own proof that
+# the pinned value is the provisioned one; without this the nostr_user half of the pin goes
+# vacuous the moment the variable is renamed, in exactly the way described above.
+ut_uses=$(grep -F '"$UT_FIELDS"' "$src" | grep -vc '^[[:space:]]*#' || true)
+[ "$ut_uses" -ge 1 ] || { echo "FAIL: nothing in the script reads the pinned UT_FIELDS, so the nostr_user schema pin governs nothing that is actually provisioned"; exit 1; }
 
 # Then per call site, so extracting the two near-identical printf calls into one helper --
 # an obvious cleanup -- does not trip it. Continuations are joined first: the provisioning
@@ -599,6 +826,8 @@ boundary_control "CT_FIELD_ROLES re-assigned below the marker (creatorId unbound
 boundary_control "ONE provisioning branch sends a different variable" "does not send the pinned" '/"input":{"name":"nostr_event"/s|"\$CT_FIELDS" "\$CT_FIELD_ROLES"|"$OTHER_FIELDS" "$OTHER_ROLES"|'
 boundary_control "CT_VARS is renamed so no call site matches (guard would go vacuous)" "nothing in the script reads the pinned" 's/CT_VARS=\$(printf/CTV=$(printf/; s/"\$CT_FIELDS" "\$CT_FIELD_ROLES"/"$OTHER_A" "$OTHER_B"/'
 boundary_control "a schema assignment below the marker is exported" "sits BELOW the pinned region"                  's|^# --- end field declaration ---$|&\nexport CT_FIELDS="${CT_FIELDS//VIDEO/STRING}"|'
+boundary_control "UT_FIELDS re-assigned below the marker (account card types downgraded)" "sits BELOW the pinned region" 's|^# --- end field declaration ---$|&\nUT_FIELDS="${UT_FIELDS//BOOLEAN/STRING}"|'
+boundary_control "nothing reads the pinned UT_FIELDS (guard would go vacuous)" "nothing in the script reads the pinned UT_FIELDS" 's/"\$UT_FIELDS"/"$OTHER_UT"/g'
 boundary_control "a second end-of-declaration marker appears" "end-of-declaration marker, found"                        's|^# --- end field declaration ---$|&\n# --- end field declaration ---|'
 boundary_control "the end-of-declaration marker is deleted" "end-of-declaration marker, found"                          '/^# --- end field declaration ---$/d'
 
@@ -618,6 +847,51 @@ pin_control "creatorId is unbound from author (Associated User panel stops resol
 # required:true would make Coop 400 every submission, because osprey omits six of the
 # seven suffixes whenever it has nothing to say.
 pin_control "the profile fields become required" "shipped content fields differ"                                 's/,\"required\":false}/,\"required\":true}/'
+
+# The same three ways the ACCOUNT card can silently lose its fields. Each of these leaves
+# the content type completely intact, so the controls above stay green while the
+# Associated User panel goes back to "No user information found".
+pin_control "the nostr_user splice is deleted (account card loses every profile field)" "shipped nostr_user fields differ" '/user_profile_fields_json)]"$/d'
+pin_control "the nostr_user fields are prefixed (they would describe another account)" "shipped nostr_user fields differ"  's/user_profile_fields_json)]/profile_fields_json)]/'
+# pubkey is the one field osprey must always send; optional here means a submission that
+# omits it is accepted and the account item carries no identity at all.
+pin_control "pubkey stops being required on nostr_user" "shipped nostr_user fields differ" 's/{"name":"pubkey","type":"STRING","required":true}/{"name":"pubkey","type":"STRING","required":false}/'
+
+# The two ways the nostr_user ROUTING invariants can silently weaken. Unlike the schema
+# pin controls above, these re-run the WHOLE guard against a mutated copy of the setup
+# script in a throwaway tree (pin_control only re-runs schema.check, which does not read
+# routing config at all). The env var stops a control-of-controls recursing: the child
+# suite's own routing_controls become no-ops, so each control runs exactly one level deep.
+routing_control() { # name expected-message-fragment sed-expression
+  local name="$1" want="$2" expr="$3" out rc
+  [ -n "${COOP_GUARD_IN_ROUTING_CTL:-}" ] && return 0
+  mkdir -p "$WORK/ctl_repo/divine"
+  sed "$expr" "$SRC" > "$WORK/ctl_repo/divine/coop-setup-org.sh"
+  cp divine/test-coop-setup-guards.sh "$WORK/ctl_repo/divine/"
+  out=$(COOP_GUARD_IN_ROUTING_CTL=1 bash "$WORK/ctl_repo/divine/test-coop-setup-guards.sh" 2>&1) && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$want"; then
+    printf '  ok    %s (rejected by the guard)\n' "$name"
+  elif [ "$rc" -ne 0 ]; then
+    printf '  FAIL  %s -- rejected, but NOT with the expected message: %s\n' "$name" "$(printf '%s' "$out" | tail -1)"
+    fails=$((fails+1))
+  else
+    printf '  FAIL  %s -- the guard did not notice\n' "$name"
+    fails=$((fails+1))
+  fi
+}
+# Dropping a middle user_priority entry is the shadowing hazard the reorder fallback
+# creates (a route appended after the match-all default never fires); FIRST/LAST stay
+# green, so only the derived completeness comparison catches it.
+routing_control "a middle user_priority entry is dropped (that route is shadowed after the default)" "user_priority differs from USER_CATROUTES-derived" '/^  "nostr_user: report_reason -> Sexual Content",$/d'
+# Renaming the marker away restores the silent existence-only skip a foreign match-all
+# rule could hide behind (the containment check above goes red, not the schema pin).
+routing_control "the foreign-rule conditioning check is removed (silent match-all skip returns)" "silently satisfied" 's/foreign_unconditioned/satisfied2/g'
+# Bare `conditionSet` (no subselection) is invalid GraphQL for a composite type; the
+# server rejects the whole query and the F3 fallback degrades 4b to create on every run.
+routing_control "the 4b query loses its conditionSet subselection (invalid GraphQL, silent create-fallback)" "selects conditionSet without a subselection" 's/conditionSet { conditions/conditionSet/'
+# The truthiness form of the round-4 defect: `not rules` swallows the empty list, so a
+# fresh org (no rules yet) is reported as a failed query and 4b never provisions.
+routing_control "an empty rules list is swallowed by the unknown-detection again (truthiness bug)" "expected 'create', got 'unknown'" 's/rules is None/not rules/'
 
 if [ "$fails" -ne 0 ]; then echo "FAILED: $fails"; exit 1; fi
 echo "all guard tests passed"
