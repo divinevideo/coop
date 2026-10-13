@@ -1,8 +1,8 @@
 import { once } from 'node:events';
 import net from 'node:net';
-
 import IORedis from 'ioredis';
 
+import getBottle from '../iocContainer/index.js';
 import { reconnectOnReadonly } from './redis.js';
 
 /**
@@ -116,6 +116,36 @@ describe('reconnectOnReadonly', () => {
       expect(server.connectionCount()).toBe(2);
     } finally {
       client.disconnect();
+      await server.close();
+    }
+  });
+
+  // Pins the wiring in iocContainer: the client the server and worker share
+  // (and that BullMQ duplicates) must use the handler, not only a test client.
+  test("the container's Redis client recovers from READONLY", async () => {
+    const server = await startDemotedPrimary();
+    const vars = ['REDIS_USE_CLUSTER', 'REDIS_HOST', 'REDIS_PORT', 'REDIS_TLS'];
+    const saved = vars.map((name) => process.env[name]);
+    process.env.REDIS_USE_CLUSTER = 'false';
+    process.env.REDIS_HOST = '127.0.0.1';
+    process.env.REDIS_PORT = String(server.port);
+    process.env.REDIS_TLS = 'false';
+    const { container } = await getBottle();
+    const client = container.IORedis;
+    try {
+      await expect(client.set('key', 'value')).resolves.toBe('OK');
+      expect(server.connectionCount()).toBe(2);
+    } finally {
+      client.disconnect();
+      vars.forEach((name, i) => {
+        if (saved[i] === undefined) {
+          // Restores the env vars this test set; the names are the fixed list above.
+          // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+          delete process.env[name];
+        } else {
+          process.env[name] = saved[i];
+        }
+      });
       await server.close();
     }
   });
