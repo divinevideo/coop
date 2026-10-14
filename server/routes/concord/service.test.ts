@@ -1,7 +1,12 @@
 /* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
 import { UserRole } from '../../models/types/permissioning.js';
 import { tryJsonParse } from '../../utils/encoding.js';
-import { object, publishRoomDecision, roomPermissions } from './service.js';
+import {
+  loadConcordConfig,
+  object,
+  publishRoomDecision,
+  roomPermissions,
+} from './service.js';
 
 const config = {
   origin: 'https://moderation.example',
@@ -104,4 +109,62 @@ test('missing actor, API-key impersonation, wrong org and malformed replies fail
       actionName: 'concord_ban_member',
     }),
   ).rejects.toThrow();
+});
+
+test('internal enforcement origin is fixed, never an arbitrary cleartext endpoint', () => {
+  const env = {
+    CONCORD_MODERATION_ORIGIN:
+      'http://concord-moderation.armada-chat.svc.cluster.local:8080',
+    CONCORD_COOP_ORIGIN: config.coopOrigin,
+    CONCORD_ACCESS_ISSUER: config.accessIssuer,
+    CONCORD_MODERATION_HMAC_KEY: config.hmacKey,
+    CONCORD_ORG_ID: config.orgId,
+    CONCORD_ACCESS_AUDIENCE: config.accessAudience,
+    CONCORD_QUEUE_ID: config.queueId,
+  };
+  expect(loadConcordConfig(env).origin).toBe(env.CONCORD_MODERATION_ORIGIN);
+  expect(() =>
+    loadConcordConfig({
+      ...env,
+      CONCORD_MODERATION_ORIGIN: 'http://attacker.example',
+    }),
+  ).toThrow();
+});
+
+test('cross-cluster requests authenticate to Access without forwarding credentials on redirects', async () => {
+  const fetchHTTP = jest.fn(
+    async (_request: import('./service.js').RoomRequest) => ({
+      ok: true,
+      status: 202,
+      body: {
+        decisionId: '10000000-0000-4000-8000-000000000002',
+        action: 'remove_message',
+        target: {
+          communityId: 'a'.repeat(64),
+          channelId: 'b'.repeat(64),
+          rumorId: 'c'.repeat(64),
+        },
+        deliveries: ['divine_relay', 'concord', 'discord'].map((target) => ({
+          target,
+          state: 'pending',
+          attempts: 0,
+          resultCode: null,
+        })),
+      },
+    }),
+  );
+  await publishRoomDecision(
+    {
+      ...config,
+      accessClientId: 'synthetic-id',
+      accessClientSecret: 'synthetic-secret',
+    },
+    { fetchHTTP, getActor: async () => actor },
+    input,
+  );
+  const request = fetchHTTP.mock.calls[0][0];
+  expect(request.headers['CF-Access-Client-Id']).toBe('synthetic-id');
+  expect(request.headers['CF-Access-Client-Secret']).toBe('synthetic-secret');
+  expect(request.redirect).toBe('error');
+  expect(request.logRequestAndResponseBody).toBe('NEVER');
 });
