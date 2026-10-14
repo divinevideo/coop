@@ -1369,6 +1369,7 @@ export default async function getBottle() {
                 item: { itemId, itemType },
                 actorId: reviewerId,
                 actorEmail: reviewerEmail,
+                decisionReason,
               });
             }
           }),
