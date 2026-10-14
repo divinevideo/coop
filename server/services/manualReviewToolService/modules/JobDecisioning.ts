@@ -95,8 +95,7 @@ export type ManualReviewDecisionComponent =
     };
 
 export type ManualReviewDecisionType =
-  | ManualReviewDecisionComponent['type']
-  | 'RELATED_ACTION';
+  ManualReviewDecisionComponent['type'] | 'RELATED_ACTION';
 
 export type SubmitDecisionInput = {
   queueId: string;
@@ -197,12 +196,21 @@ export default class JobDecisioning {
     // (for security) before we save the data to the db. We accept that there
     // could be some legit policies/actions that are very rarely not found
     // (from eventually consistent pg lookup) as a reasonable tradeoff.
-    if (decisions.some((decision) => decision.type === 'CUSTOM_ACTION')) {
-      const allActionIds = decisions.flatMap((decision) =>
+    if (
+      decisions.some((decision) => decision.type === 'CUSTOM_ACTION') ||
+      relatedActions.some((related) => related.actionIds.length > 0)
+    ) {
+      const primaryActionIds = decisions.flatMap((decision) =>
         decision.type === 'CUSTOM_ACTION'
           ? decision.actions.map((action) => action.id)
           : [],
       );
+      const allActionIds = [
+        ...new Set([
+          ...primaryActionIds,
+          ...relatedActions.flatMap((related) => related.actionIds),
+        ]),
+      ];
       const validActions = await this.getCustomActionsByIds({
         ids: allActionIds,
         orgId,
@@ -214,13 +222,19 @@ export default class JobDecisioning {
         roomDeliveryRequired &&
         (validActions.length !== allActionIds.length ||
           validActions.some((action) => !action.name.startsWith('concord_')) ||
-          decisions.some((decision) => decision.type !== 'CUSTOM_ACTION'))
+          decisions.some(
+            (decision) =>
+              decision.type !== 'CUSTOM_ACTION' && decision.type !== 'IGNORE',
+          ))
       )
         throw new Error(
           'Submit room enforcement separately from other actions',
         );
       // We only throw if there aren't any valid actions.
-      if (validActions.length === 0) {
+      if (
+        decisions.some((decision) => decision.type === 'CUSTOM_ACTION') &&
+        !validActions.some((action) => primaryActionIds.includes(action.id))
+      ) {
         throw makeSubmittedJobActionNotFoundError({ shouldErrorSpan: true });
       }
     }
@@ -343,11 +357,16 @@ export default class JobDecisioning {
           .selectAll()
           .executeTakeFirst();
         if (!prior) throw new Error('Recorded decision unavailable');
-        const ids = prior.decision_components.flatMap((part) =>
-          part.type === 'CUSTOM_ACTION'
-            ? part.actions.map((action) => action.id)
-            : [],
-        );
+        const ids = [
+          ...new Set([
+            ...prior.decision_components.flatMap((part) =>
+              part.type === 'CUSTOM_ACTION'
+                ? part.actions.map((action) => action.id)
+                : [],
+            ),
+            ...prior.related_actions.flatMap((related) => related.actionIds),
+          ]),
+        ];
         const originalActions = ids.length
           ? await this.getCustomActionsByIds({ orgId, ids })
           : [];
