@@ -1227,6 +1227,7 @@ export type GQLExecuteBulkActionInput = {
    * execution audit log.
    */
   readonly note?: InputMaybe<Scalars['String']['input']>;
+  readonly operationId?: InputMaybe<Scalars['String']['input']>;
   /**
    * Optional map of `actionId` -> `{ paramName: value }` carrying
    * moderator-supplied runtime parameter values. Each map is validated against
@@ -4968,6 +4969,19 @@ export type GQLZentropiLabelerVersion = {
 export type GQLZentropiLabelerVersionInput = {
   readonly id: Scalars['String']['input'];
   readonly label: Scalars['String']['input'];
+};
+
+export type GQLRoomScopeStaffQueryVariables = Exact<{ [key: string]: never }>;
+
+export type GQLRoomScopeStaffQuery = {
+  readonly __typename: 'Query';
+  readonly me?: {
+    readonly __typename: 'User';
+    readonly id: string;
+    readonly role?: GQLUserRole | null;
+    readonly approvedByAdmin?: boolean | null;
+    readonly rejectedByAdmin?: boolean | null;
+  } | null;
 };
 
 export type GQLApiAuthQueryVariables = Exact<{ [key: string]: never }>;
@@ -25333,6 +25347,107 @@ export const GQLActionFragmentFragmentDoc = gql`
     }
   }
 `;
+export const GQLRoomScopeStaffDocument = gql`
+  query RoomScopeStaff {
+    me {
+      id
+      role
+      approvedByAdmin
+      rejectedByAdmin
+    }
+  }
+`;
+
+/**
+ * __useGQLRoomScopeStaffQuery__
+ *
+ * To run a query within a React component, call `useGQLRoomScopeStaffQuery` and pass it any options that fit your needs.
+ * When your component renders, `useGQLRoomScopeStaffQuery` returns an object from Apollo Client that contains loading, error, and data properties
+ * you can use to render your UI.
+ *
+ * @param baseOptions options that will be passed into the query, supported options are listed on: https://www.apollographql.com/docs/react/api/react-hooks/#options;
+ *
+ * @example
+ * const { data, loading, error } = useGQLRoomScopeStaffQuery({
+ *   variables: {
+ *   },
+ * });
+ */
+export function useGQLRoomScopeStaffQuery(
+  baseOptions?: Apollo.QueryHookOptions<
+    GQLRoomScopeStaffQuery,
+    GQLRoomScopeStaffQueryVariables
+  >,
+) {
+  const options = { ...defaultOptions, ...baseOptions };
+  return Apollo.useQuery<
+    GQLRoomScopeStaffQuery,
+    GQLRoomScopeStaffQueryVariables
+  >(GQLRoomScopeStaffDocument, options);
+}
+export function useGQLRoomScopeStaffLazyQuery(
+  baseOptions?: Apollo.LazyQueryHookOptions<
+    GQLRoomScopeStaffQuery,
+    GQLRoomScopeStaffQueryVariables
+  >,
+) {
+  const options = { ...defaultOptions, ...baseOptions };
+  return Apollo.useLazyQuery<
+    GQLRoomScopeStaffQuery,
+    GQLRoomScopeStaffQueryVariables
+  >(GQLRoomScopeStaffDocument, options);
+}
+// @ts-ignore
+export function useGQLRoomScopeStaffSuspenseQuery(
+  baseOptions?: Apollo.SuspenseQueryHookOptions<
+    GQLRoomScopeStaffQuery,
+    GQLRoomScopeStaffQueryVariables
+  >,
+): Apollo.UseSuspenseQueryResult<
+  GQLRoomScopeStaffQuery,
+  GQLRoomScopeStaffQueryVariables
+>;
+export function useGQLRoomScopeStaffSuspenseQuery(
+  baseOptions?:
+    | Apollo.SkipToken
+    | Apollo.SuspenseQueryHookOptions<
+        GQLRoomScopeStaffQuery,
+        GQLRoomScopeStaffQueryVariables
+      >,
+): Apollo.UseSuspenseQueryResult<
+  GQLRoomScopeStaffQuery | undefined,
+  GQLRoomScopeStaffQueryVariables
+>;
+export function useGQLRoomScopeStaffSuspenseQuery(
+  baseOptions?:
+    | Apollo.SkipToken
+    | Apollo.SuspenseQueryHookOptions<
+        GQLRoomScopeStaffQuery,
+        GQLRoomScopeStaffQueryVariables
+      >,
+) {
+  const options =
+    baseOptions === Apollo.skipToken
+      ? baseOptions
+      : { ...defaultOptions, ...baseOptions };
+  return Apollo.useSuspenseQuery<
+    GQLRoomScopeStaffQuery,
+    GQLRoomScopeStaffQueryVariables
+  >(GQLRoomScopeStaffDocument, options);
+}
+export type GQLRoomScopeStaffQueryHookResult = ReturnType<
+  typeof useGQLRoomScopeStaffQuery
+>;
+export type GQLRoomScopeStaffLazyQueryHookResult = ReturnType<
+  typeof useGQLRoomScopeStaffLazyQuery
+>;
+export type GQLRoomScopeStaffSuspenseQueryHookResult = ReturnType<
+  typeof useGQLRoomScopeStaffSuspenseQuery
+>;
+export type GQLRoomScopeStaffQueryResult = Apollo.QueryResult<
+  GQLRoomScopeStaffQuery,
+  GQLRoomScopeStaffQueryVariables
+>;
 export const GQLApiAuthDocument = gql`
   query ApiAuth {
     apiKey
@@ -43218,6 +43333,7 @@ export type GQLUpdateSsoCredentialsMutationOptions = Apollo.BaseMutationOptions<
 >;
 export const namedOperations = {
   Query: {
+    RoomScopeStaff: 'RoomScopeStaff',
     ApiAuth: 'ApiAuth',
     HashBanks: 'HashBanks',
     HashBankById: 'HashBankById',

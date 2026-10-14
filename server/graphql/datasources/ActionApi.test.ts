@@ -11,9 +11,7 @@ type ActionAPICtor = new (
   getItemTypeEventuallyConsistent: jest.Mock,
 ) => InstanceType<typeof ActionAPI>;
 
-function makeApi(overrides?: {
-  action?: Record<string, unknown>;
-}) {
+function makeApi(overrides?: { action?: Record<string, unknown> }) {
   const action = overrides?.action ?? {
     id: 'action-1',
     orgId: 'org-1',
@@ -179,4 +177,31 @@ describe('ActionAPI.bulkExecuteActions', () => {
     const [triggered] = publishActions.mock.calls[0];
     expect(triggered[0].customMrtApiParamDecisionPayload).toBeUndefined();
   });
+});
+
+test('manual room retry reuses its operation after acceptance response loss', async () => {
+  const { api, publishActions } = makeApi({
+    action: {
+      id: 'action-1',
+      name: 'concord_remove_message',
+      actionType: 'CUSTOM_ACTION',
+      customMrtApiParams: [],
+    },
+  });
+  const input = {
+    ...baseCallArgs,
+    operationId: '10000000-0000-4000-8000-000000000001',
+    actorNote: 'Synthetic reason',
+  };
+  publishActions
+    .mockRejectedValueOnce(new Error('response lost'))
+    .mockResolvedValueOnce([]);
+  await expect(api.bulkExecuteActions(input)).rejects.toThrow('response lost');
+  await api.bulkExecuteActions(input);
+  expect(publishActions.mock.calls[0][1].correlationId).toBe(
+    publishActions.mock.calls[1][1].correlationId,
+  );
+  await expect(
+    api.bulkExecuteActions({ ...input, operationId: undefined }),
+  ).rejects.toThrow(/operation/i);
 });

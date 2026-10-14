@@ -1,4 +1,5 @@
 /* eslint-disable max-lines */
+import { isDeepStrictEqual } from 'node:util';
 import { sql, type Kysely } from 'kysely';
 import { match } from 'ts-pattern';
 import { type JsonObject } from 'type-fest';
@@ -192,8 +193,18 @@ export default class JobDecisioning {
         ids: allActionIds,
         orgId,
       });
-      roomDeliveryRequired = validActions.some((action) => action.name.startsWith('concord_'));
-      if (roomDeliveryRequired && (validActions.length !== allActionIds.length || validActions.some((action) => !action.name.startsWith('concord_')) || decisions.some((decision) => decision.type !== 'CUSTOM_ACTION'))) throw new Error('Submit room enforcement separately from other actions');
+      roomDeliveryRequired = validActions.some((action) =>
+        action.name.startsWith('concord_'),
+      );
+      if (
+        roomDeliveryRequired &&
+        (validActions.length !== allActionIds.length ||
+          validActions.some((action) => !action.name.startsWith('concord_')) ||
+          decisions.some((decision) => decision.type !== 'CUSTOM_ACTION'))
+      )
+        throw new Error(
+          'Submit room enforcement separately from other actions',
+        );
       // We only throw if there aren't any valid actions.
       if (validActions.length === 0) {
         throw makeSubmittedJobActionNotFoundError({ shouldErrorSpan: true });
@@ -298,10 +309,71 @@ export default class JobDecisioning {
         };
       }
 
+      let roomIntent =
+        automaticCloseDecision === undefined
+          ? {
+              decisionComponents,
+              relatedActions,
+              job,
+              queueId,
+              reviewerId,
+              reviewerEmail,
+              decisionReason,
+            }
+          : undefined;
+      if (logDecisionStatus === 'ALREADY_LOGGED') {
+        const prior = await this.pgQuery
+          .selectFrom('manual_review_tool.manual_review_decisions')
+          .where('id', '=', jobIdToGuid(jobId))
+          .where('org_id', '=', orgId)
+          .selectAll()
+          .executeTakeFirst();
+        if (!prior) throw new Error('Recorded decision unavailable');
+        const ids = prior.decision_components.flatMap((part) =>
+          part.type === 'CUSTOM_ACTION'
+            ? part.actions.map((action) => action.id)
+            : [],
+        );
+        const originalActions = ids.length
+          ? await this.getCustomActionsByIds({ orgId, ids })
+          : [];
+        if (originalActions.length !== ids.length)
+          throw new Error('Recorded action configuration unavailable');
+        const wasRoomDecision = originalActions.some((action) =>
+          action.name.startsWith('concord_'),
+        );
+        if (roomDeliveryRequired || wasRoomDecision) {
+          if (
+            !wasRoomDecision ||
+            !prior.reviewer_id ||
+            prior.queue_id !== queueId ||
+            !isDeepStrictEqual(prior.decision_components, decisions) ||
+            !isDeepStrictEqual(prior.related_actions, relatedActions) ||
+            (prior.decision_reason ?? undefined) !== decisionReason
+          ) {
+            throw new Error(
+              'Room decision already recorded with a different intent',
+            );
+          }
+          roomDeliveryRequired = true;
+          roomIntent = {
+            decisionComponents: prior.decision_components,
+            relatedActions: prior.related_actions,
+            job,
+            queueId: prior.queue_id,
+            reviewerId: prior.reviewer_id,
+            // Room publication resolves the original actor from current server-side
+            // staff records. Never attribute this retry to the new session's email.
+            reviewerEmail: '',
+            decisionReason: prior.decision_reason ?? undefined,
+          };
+        }
+      }
+
       // Keep room jobs reviewable until the enforcement service durably accepts
       // their immutable decision. A retry uses the same job-derived identity.
-      if (roomDeliveryRequired && automaticCloseDecision === undefined) {
-        await this.onRecordDecision({ decisionComponents, relatedActions, job, queueId, reviewerId, reviewerEmail, decisionReason });
+      if (roomDeliveryRequired && roomIntent) {
+        await this.onRecordDecision(roomIntent);
       }
       // logDecision() succeeded (now or previously), so call removeJob().
       const [removeJobStatus, removeJobErr] = await removeJob().then(
@@ -339,7 +411,11 @@ export default class JobDecisioning {
     // so we can skip the onRecordDecisionCall
     // TODO: start sending automatic close decisions when we are sending the
     // report decision callbacks
-    if (newDecisionStored && automaticCloseDecision === undefined && !roomDeliveryRequired) {
+    if (
+      newDecisionStored &&
+      automaticCloseDecision === undefined &&
+      !roomDeliveryRequired
+    ) {
       // TODO: use proper publishing to a durable queue and retry
       this.onRecordDecision({
         decisionComponents,

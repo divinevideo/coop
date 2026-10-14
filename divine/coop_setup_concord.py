@@ -40,7 +40,12 @@ def provision(gql, origin, reviewers):
         ('concord_ban_member', 'Ban in this community. Requires moderation manager. Does not ban the account platform-wide or from the Discord guild.', [message, member]),
         ('concord_unban_member', 'Remove this community ban. Does not restore removed content or alter platform-wide bans.', [message, member]),
     ]:
-        ensure('actions', name, 'createAction', 'CreateActionInput', 'MutateActionSuccessResponse', {'description': description, 'itemTypeIds': types, 'callbackUrl': origin + '/v1/decisions'})
+        parameters = [] if name == 'concord_remove_message' else [{
+            'name': 'discordGuildConfirmed', 'displayName': 'Also apply to the entire Discord server',
+            'description': 'Admin only: apply this ban or unban to the entire Discord server, not just this room. Leave off for community-only enforcement.',
+            'type': 'BOOLEAN', 'required': False, 'defaultValue': False,
+        }]
+        ensure('actions', name, 'createAction', 'CreateActionInput', 'MutateActionSuccessResponse', {'description': description, 'itemTypeIds': types, 'callbackUrl': origin + '/v1/decisions', 'parameters': parameters})
     return {'CONCORD_QUEUE_ID': queue, 'CONCORD_MESSAGE_TYPE_ID': message, 'CONCORD_MEMBER_TYPE_ID': member}
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

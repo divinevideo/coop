@@ -31,6 +31,10 @@ class ProvisionTest(unittest.TestCase):
             self.assertTrue(set(action['itemTypeIds']).issubset(room_ids))
             self.assertEqual(action['callbackUrl'], 'https://moderation.example/v1/decisions')
             self.assertNotIn('callbackUrlHeaders', action)
+            if action['name'] != 'concord_remove_message':
+                self.assertEqual(action['parameters'][0]['name'], 'discordGuildConfirmed')
+                self.assertIs(action['parameters'][0]['defaultValue'], False)
+                self.assertIn('entire Discord server', action['parameters'][0]['description'])
         for route in state['routingRules']: self.assertEqual(route['destinationQueueId'], queue['id'])
 
     def test_missing_staff_and_invalid_origin_fail_without_mutation(self):

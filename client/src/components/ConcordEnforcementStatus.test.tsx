@@ -59,7 +59,7 @@ test('keeps separate delivery states visible and hides evidence until requested'
   expect(
     screen.getByText('Acknowledged — verification pending'),
   ).toBeInTheDocument();
-  expect(screen.getByText('Failed')).toBeInTheDocument();
+  expect(screen.getByText(/^Failed/)).toBeInTheDocument();
   expect(screen.queryByText(data.content)).not.toBeInTheDocument();
   fireEvent.click(screen.getByText('View report evidence'));
   expect(screen.getByText(data.content)).toBeInTheDocument();

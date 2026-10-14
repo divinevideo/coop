@@ -291,13 +291,17 @@ export async function publishRoomDecision(
   )
     throw new Error('Room action permission or scope invalid');
   const executionId = uuidv5(
-    jsonStringify([
-      input.orgId,
-      input.correlationId,
-      input.actionId,
-      input.itemTypeId,
-      input.itemId,
-    ]),
+    jsonStringify(
+      input.correlationId.startsWith('manual-action-run:')
+        ? [input.orgId, input.correlationId]
+        : [
+            input.orgId,
+            input.correlationId,
+            input.actionId,
+            input.itemTypeId,
+            input.itemId,
+          ],
+    ),
     '7d6e67c4-c685-4a34-8d53-dd5ca90f1c43',
   );
   const result = parseRoomStatus(
