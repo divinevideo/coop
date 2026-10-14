@@ -1,4 +1,5 @@
 import { type Route } from '../utils/route-helpers.js';
+import ConcordRoutes from './concord/index.js';
 import ActionRoutes from './action/ActionRoutes.js';
 import ContentRoutes from './content/ContentRoutes.js';
 import GDPRRoutes from './gdpr/gdprRoutes.js';
@@ -20,6 +21,7 @@ export type Controller = {
 };
 
 export default {
+  Concord: ConcordRoutes,
   Items: ItemRoutes,
   Content: ContentRoutes,
   Reporting: ReportingRoutes,

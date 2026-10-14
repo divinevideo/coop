@@ -175,6 +175,7 @@ export default class JobDecisioning {
       });
     }
     const decisions = decisionComponents ?? [automaticCloseDecision];
+    let roomDeliveryRequired = false;
 
     // If the decision included some actionIds or policyIds, we want to verify
     // that those ids actually correspond to known actions/policies in the org
@@ -191,6 +192,8 @@ export default class JobDecisioning {
         ids: allActionIds,
         orgId,
       });
+      roomDeliveryRequired = validActions.some((action) => action.name.startsWith('concord_'));
+      if (roomDeliveryRequired && (validActions.length !== allActionIds.length || validActions.some((action) => !action.name.startsWith('concord_')) || decisions.some((decision) => decision.type !== 'CUSTOM_ACTION'))) throw new Error('Submit room enforcement separately from other actions');
       // We only throw if there aren't any valid actions.
       if (validActions.length === 0) {
         throw makeSubmittedJobActionNotFoundError({ shouldErrorSpan: true });
@@ -295,6 +298,11 @@ export default class JobDecisioning {
         };
       }
 
+      // Keep room jobs reviewable until the enforcement service durably accepts
+      // their immutable decision. A retry uses the same job-derived identity.
+      if (roomDeliveryRequired && automaticCloseDecision === undefined) {
+        await this.onRecordDecision({ decisionComponents, relatedActions, job, queueId, reviewerId, reviewerEmail, decisionReason });
+      }
       // logDecision() succeeded (now or previously), so call removeJob().
       const [removeJobStatus, removeJobErr] = await removeJob().then(
         () => ['SUCCESS'] as const,
@@ -331,7 +339,7 @@ export default class JobDecisioning {
     // so we can skip the onRecordDecisionCall
     // TODO: start sending automatic close decisions when we are sending the
     // report decision callbacks
-    if (newDecisionStored && automaticCloseDecision === undefined) {
+    if (newDecisionStored && automaticCloseDecision === undefined && !roomDeliveryRequired) {
       // TODO: use proper publishing to a durable queue and retry
       this.onRecordDecision({
         decisionComponents,

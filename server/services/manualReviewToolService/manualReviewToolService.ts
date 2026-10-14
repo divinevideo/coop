@@ -355,7 +355,7 @@ export class ManualReviewToolService {
   async enqueue(input: ManualReviewJobInput, queueId?: string) {
     const MAX_ENQUEUE_ATTEMPTS = 5;
 
-    await this.tracer.addActiveSpan(
+    return this.tracer.addActiveSpan(
       {
         resource: 'mrtService',
         operation: 'enqueue',
@@ -520,6 +520,7 @@ export class ManualReviewToolService {
           const { targetQueueForNewJob } = enqueueResult;
           this.onEnqueue(input, targetQueueForNewJob).catch(() => {});
         }
+        return enqueueResult;
       },
     );
   }

@@ -885,9 +885,10 @@ export default async function getBottle() {
           const nonNullActionsWithCustomMrtParams =
             actionsWithCustomMrtParams.filter((a) => a.action !== undefined);
 
+          const roomDelivery = actions.some((action) => action.name.startsWith('concord_'));
           const correlationId = toCorrelationId({
             type: 'mrt-decision',
-            id: uuidv1(),
+            id: roomDelivery ? job.id : uuidv1(),
           });
           const itemType = await container.getItemTypeEventuallyConsistent({
             orgId,
@@ -904,7 +905,7 @@ export default async function getBottle() {
             'submissionId' in item && !('itemType' in item)
               ? itemSubmissionWithTypeIdentifierToItemSubmission(item, itemType)
               : item;
-          actionPublisher
+          const publishing = actionPublisher
             .publishActions(
               nonNullActionsWithCustomMrtParams.map((action) => ({
                 // we can cast to non-undefined (!) because we know that
@@ -928,9 +929,15 @@ export default async function getBottle() {
                 targetItem: itemSubmission,
                 actorId,
                 actorEmail,
+                decisionReason: params.decisionReason,
               },
-            )
-            .catch((error) => {
+            );
+          if (roomDelivery) {
+            const outcomes = await publishing;
+            if (outcomes.some((outcome) => !outcome.success)) throw new Error('Room enforcement was not durably accepted');
+            return;
+          }
+          void publishing.catch((error) => {
               container.Tracer.addSpan(
                 { resource: 'actionPublisher', operation: 'publishAction' },
                 (span) => {
@@ -1121,6 +1128,7 @@ export default async function getBottle() {
                   item: job.payload.item,
                   actorId: reviewerId,
                   actorEmail: reviewerEmail,
+                  decisionReason,
                 });
                 break;
               case 'SUBMIT_NCMEC_REPORT':

@@ -25,6 +25,8 @@ import { asyncIterableToArray } from '../utils/collections.js';
 import { getSourceType, type CorrelationId } from '../utils/correlationIds.js';
 import { jsonStringify } from '../utils/encoding.js';
 import { assertUnreachable, safePick, withRetries } from '../utils/misc.js';
+import { roomActor } from '../routes/concord/authorization.js';
+import { loadConcordConfig, publishRoomDecision } from '../routes/concord/service.js';
 import { type RuleEnvironment } from './RuleEngine.js';
 
 export type ActionExecutionData<
@@ -121,6 +123,7 @@ class ActionPublisher {
     private ncmecService: Dependencies['NcmecService'],
     private itemInvestigationService: Dependencies['ItemInvestigationService'],
     private userStrikeService: Dependencies['UserStrikeService'],
+    private userAPIDataSource?: Dependencies['UserAPIDataSource'],
   ) {}
 
   /**
@@ -233,7 +236,8 @@ class ActionPublisher {
                 reportedItems,
                 relatedRules,
                 customMrtApiParamDecisionPayload,
-                actorNote,
+                actorNote ?? executionContext.decisionReason,
+                actorId,
               );
             },
           );
@@ -303,6 +307,7 @@ class ActionPublisher {
       string | boolean | unknown
     >,
     actorNote?: string,
+    actorId?: string,
   ): Promise<boolean> {
     return this.tracer.addActiveSpan(
       { resource: 'actionPublisher', operation: 'publishAction' },
@@ -333,6 +338,18 @@ class ActionPublisher {
         try {
           switch (action.actionType) {
             case ActionType.CUSTOM_ACTION:
+              if (action.name.startsWith('concord_')) {
+                const config = loadConcordConfig(process.env);
+                if (action.callbackUrl !== config.origin + '/v1/decisions' || !this.userAPIDataSource) return false;
+                const item = await getFullItem();
+                const caseId = item?.data.case_id;
+                if (typeof caseId !== 'string') return false;
+                await publishRoomDecision(config, {
+                  fetchHTTP: this.fetchHTTP,
+                  getActor: (id, orgId) => roomActor({ UserAPIDataSource: this.userAPIDataSource!, ManualReviewToolService: this.manualReviewToolService }, config, id, orgId),
+                }, { orgId, actionId: action.id, actionName: action.name, itemId: targetItem.itemId, itemTypeId: targetItem.itemType.id, itemTypeName: targetItem.itemType.name, caseId, correlationId: String(correlationId), actorId, note: actorNote, parameters: customMrtApiParamDecisionPayload?.discordGuildConfirmed === undefined ? {} : { discordGuildConfirmed: customMrtApiParamDecisionPayload.discordGuildConfirmed } });
+                return true;
+              }
               const customHeaders = action.callbackUrlHeaders;
               const customBody = action.callbackUrlBody;
 
@@ -592,6 +609,7 @@ export default inject(
     'NcmecService',
     'ItemInvestigationService',
     'UserStrikeService',
+    'UserAPIDataSource',
   ],
   ActionPublisher,
 );

@@ -6,7 +6,6 @@
  * on each iteration instead of just the current one.
  */
 
-import getBottle, { type Dependencies } from '../iocContainer/index.js';
 import { ActionType } from '../services/moderationConfigService/index.js';
 import { type CorrelationId } from '../utils/correlationIds.js';
 import { jsonParse } from '../utils/encoding.js';
@@ -67,24 +66,11 @@ function makeIsolatedPublisher(opts: { fetchHTTP: jest.Mock }) {
 }
 
 describe('ActionPublisher', () => {
-  let container: Dependencies;
-  let actionPublisher: ActionPublisher;
-
-  beforeAll(async () => {
-    ({ container } = await getBottle());
-    actionPublisher = container.ActionPublisher;
-  });
-
-  afterAll(async () => {
-    await container.closeSharedResourcesForShutdown();
-  });
-
   describe('publishActions', () => {
     it('should log each action execution exactly once (not N² times)', async () => {
-      const logSpy = jest.spyOn(
-        container.ActionExecutionLogger,
-        'logActionExecutions',
-      );
+      const { publisher: actionPublisher, logActionExecutions: logSpy } = makeIsolatedPublisher({
+        fetchHTTP: jest.fn().mockResolvedValue({ ok: true, status: 204 }),
+      });
 
       // Use 2 actions to catch the N² bug
       // With the bug: 2 actions → 2² = 4 log entries
@@ -294,10 +280,9 @@ describe('ActionPublisher', () => {
     });
 
     it('forwards moderator-supplied parameter values and actor note to the logger', async () => {
-      const logSpy = jest.spyOn(
-        container.ActionExecutionLogger,
-        'logActionExecutions',
-      );
+      const { publisher: actionPublisher, logActionExecutions: logSpy } = makeIsolatedPublisher({
+        fetchHTTP: jest.fn().mockResolvedValue({ ok: true, status: 204 }),
+      });
 
       const triggeredActions = [
         {
@@ -340,7 +325,7 @@ describe('ActionPublisher', () => {
         actorNote: 'Repeat offender',
       };
 
-      await container.ActionPublisher.publishActions(
+      await actionPublisher.publishActions(
         triggeredActions,
         executionContext,
       );
