@@ -939,7 +939,7 @@ export default async function getBottle() {
             if (outcomes.some((outcome) => !outcome.success)) throw new Error('Room enforcement was not durably accepted');
             return;
           }
-          void publishing.catch((error) => {
+          publishing.catch((error) => {
               container.Tracer.addSpan(
                 { resource: 'actionPublisher', operation: 'publishAction' },
                 (span) => {
