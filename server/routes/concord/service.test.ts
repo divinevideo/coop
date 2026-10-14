@@ -1,4 +1,6 @@
 /* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
+import type { RoomRequest } from './service.js';
+
 import { UserRole } from '../../models/types/permissioning.js';
 import { tryJsonParse } from '../../utils/encoding.js';
 import {
@@ -133,7 +135,7 @@ test('internal enforcement origin is fixed, never an arbitrary cleartext endpoin
 
 test('cross-cluster requests authenticate to Access without forwarding credentials on redirects', async () => {
   const fetchHTTP = jest.fn(
-    async (_request: import('./service.js').RoomRequest) => ({
+    async (_request: RoomRequest) => ({
       ok: true,
       status: 202,
       body: {
