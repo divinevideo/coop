@@ -6,6 +6,7 @@ import { type JsonObject } from 'type-fest';
 
 import { type Dependencies } from '../../../iocContainer/index.js';
 import { filterNullOrUndefined } from '../../../utils/collections.js';
+import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
 import {
   CoopError,
   ErrorType,
@@ -132,6 +133,19 @@ export type OnRecordDecisionInput = {
   reviewerEmail: string;
   decisionReason?: string;
 };
+
+// Compare the representation Postgres stores in JSONB: undefined object fields
+// disappear, while object key order is immaterial. Real action/scope changes
+// must still fail the immutable-intent check.
+function samePersistedJson(
+  left: readonly unknown[],
+  right: readonly unknown[],
+) {
+  return isDeepStrictEqual(
+    jsonParse(jsonStringify(left)),
+    jsonParse(jsonStringify(right)),
+  );
+}
 
 export default class JobDecisioning {
   constructor(
@@ -347,8 +361,8 @@ export default class JobDecisioning {
             !wasRoomDecision ||
             !prior.reviewer_id ||
             prior.queue_id !== queueId ||
-            !isDeepStrictEqual(prior.decision_components, decisions) ||
-            !isDeepStrictEqual(prior.related_actions, relatedActions) ||
+            !samePersistedJson(prior.decision_components, decisions) ||
+            !samePersistedJson(prior.related_actions, relatedActions) ||
             (prior.decision_reason ?? undefined) !== decisionReason
           ) {
             throw new Error(

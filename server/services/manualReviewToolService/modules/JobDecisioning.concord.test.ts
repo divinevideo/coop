@@ -1,4 +1,5 @@
 /* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
+import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
 import JobDecisioning from './JobDecisioning.js';
 
 test('a room job stays reviewable when durable enforcement acceptance fails', async () => {
@@ -67,8 +68,8 @@ test('a room job stays reviewable when durable enforcement acceptance fails', as
   expect(calls).toEqual(['log', 'deliver']);
 });
 
-test.each(['action', 'reason', 'reviewer', 'same'])(
-  'room retry preserves recorded intent after response loss: %s',
+test.each(['action', 'reason', 'parameters', 'related', 'reviewer', 'same'])(
+  'room retry preserves recorded intent after JSON storage and response loss: %s',
   async (change) => {
     const job = {
       id: 'synthetic:10000000-0000-4000-8000-000000000002',
@@ -91,7 +92,8 @@ test.each(['action', 'reason', 'reviewer', 'same'])(
               throw new Error(
                 'duplicate key value violates unique constraint "manual_review_decisions_pkey"',
               );
-            recorded = value;
+            // JSONB drops undefined object fields instead of retaining JS objects.
+            recorded = jsonParse(jsonStringify(value));
           },
         };
       },
@@ -141,6 +143,8 @@ test.each(['action', 'reason', 'reviewer', 'same'])(
           policies: [],
           itemIds: ['case'],
           itemTypeId: 'room-type',
+          // The GraphQL resolver creates this own property even when absent.
+          actionIdsToMrtApiParamDecisionPayload: undefined,
         },
       ],
     };
@@ -153,15 +157,37 @@ test.each(['action', 'reason', 'reviewer', 'same'])(
         ? { decisionComponents: [{ type: 'IGNORE' }] }
         : change === 'reason'
           ? { decisionReason: 'Changed intent' }
-          : change === 'reviewer'
+          : change === 'parameters'
             ? {
-                reviewerId: 'different-staff',
-                reviewerEmail: 'different@example.invalid',
+                decisionComponents: [
+                  {
+                    ...input.decisionComponents[0],
+                    actionIdsToMrtApiParamDecisionPayload: {
+                      'room-action': { discordGuildConfirmed: true },
+                    },
+                  },
+                ],
               }
-            : {}),
+            : change === 'related'
+              ? {
+                  relatedActions: [
+                    {
+                      actionIds: ['room-action'],
+                      itemIds: ['other-case'],
+                      itemTypeId: 'room-type',
+                      policyIds: [],
+                    },
+                  ],
+                }
+              : change === 'reviewer'
+                ? {
+                    reviewerId: 'different-staff',
+                    reviewerEmail: 'different@example.invalid',
+                  }
+                : {}),
     };
     await service.submitDecision(retry).catch(() => {});
-    if (change === 'action' || change === 'reason') {
+    if (['action', 'reason', 'parameters', 'related'].includes(change)) {
       expect(publish).toHaveBeenCalledTimes(1);
       expect(queue.removeJob).not.toHaveBeenCalled();
     } else {
