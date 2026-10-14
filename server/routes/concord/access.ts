@@ -52,6 +52,7 @@ export function accessVerifier(
     });
     if (
       typeof verified === 'string' ||
+      !Number.isSafeInteger(verified.exp) ||
       typeof verified.email !== 'string' ||
       verified.email.toLowerCase() !== email.toLowerCase()
     )

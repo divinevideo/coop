@@ -47,3 +47,24 @@ test('staff requests require a signed Access token for this app and session iden
   ).rejects.toThrow();
   expect(fetchHTTP).toHaveBeenCalledTimes(1);
 });
+
+test('Access tokens without an expiry cannot authorize staff', async () => {
+  const verify = accessVerifier(
+    { accessIssuer: issuer, accessAudience: audience },
+    async () => ({
+      ok: true,
+      status: 200,
+      body: {
+        keys: [
+          { ...pair.publicKey.export({ format: 'jwk' }), kid: 'synthetic' },
+        ],
+      },
+    }),
+  );
+  const token = jwt.sign(
+    { email: 'synthetic@example.invalid' },
+    pair.privateKey,
+    { algorithm: 'RS256', keyid: 'synthetic', issuer, audience },
+  );
+  await expect(verify(token, 'synthetic@example.invalid')).rejects.toThrow();
+});

@@ -23,6 +23,8 @@ export type ConcordConfig = {
   accessIssuer: string;
   accessAudience: string;
   queueId: string;
+  accessClientId?: string;
+  accessClientSecret?: string;
 };
 export type RoomAction = 'remove_message' | 'ban_member' | 'unban_member';
 export type RoomRequest = {
@@ -66,7 +68,15 @@ export function loadConcordConfig(env: NodeJS.ProcessEnv): ConcordConfig {
     coopOrigin = require('CONCORD_COOP_ORIGIN'),
     accessIssuer = require('CONCORD_ACCESS_ISSUER'),
     hmacKey = require('CONCORD_MODERATION_HMAC_KEY');
-  for (const value of [origin, coopOrigin, accessIssuer])
+  // This fixed service is private to the cluster and protected by NetworkPolicy.
+  // Browser/Access origins and every external enforcement origin still require TLS.
+  const internalOrigin =
+    'http://concord-moderation.armada-chat.svc.cluster.local:8080';
+  for (const value of [
+    coopOrigin,
+    accessIssuer,
+    ...(origin === internalOrigin ? [] : [origin]),
+  ])
     if (new URL(value).protocol !== 'https:' || new URL(value).origin !== value)
       throw new Error('Invalid room service origin');
   if (
@@ -74,7 +84,16 @@ export function loadConcordConfig(env: NodeJS.ProcessEnv): ConcordConfig {
     !new URL(accessIssuer).hostname.endsWith('.cloudflareaccess.com')
   )
     throw new Error('Invalid room service credential configuration');
+  const accessClientId = env.CONCORD_ACCESS_CLIENT_ID,
+    accessClientSecret = env.CONCORD_ACCESS_CLIENT_SECRET;
+  if (
+    Boolean(accessClientId) !== Boolean(accessClientSecret) ||
+    (accessClientId && new URL(origin).protocol !== 'https:')
+  )
+    throw new Error('Invalid service Access credentials');
   return {
+    accessClientId,
+    accessClientSecret,
     origin,
     coopOrigin,
     accessIssuer,
@@ -149,6 +168,12 @@ export async function roomRequest(
     method,
     ...(body ? { body } : {}),
     headers: {
+      ...(config.accessClientId && config.accessClientSecret
+        ? {
+            'CF-Access-Client-Id': config.accessClientId,
+            'CF-Access-Client-Secret': config.accessClientSecret,
+          }
+        : {}),
       'content-type': 'application/json',
       'x-coop-actor': staff,
       'x-coop-timestamp': timestamp,
