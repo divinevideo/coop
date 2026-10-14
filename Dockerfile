@@ -7,11 +7,9 @@
 # Docker's cache will let us skip installs when the dependencies haven't changed.
 # We build on debian because it has fewer dependency issues than Alpine for our
 # native modules, and we don't really care about the larger image size.
-FROM node:24.14.1-bullseye-slim AS server_base
+FROM node:24.14.1-bookworm-slim@sha256:b506e7321f176aae77317f99d67a24b272c1f09f1d10f1761f2773447d8da26c AS server_base
 WORKDIR /app
-# Bullseye security packages have moved off the live mirror.
-RUN sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' /etc/apt/sources.list \
-    && apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
 COPY ["server/package.json", "server/package-lock.json", "./"]
 RUN npm ci
@@ -21,10 +19,9 @@ FROM server_base AS build_backend
 RUN npm run build
 
 # make a shared layer that can be the base for worker and api images.
-FROM node:24.14.1-bullseye-slim AS backend_base
+FROM node:24.14.1-bookworm-slim@sha256:b506e7321f176aae77317f99d67a24b272c1f09f1d10f1761f2773447d8da26c AS backend_base
 WORKDIR /app
-RUN sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' /etc/apt/sources.list \
-    && apt-get update && apt-get install dumb-init
+RUN apt-get update && apt-get install -y --no-install-recommends dumb-init && rm -rf /var/lib/apt/lists/*
 COPY --from=build_backend ["/app/package.json", "/app/package-lock.json", "./"]
 RUN npm ci --omit=dev
 COPY --from=build_backend /app/transpiled ./
@@ -52,7 +49,7 @@ CMD ["node", "bin/run-worker-or-job.js"]
 # The K8s db-migrate Job provides the command at runtime (e.g.,
 #   npm run db:update -- --env staging --db api-server-pg
 # ). Falls back to --help if no command is given.
-FROM node:24.14.1-bullseye-slim AS build_migrator
+FROM node:24.14.1-bookworm-slim@sha256:b506e7321f176aae77317f99d67a24b272c1f09f1d10f1761f2773447d8da26c AS build_migrator
 WORKDIR /app
 RUN groupadd -r migrator && useradd -r -g migrator -u 1001 migrator
 ENV NPM_CONFIG_CACHE=/tmp/.npm

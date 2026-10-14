@@ -1,5 +1,5 @@
 # Build this fork's tested UI; the upstream asset repackager cannot carry it.
-FROM node:24.14.1-bullseye-slim@sha256:7016825698f5bfb8e9cb89d98d10a33e5796b19cc01ec4da131e9aa478f2cc0c AS build
+FROM node:24.14.1-bookworm-slim@sha256:b506e7321f176aae77317f99d67a24b272c1f09f1d10f1761f2773447d8da26c AS build
 WORKDIR /app
 COPY client/package.json client/package-lock.json ./
 RUN npm ci
