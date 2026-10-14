@@ -43,3 +43,24 @@ but the adapter cannot execute.
 - **Long-term:** this setup should be applied automatically as a post-deploy **Job in
   iac-coreconfig** (like `db-migrate`), with these scripts as the source — so COOP org
   config becomes GitOps-reproducible per environment rather than hand-run.
+
+## Concord room enforcement
+
+`coop-setup-concord.sh` creates separate room types, actions, routing and the
+Room Review queue. It leaves platform-wide moderation unchanged. Only explicit
+admin confirmation requests an entire Discord-server ban; the default is
+community-only. The server independently rechecks current staff authority.
+
+Build all matching artifacts from a clean, committed checkout with
+`bash divine/build-concord-images.sh`. This builds the existing source server,
+worker and migrator targets, plus `divine/coop-client-source/Dockerfile`. The
+existing upstream static-asset repackager does not contain these UI changes.
+The script does not push or deploy. Deploy the receipt migration before the
+matching API/worker/client, and configure the private enforcement service and
+Access policies through GitOps before enabling the POC.
+
+Room decisions require a reason. Manual submissions retain an opaque operation
+ID until acceptance is confirmed; retry the original input after an uncertain
+response. Queue retries resume the recorded decision and original staff actor;
+a changed action or reason is rejected. The three delivery rows remain separate:
+queued and acknowledged do not mean verified enforcement.

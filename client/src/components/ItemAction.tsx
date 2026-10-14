@@ -22,6 +22,7 @@ import CoopModal from '@/webpages/dashboard/components/CoopModal';
 import PolicyDropdown from '@/webpages/dashboard/components/PolicyDropdown';
 
 import ConcordEnforcementStatus from './ConcordEnforcementStatus';
+import { completeRoomOperation, roomOperation } from './roomOperation';
 
 const { Option } = Select;
 
@@ -55,6 +56,14 @@ export default function ItemAction(props: {
           'One or more actions failed. The callback URL may have returned an error. If your org requires a policy for decisions, select a policy and try again.',
         );
       } else {
+        if (
+          eligibleActions.some(
+            (action) =>
+              selectedActionIds.includes(action.id) &&
+              action.name.startsWith('concord_'),
+          )
+        )
+          completeRoomOperation(itemIdentifier);
         setModalBody(
           eligibleActions.some(
             (action) =>
@@ -208,6 +217,13 @@ export default function ItemAction(props: {
       bulkAction({
         variables: {
           input: {
+            operationId: eligibleActions.some(
+              (action) =>
+                selectedActionIds.includes(action.id) &&
+                action.name.startsWith('concord_'),
+            )
+              ? roomOperation(itemIdentifier)
+              : undefined,
             itemTypeId: itemIdentifier.typeId,
             actionIds: selectedActionIds,
             itemIds: [itemIdentifier.id],
@@ -230,8 +246,8 @@ export default function ItemAction(props: {
       }),
     [
       bulkAction,
-      itemIdentifier.id,
-      itemIdentifier.typeId,
+      eligibleActions,
+      itemIdentifier,
       selectedActionIds,
       selectedPolicyIds,
       parametersByActionId,

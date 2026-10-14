@@ -1292,6 +1292,7 @@ export type GQLExecuteBulkActionInput = {
    * execution audit log.
    */
   readonly note?: InputMaybe<Scalars['String']['input']>;
+  readonly operationId?: InputMaybe<Scalars['String']['input']>;
   /**
    * Optional map of `actionId` -> `{ paramName: value }` carrying
    * moderator-supplied runtime parameter values. Each map is validated against
