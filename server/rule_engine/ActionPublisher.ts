@@ -346,7 +346,7 @@ class ActionPublisher {
                 if (typeof caseId !== 'string') return false;
                 await publishRoomDecision(config, {
                   fetchHTTP: this.fetchHTTP,
-                  getActor: (id, orgId) => roomActor({ UserAPIDataSource: this.userAPIDataSource!, ManualReviewToolService: this.manualReviewToolService }, config, id, orgId),
+                  getActor: async (id, orgId) => roomActor({ UserAPIDataSource: this.userAPIDataSource!, ManualReviewToolService: this.manualReviewToolService }, config, id, orgId),
                 }, { orgId, actionId: action.id, actionName: action.name, itemId: targetItem.itemId, itemTypeId: targetItem.itemType.id, itemTypeName: targetItem.itemType.name, caseId, correlationId: String(correlationId), actorId, note: actorNote, parameters: customMrtApiParamDecisionPayload?.discordGuildConfirmed === undefined ? {} : { discordGuildConfirmed: customMrtApiParamDecisionPayload.discordGuildConfirmed } });
                 return true;
               }
