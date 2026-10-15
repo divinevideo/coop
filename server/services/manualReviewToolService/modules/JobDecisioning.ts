@@ -5,6 +5,7 @@ import { match } from 'ts-pattern';
 import { type JsonObject } from 'type-fest';
 
 import { type Dependencies } from '../../../iocContainer/index.js';
+import { validRoomReason } from '../../../routes/concord/service.js';
 import { filterNullOrUndefined } from '../../../utils/collections.js';
 import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
 import {
@@ -239,6 +240,10 @@ export default class JobDecisioning {
       }
     }
 
+    if (roomDeliveryRequired && !validRoomReason(decisionReason)) {
+      throw new Error('Room actions require a reason of 1 to 2048 characters');
+    }
+
     const removeJob = async () =>
       this.queueOps.removeJob({
         orgId,
@@ -258,6 +263,7 @@ export default class JobDecisioning {
         relatedActions,
         enqueueSourceInfo: job.enqueueSourceInfo,
         decisionReason,
+        roomDeliveryRequired,
       });
 
     // When a job decision is submitted, we want to record the decision (in pg)
@@ -357,25 +363,38 @@ export default class JobDecisioning {
           .selectAll()
           .executeTakeFirst();
         if (!prior) throw new Error('Recorded decision unavailable');
-        const ids = [
-          ...new Set([
-            ...prior.decision_components.flatMap((part) =>
-              part.type === 'CUSTOM_ACTION'
-                ? part.actions.map((action) => action.id)
-                : [],
-            ),
-            ...prior.related_actions.flatMap((related) => related.actionIds),
-          ]),
-        ];
-        const originalActions = ids.length
-          ? await this.getCustomActionsByIds({ orgId, ids })
-          : [];
-        if (originalActions.length !== ids.length)
-          throw new Error('Recorded action configuration unavailable');
-        const wasRoomDecision = originalActions.some((action) =>
-          action.name.startsWith('concord_'),
-        );
-        if (roomDeliveryRequired || wasRoomDecision) {
+        // New room records retain their delivery classification independently of
+        // mutable action configuration. Legacy room records use their item type;
+        // ordinary queues must not depend on retaining deleted action rows.
+        const wasRoomJob =
+          prior.job_payload.roomDeliveryRequired === true ||
+          ['concord_message', 'concord_member'].includes(
+            (
+              await this.moderationConfigService.getItemType({
+                orgId,
+                itemTypeSelector: job.payload.item.itemTypeIdentifier,
+              })
+            )?.name ?? '',
+          );
+        if (roomDeliveryRequired || wasRoomJob) {
+          const ids = [
+            ...new Set([
+              ...prior.decision_components.flatMap((part) =>
+                part.type === 'CUSTOM_ACTION'
+                  ? part.actions.map((action) => action.id)
+                  : [],
+              ),
+              ...prior.related_actions.flatMap((related) => related.actionIds),
+            ]),
+          ];
+          const originalActions = ids.length
+            ? await this.getCustomActionsByIds({ orgId, ids })
+            : [];
+          if (originalActions.length !== ids.length)
+            throw new Error('Recorded action configuration unavailable');
+          const wasRoomDecision = originalActions.some((action) =>
+            action.name.startsWith('concord_'),
+          );
           if (
             !wasRoomDecision ||
             !prior.reviewer_id ||
@@ -491,6 +510,7 @@ export default class JobDecisioning {
     relatedActions: ManualReviewDecisionRelatedAction[];
     enqueueSourceInfo?: ManualReviewJobEnqueueSourceInfo;
     decisionReason?: string;
+    roomDeliveryRequired: boolean;
   }) {
     const {
       id,
@@ -502,6 +522,7 @@ export default class JobDecisioning {
       relatedActions,
       enqueueSourceInfo,
       decisionReason,
+      roomDeliveryRequired,
     } = opts;
 
     const itemType = await this.moderationConfigService.getItemType({
@@ -525,7 +546,9 @@ export default class JobDecisioning {
       .insertInto('manual_review_tool.manual_review_decisions')
       .values({
         id,
-        job_payload: job,
+        job_payload: roomDeliveryRequired
+          ? { ...job, roomDeliveryRequired: true }
+          : job,
         queue_id: queueId,
         reviewer_id: reviewerId,
         org_id: orgId,

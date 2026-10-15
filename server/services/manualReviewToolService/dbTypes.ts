@@ -78,7 +78,9 @@ export type ManualReviewToolServicePg = {
   };
   'manual_review_tool.manual_review_decisions': {
     id: string;
-    job_payload: StoredManualReviewJob | ManualReviewAppealJob;
+    job_payload: (StoredManualReviewJob | ManualReviewAppealJob) & {
+      roomDeliveryRequired?: true;
+    };
     queue_id: string;
     reviewer_id: string | null;
     org_id: string;
