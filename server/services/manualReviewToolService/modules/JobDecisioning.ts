@@ -396,29 +396,35 @@ export default class JobDecisioning {
             action.name.startsWith('concord_'),
           );
           if (
-            !wasRoomDecision ||
-            !prior.reviewer_id ||
-            prior.queue_id !== queueId ||
-            !samePersistedJson(prior.decision_components, decisions) ||
-            !samePersistedJson(prior.related_actions, relatedActions) ||
-            (prior.decision_reason ?? undefined) !== decisionReason
+            roomDeliveryRequired ||
+            wasRoomDecision ||
+            prior.job_payload.roomDeliveryRequired === true
           ) {
-            throw new Error(
-              'Room decision already recorded with a different intent',
-            );
+            if (
+              !wasRoomDecision ||
+              !prior.reviewer_id ||
+              prior.queue_id !== queueId ||
+              !samePersistedJson(prior.decision_components, decisions) ||
+              !samePersistedJson(prior.related_actions, relatedActions) ||
+              (prior.decision_reason ?? undefined) !== decisionReason
+            ) {
+              throw new Error(
+                'Room decision already recorded with a different intent',
+              );
+            }
+            roomDeliveryRequired = true;
+            roomIntent = {
+              decisionComponents: prior.decision_components,
+              relatedActions: prior.related_actions,
+              job,
+              queueId: prior.queue_id,
+              reviewerId: prior.reviewer_id,
+              // Room publication resolves the original actor from current server-side
+              // staff records. Never attribute this retry to the new session's email.
+              reviewerEmail: '',
+              decisionReason: prior.decision_reason ?? undefined,
+            };
           }
-          roomDeliveryRequired = true;
-          roomIntent = {
-            decisionComponents: prior.decision_components,
-            relatedActions: prior.related_actions,
-            job,
-            queueId: prior.queue_id,
-            reviewerId: prior.reviewer_id,
-            // Room publication resolves the original actor from current server-side
-            // staff records. Never attribute this retry to the new session's email.
-            reviewerEmail: '',
-            decisionReason: prior.decision_reason ?? undefined,
-          };
         }
       }
 
