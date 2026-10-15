@@ -7,6 +7,7 @@ import _ from 'lodash';
 import { type Opaque } from 'type-fest';
 
 import { type Dependencies } from '../../iocContainer/index.js';
+import { type StaffActor } from '../../routes/concord/service.js';
 import { type ConsumerDirectives } from '../../lib/cache/index.js';
 import {
   type Invoker,
@@ -300,6 +301,7 @@ export class ManualReviewToolService {
       input: ManualReviewJobInput | ManualReviewAppealJobInput,
       queueId: string,
     ) => Promise<void>,
+    getRoomActor?: (id: string, orgId: string) => Promise<StaffActor>,
   ) {
     this.queueOps = new QueueOperations(
       pgQuery,
@@ -332,6 +334,7 @@ export class ManualReviewToolService {
       onRecordDecision,
       moderationConfigService,
       this.tracer,
+      getRoomActor,
     );
     this.jobRendering = new JobRendering(pgQuery);
     this.decisionAnalytics = new DecisionAnalytics(pgQueryReadReplica);
