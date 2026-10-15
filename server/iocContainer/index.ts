@@ -18,6 +18,7 @@ import { type JsonObject, type ReadonlyDeep } from 'type-fest';
 import { v1 as uuidv1 } from 'uuid';
 
 import makeDb from '../models/index.js';
+import { assertRoomActionConfigurationAvailable, assertRoomRelatedItemTypeAvailable } from '../services/manualReviewToolService/index.js';
 import { roomActor } from '../routes/concord/authorization.js';
 import { loadConcordConfig } from '../routes/concord/service.js';
 import type { IActionExecutionsAdapter } from '../plugins/warehouse/queries/IActionExecutionsAdapter.js';
@@ -836,6 +837,7 @@ export default async function getBottle() {
         reviewerId,
         reviewerEmail,
         decisionReason,
+        roomDeliveryRequired,
       }) {
         const { orgId } = job;
         const { itemId, itemTypeIdentifier, data } = job.payload.item;
@@ -887,7 +889,9 @@ export default async function getBottle() {
           const nonNullActionsWithCustomMrtParams =
             actionsWithCustomMrtParams.filter((a) => a.action !== undefined);
 
-          const roomDelivery = actions.some((action) => action.name.startsWith('concord_'));
+          if (roomDeliveryRequired)
+            assertRoomActionConfigurationAvailable(actionIds, actions);
+          const roomDelivery = roomDeliveryRequired || actions.some((action) => action.name.startsWith('concord_'));
           const correlationId = toCorrelationId({
             type: 'mrt-decision',
             id: roomDelivery ? job.id : uuidv1(),
@@ -1355,6 +1359,8 @@ export default async function getBottle() {
             });
 
             if (!itemType) {
+              if (roomDeliveryRequired)
+                assertRoomRelatedItemTypeAvailable(itemType);
               return;
             }
             const decisionActions = actionIds.map((actionId) => ({
