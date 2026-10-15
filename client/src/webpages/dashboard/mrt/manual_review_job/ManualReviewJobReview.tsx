@@ -9,6 +9,7 @@ import { Button, Dropdown, Input, Select, Tooltip } from 'antd';
 import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { Helmet } from 'react-helmet-async';
 import { useNavigate, useParams } from 'react-router-dom';
+import { type JsonObject } from 'type-fest';
 
 import ComponentLoading from '../../../../components/common/ComponentLoading';
 import CopyTextComponent from '../../../../components/common/CopyTextComponent';
@@ -1782,6 +1783,15 @@ function ManualReviewJobReviewImpl(props: {
                         relatedItemActions: selectedRelatedActions.map(
                           (action) => ({
                             actionIds: [action.action.id],
+                            actionIdsToMrtApiParamDecisionPayload:
+                              action.customMrtApiParamDecisionPayload == null
+                                ? undefined
+                                : {
+                                    [action.action.id]:
+                                      // Parameter form values are JSON; the store
+                                      // uses unknown to support custom controls.
+                                      action.customMrtApiParamDecisionPayload as JsonObject,
+                                  },
                             itemIds: [action.target.identifier.itemId],
                             itemTypeId: action.target.identifier.itemTypeId,
                             policyIds: action.policies.map(

@@ -7,8 +7,8 @@ import { type JsonObject } from 'type-fest';
 import { type Dependencies } from '../../../iocContainer/index.js';
 import {
   object,
-  validRoomReason,
   validateRoomActionPermission,
+  validRoomReason,
   type StaffActor,
 } from '../../../routes/concord/service.js';
 import { filterNullOrUndefined } from '../../../utils/collections.js';
@@ -33,6 +33,7 @@ import type QueueOperations from './QueueOperations.js';
 import { jobIdToGuid } from './QueueOperations.js';
 
 export type ManualReviewDecisionRelatedAction = {
+  actionIdsToMrtApiParamDecisionPayload?: JsonObject | null;
   actionIds: readonly string[];
   itemIds: readonly string[];
   itemTypeId: string;
@@ -101,7 +102,8 @@ export type ManualReviewDecisionComponent =
     };
 
 export type ManualReviewDecisionType =
-  ManualReviewDecisionComponent['type'] | 'RELATED_ACTION';
+  | ManualReviewDecisionComponent['type']
+  | 'RELATED_ACTION';
 
 export type SubmitDecisionInput = {
   queueId: string;
@@ -261,10 +263,12 @@ export default class JobDecisioning {
         }
         for (const related of relatedActions) {
           for (const id of related.actionIds) {
+            const parameters =
+              related.actionIdsToMrtApiParamDecisionPayload?.[id];
             validateRoomActionPermission(
               actor,
               validActions.find((action) => action.id === id)!.name,
-              {},
+              parameters === undefined ? {} : object(parameters),
             );
           }
         }

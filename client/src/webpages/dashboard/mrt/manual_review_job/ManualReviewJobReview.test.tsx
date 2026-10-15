@@ -74,6 +74,7 @@ vi.mock('./v2/ManualReviewJobContentView', () => ({
               displayName: 'Synthetic member',
             },
             policies: [],
+            customMrtApiParamDecisionPayload: { discordGuildConfirmed: true },
           },
         ])
       }
@@ -195,6 +196,31 @@ test('a related room action also requires a reason when the primary action is Ig
   ).toBeInTheDocument();
   fireEvent.click(screen.getByText('Submit'));
   expect(hooks.submit).not.toHaveBeenCalled();
+});
+
+test('related room action preserves explicit server scope in the submitted intent', () => {
+  review();
+  fireEvent.click(screen.getByText('Ignore'));
+  fireEvent.click(screen.getByText('Select related room action'));
+  fireEvent.change(screen.getByPlaceholderText('Reason for decision'), {
+    target: { value: 'Synthetic scope reason' },
+  });
+  fireEvent.click(screen.getByText('Submit'));
+  expect(hooks.submit).toHaveBeenCalledWith(
+    expect.objectContaining({
+      variables: {
+        input: expect.objectContaining({
+          relatedItemActions: [
+            expect.objectContaining({
+              actionIdsToMrtApiParamDecisionPayload: {
+                'room-related': { discordGuildConfirmed: true },
+              },
+            }),
+          ],
+        }),
+      },
+    }),
+  );
 });
 
 test('ordinary actions keep the optional reason behavior when the org setting is disabled', () => {
