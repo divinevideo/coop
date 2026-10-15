@@ -1,6 +1,6 @@
 /* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
-import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
 import { UserRole } from '../../../models/types/permissioning.js';
+import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
 import JobDecisioning from './JobDecisioning.js';
 
 const getRoomActor = async (id: string, orgId: string) => ({
@@ -238,6 +238,9 @@ test('related room actions retain the job and original intent until acceptance',
     relatedActions: [
       {
         actionIds: ['room-ban'],
+        actionIdsToMrtApiParamDecisionPayload: {
+          'room-ban': { discordGuildConfirmed: true },
+        },
         itemIds: ['case'],
         itemTypeId: 'member-type',
         policyIds: [],

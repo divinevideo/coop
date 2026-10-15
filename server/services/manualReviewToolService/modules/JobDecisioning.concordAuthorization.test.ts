@@ -2,7 +2,14 @@
 import { UserRole } from '../../../models/types/permissioning.js';
 import JobDecisioning from './JobDecisioning.js';
 
-test.each(['primary_ban', 'related_ban', 'guild_scope', 'malformed_scope'])(
+test.each([
+  'primary_ban',
+  'related_ban',
+  'guild_scope',
+  'malformed_scope',
+  'related_guild_scope',
+  'related_malformed_scope',
+])(
   'room authorization and scope are checked before recording intent: %s',
   async (kind) => {
     const job = {
@@ -29,9 +36,9 @@ test.each(['primary_ban', 'related_ban', 'guild_scope', 'malformed_scope'])(
       approvedByAdmin: true,
       rejectedByAdmin: false,
       role:
-        kind === 'guild_scope'
+        kind === 'guild_scope' || kind === 'related_guild_scope'
           ? UserRole.MODERATOR_MANAGER
-          : kind === 'malformed_scope'
+          : kind === 'malformed_scope' || kind === 'related_malformed_scope'
             ? UserRole.ADMIN
             : UserRole.MODERATOR,
     };
@@ -54,35 +61,41 @@ test.each(['primary_ban', 'related_ban', 'guild_scope', 'malformed_scope'])(
       reviewerId: 'staff',
       reviewerEmail: 'synthetic@example.invalid',
       decisionReason: 'Synthetic reason',
-      decisionComponents:
-        kind === 'related_ban'
-          ? [{ type: 'IGNORE' }]
-          : [
-              {
-                type: 'CUSTOM_ACTION',
-                actions: [{ id: 'ban' }],
-                policies: [],
-                actionIdsToMrtApiParamDecisionPayload: {
-                  ban:
-                    kind === 'guild_scope'
-                      ? { discordGuildConfirmed: true }
-                      : kind === 'malformed_scope'
-                        ? { discordGuildConfirmed: 'true' }
-                        : {},
+      decisionComponents: kind.startsWith('related_')
+        ? [{ type: 'IGNORE' }]
+        : [
+            {
+              type: 'CUSTOM_ACTION',
+              actions: [{ id: 'ban' }],
+              policies: [],
+              actionIdsToMrtApiParamDecisionPayload: {
+                ban:
+                  kind === 'guild_scope'
+                    ? { discordGuildConfirmed: true }
+                    : kind === 'malformed_scope'
+                      ? { discordGuildConfirmed: 'true' }
+                      : {},
+              },
+            },
+          ],
+      relatedActions: kind.startsWith('related_')
+        ? [
+            {
+              actionIds: ['ban'],
+              itemIds: ['case'],
+              itemTypeId: 'member-type',
+              policyIds: [],
+              actionIdsToMrtApiParamDecisionPayload: {
+                ban: {
+                  discordGuildConfirmed:
+                    kind === 'related_malformed_scope'
+                      ? 'true'
+                      : kind === 'related_guild_scope',
                 },
               },
-            ],
-      relatedActions:
-        kind === 'related_ban'
-          ? [
-              {
-                actionIds: ['ban'],
-                itemIds: ['case'],
-                itemTypeId: 'member-type',
-                policyIds: [],
-              },
-            ]
-          : [],
+            },
+          ]
+        : [],
     };
     await expect(service.submitDecision(input)).rejects.toThrow(
       'permission or scope',
@@ -93,6 +106,8 @@ test.each(['primary_ban', 'related_ban', 'guild_scope', 'malformed_scope'])(
     actor.role = UserRole.ADMIN;
     if (kind === 'malformed_scope')
       input.decisionComponents[0].actionIdsToMrtApiParamDecisionPayload.ban.discordGuildConfirmed = false;
+    if (kind === 'related_malformed_scope')
+      input.relatedActions[0].actionIdsToMrtApiParamDecisionPayload.ban.discordGuildConfirmed = false;
     await service.submitDecision(input);
     expect(record).toHaveBeenCalledTimes(1);
     expect(publish).toHaveBeenCalledTimes(1);
