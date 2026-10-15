@@ -133,6 +133,24 @@ export function validRoomReason(note: string | undefined): note is string {
     typeof note === 'string' && note.trim().length > 0 && note.length <= 2048
   );
 }
+export function validateRoomActionPermission(
+  actor: StaffActor,
+  actionName: string,
+  parameters: Record<string, unknown>,
+) {
+  const action = roomAction(actionName);
+  const permissions = roomPermissions(actor);
+  if (
+    !action ||
+    Object.keys(parameters).some((key) => key !== 'discordGuildConfirmed') ||
+    (parameters.discordGuildConfirmed !== undefined &&
+      typeof parameters.discordGuildConfirmed !== 'boolean') ||
+    !permissions.includes(action) ||
+    (parameters.discordGuildConfirmed === true &&
+      !permissions.includes('discord_guild_ban'))
+  )
+    throw new Error('Room action permission or scope invalid');
+}
 export async function roomRequest(
   config: ConcordConfig,
   fetchHTTP: RoomTransport,
@@ -282,18 +300,9 @@ export async function publishRoomDecision(
     !validRoomReason(input.note)
   )
     throw new Error('Room action requires a staff decision and reason');
-  const actor = await dependencies.getActor(input.actorId, input.orgId),
-    permissions = roomPermissions(actor);
+  const actor = await dependencies.getActor(input.actorId, input.orgId);
   const parameters = input.parameters ?? {};
-  if (
-    Object.keys(parameters).some((key) => key !== 'discordGuildConfirmed') ||
-    (parameters.discordGuildConfirmed !== undefined &&
-      typeof parameters.discordGuildConfirmed !== 'boolean') ||
-    !permissions.includes(action) ||
-    (parameters.discordGuildConfirmed === true &&
-      !permissions.includes('discord_guild_ban'))
-  )
-    throw new Error('Room action permission or scope invalid');
+  validateRoomActionPermission(actor, input.actionName, parameters);
   const executionId = uuidv5(
     jsonStringify(
       input.correlationId.startsWith('manual-action-run:')

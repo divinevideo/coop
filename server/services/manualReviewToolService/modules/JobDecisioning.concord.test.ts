@@ -1,6 +1,15 @@
 /* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
 import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
+import { UserRole } from '../../../models/types/permissioning.js';
 import JobDecisioning from './JobDecisioning.js';
+
+const getRoomActor = async (id: string, orgId: string) => ({
+  id,
+  orgId,
+  role: UserRole.ADMIN,
+  approvedByAdmin: true,
+  rejectedByAdmin: false,
+});
 
 test.each(['global_deleted_action', 'room_ignore'])(
   'non-enforcement retries remove an already-recorded job without action lookup: %s',
@@ -76,6 +85,7 @@ test.each(['global_deleted_action', 'room_ignore'])(
             : async () => undefined,
       } as never,
       { addSpan: jest.fn() } as never,
+      getRoomActor,
     );
     const input = {
       orgId: 'synthetic',
@@ -125,6 +135,7 @@ test.each([undefined, '', '   ', 'x'.repeat(2049)])(
       publish,
       { getItemType: async () => undefined } as never,
       { addSpan: jest.fn() } as never,
+      getRoomActor,
     );
     const input = {
       orgId: 'synthetic',
@@ -213,6 +224,7 @@ test('related room actions retain the job and original intent until acceptance',
     publish,
     { getItemType: async () => undefined } as never,
     { addSpan: jest.fn() } as never,
+    getRoomActor,
   );
   const input = {
     orgId: 'synthetic',
@@ -302,6 +314,7 @@ test('a room job stays reviewable when durable enforcement acceptance fails', as
     publish,
     { getItemType: async () => undefined } as never,
     { addSpan: jest.fn() } as never,
+    getRoomActor,
   );
   const input = {
     orgId: 'synthetic',
@@ -383,6 +396,7 @@ test.each(['action', 'reason', 'parameters', 'related', 'reviewer', 'same'])(
       publish,
       { getItemType: async () => undefined } as never,
       { addSpan: jest.fn() } as never,
+      getRoomActor,
     );
     const input: any = {
       orgId: 'synthetic',

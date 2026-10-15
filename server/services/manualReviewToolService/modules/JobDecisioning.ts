@@ -5,7 +5,12 @@ import { match } from 'ts-pattern';
 import { type JsonObject } from 'type-fest';
 
 import { type Dependencies } from '../../../iocContainer/index.js';
-import { validRoomReason } from '../../../routes/concord/service.js';
+import {
+  object,
+  validRoomReason,
+  validateRoomActionPermission,
+  type StaffActor,
+} from '../../../routes/concord/service.js';
 import { filterNullOrUndefined } from '../../../utils/collections.js';
 import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
 import {
@@ -155,6 +160,10 @@ export default class JobDecisioning {
     readonly onRecordDecision: (params: OnRecordDecisionInput) => Promise<void>,
     private readonly moderationConfigService: Dependencies['ModerationConfigService'],
     private readonly tracer: Dependencies['Tracer'],
+    private readonly getRoomActor?: (
+      id: string,
+      orgId: string,
+    ) => Promise<StaffActor>,
   ) {}
 
   async submitDecision(opts: SubmitDecisionInput) {
@@ -231,6 +240,35 @@ export default class JobDecisioning {
         throw new Error(
           'Submit room enforcement separately from other actions',
         );
+      if (roomDeliveryRequired) {
+        if (!reviewerId || !this.getRoomActor)
+          throw new Error('Room staff verification required');
+        const actor = await this.getRoomActor(reviewerId, orgId);
+        for (const decision of decisions) {
+          if (decision.type !== 'CUSTOM_ACTION') continue;
+          for (const action of decision.actions) {
+            const configured = validActions.find(
+              (candidate) => candidate.id === action.id,
+            )!;
+            const parameters =
+              decision.actionIdsToMrtApiParamDecisionPayload?.[action.id];
+            validateRoomActionPermission(
+              actor,
+              configured.name,
+              parameters === undefined ? {} : object(parameters),
+            );
+          }
+        }
+        for (const related of relatedActions) {
+          for (const id of related.actionIds) {
+            validateRoomActionPermission(
+              actor,
+              validActions.find((action) => action.id === id)!.name,
+              {},
+            );
+          }
+        }
+      }
       // We only throw if there aren't any valid actions.
       if (
         decisions.some((decision) => decision.type === 'CUSTOM_ACTION') &&

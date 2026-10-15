@@ -18,6 +18,8 @@ import { type JsonObject, type ReadonlyDeep } from 'type-fest';
 import { v1 as uuidv1 } from 'uuid';
 
 import makeDb from '../models/index.js';
+import { roomActor } from '../routes/concord/authorization.js';
+import { loadConcordConfig } from '../routes/concord/service.js';
 import type { IActionExecutionsAdapter } from '../plugins/warehouse/queries/IActionExecutionsAdapter.js';
 import type { IActionStatisticsAdapter } from '../plugins/warehouse/queries/IActionStatisticsAdapter.js';
 import type { IContentApiRequestsAdapter } from '../plugins/warehouse/queries/IContentApiRequestsAdapter.js';
@@ -1377,6 +1379,16 @@ export default async function getBottle() {
         _input: ManualReviewJobInput | ManualReviewAppealJobInput,
         _queueId: string,
       ) {},
+      async (id, orgId) =>
+        roomActor(
+          {
+            UserAPIDataSource: container.UserAPIDataSource,
+            ManualReviewToolService: container.ManualReviewToolService,
+          },
+          loadConcordConfig(process.env),
+          id,
+          orgId,
+        ),
     );
   });
 
