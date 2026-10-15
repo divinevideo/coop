@@ -132,6 +132,8 @@ export type SubmitDecisionInput = {
 );
 
 export type OnRecordDecisionInput = {
+  // Retain the durable-delivery contract across configuration races.
+  roomDeliveryRequired?: boolean;
   relatedActions: readonly ManualReviewDecisionRelatedAction[];
   job: ManualReviewJob | ManualReviewAppealJob;
   queueId: string;
@@ -140,6 +142,23 @@ export type OnRecordDecisionInput = {
   reviewerEmail: string;
   decisionReason?: string;
 };
+
+export function assertRoomRelatedItemTypeAvailable(itemType: unknown) {
+  if (itemType == null)
+    throw new Error('Room related item type configuration unavailable');
+}
+
+export function assertRoomActionConfigurationAvailable(
+  actionIds: readonly string[],
+  actions: readonly { id: string; name: string }[],
+) {
+  if (
+    actions.length !== actionIds.length ||
+    actionIds.some((id) => !actions.some((action) => action.id === id)) ||
+    actions.some((action) => !action.name.startsWith('concord_'))
+  )
+    throw new Error('Room action configuration unavailable');
+}
 
 // Compare the representation Postgres stores in JSONB: undefined object fields
 // disappear, while object key order is immaterial. Real action/scope changes
@@ -262,6 +281,15 @@ export default class JobDecisioning {
           }
         }
         for (const related of relatedActions) {
+          // Reject unavailable targets before recording immutable room intent.
+          if (related.actionIds.length > 0) {
+            assertRoomRelatedItemTypeAvailable(
+              await this.moderationConfigService.getItemType({
+                orgId,
+                itemTypeSelector: { id: related.itemTypeId },
+              }),
+            );
+          }
           for (const id of related.actionIds) {
             const parameters =
               related.actionIdsToMrtApiParamDecisionPayload?.[id];
@@ -473,7 +501,10 @@ export default class JobDecisioning {
       // Keep room jobs reviewable until the enforcement service durably accepts
       // their immutable decision. A retry uses the same job-derived identity.
       if (roomDeliveryRequired && roomIntent) {
-        await this.onRecordDecision(roomIntent);
+        await this.onRecordDecision({
+          ...roomIntent,
+          roomDeliveryRequired: true,
+        });
       }
       // logDecision() succeeded (now or previously), so call removeJob().
       const [removeJobStatus, removeJobErr] = await removeJob().then(

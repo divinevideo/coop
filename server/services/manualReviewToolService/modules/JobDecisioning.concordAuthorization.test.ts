@@ -9,6 +9,7 @@ test.each([
   'malformed_scope',
   'related_guild_scope',
   'related_malformed_scope',
+  'related_missing_type',
 ])(
   'room authorization and scope are checked before recording intent: %s',
   async (kind) => {
@@ -30,6 +31,7 @@ test.each([
       removeJob: jest.fn(async () => {}),
     };
     const publish = jest.fn(async () => {});
+    let relatedTypeAvailable = kind !== 'related_missing_type';
     const actor = {
       id: 'staff',
       orgId: 'synthetic',
@@ -38,7 +40,9 @@ test.each([
       role:
         kind === 'guild_scope' || kind === 'related_guild_scope'
           ? UserRole.MODERATOR_MANAGER
-          : kind === 'malformed_scope' || kind === 'related_malformed_scope'
+          : kind === 'malformed_scope' ||
+              kind === 'related_malformed_scope' ||
+              kind === 'related_missing_type'
             ? UserRole.ADMIN
             : UserRole.MODERATOR,
     };
@@ -49,7 +53,16 @@ test.each([
         close: async () => {},
       }) as never,
       publish,
-      { getItemType: async () => undefined } as never,
+      {
+        getItemType: async ({
+          itemTypeSelector,
+        }: {
+          itemTypeSelector: { id: string };
+        }) =>
+          relatedTypeAvailable && itemTypeSelector.id === 'member-type'
+            ? {}
+            : undefined,
+      } as never,
       { addSpan: jest.fn() } as never,
       async () => actor,
     );
@@ -98,12 +111,15 @@ test.each([
         : [],
     };
     await expect(service.submitDecision(input)).rejects.toThrow(
-      'permission or scope',
+      kind === 'related_missing_type'
+        ? 'item type configuration unavailable'
+        : 'permission or scope',
     );
     expect(record).not.toHaveBeenCalled();
     expect(publish).not.toHaveBeenCalled();
     expect(queue.removeJob).not.toHaveBeenCalled();
     actor.role = UserRole.ADMIN;
+    relatedTypeAvailable = true;
     if (kind === 'malformed_scope')
       input.decisionComponents[0].actionIdsToMrtApiParamDecisionPayload.ban.discordGuildConfirmed = false;
     if (kind === 'related_malformed_scope')
