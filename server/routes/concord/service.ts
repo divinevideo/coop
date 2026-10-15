@@ -128,6 +128,11 @@ export function roomAction(name: string): RoomAction | undefined {
   if (name === 'concord_unban_member') return 'unban_member';
   return undefined;
 }
+export function validRoomReason(note: string | undefined): note is string {
+  return (
+    typeof note === 'string' && note.trim().length > 0 && note.length <= 2048
+  );
+}
 export async function roomRequest(
   config: ConcordConfig,
   fetchHTTP: RoomTransport,
@@ -274,8 +279,7 @@ export async function publishRoomDecision(
     !/^(manual-action-run|mrt-decision):.+/.test(input.correlationId) ||
     !['concord_message', 'concord_member'].includes(input.itemTypeName) ||
     !UUID.test(input.caseId) ||
-    !input.note?.trim() ||
-    input.note.length > 2048
+    !validRoomReason(input.note)
   )
     throw new Error('Room action requires a staff decision and reason');
   const actor = await dependencies.getActor(input.actorId, input.orgId),

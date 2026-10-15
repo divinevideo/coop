@@ -2,6 +2,147 @@
 import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
 import JobDecisioning from './JobDecisioning.js';
 
+test('non-room retries remove an already-recorded job without loading deleted actions', async () => {
+  const job = {
+    id: 'synthetic:10000000-0000-4000-8000-000000000005',
+    orgId: 'synthetic',
+    payload: {
+      kind: 'DEFAULT',
+      item: {
+        itemId: 'global-item',
+        itemTypeIdentifier: { id: 'global-type' },
+        data: {},
+      },
+    },
+  };
+  const prior = {
+    job_payload: job,
+    queue_id: 'queue',
+    reviewer_id: 'staff',
+    related_actions: [],
+    decision_components: [
+      { type: 'CUSTOM_ACTION', actions: [{ id: 'deleted-action' }] },
+    ],
+  };
+  const select = {
+    where() {
+      return select;
+    },
+    selectAll() {
+      return select;
+    },
+    executeTakeFirst: async () => prior,
+  };
+  const pg = {
+    insertInto: () => ({
+      values: () => ({
+        execute: async () => {
+          throw new Error(
+            'duplicate key value violates unique constraint "manual_review_decisions_pkey"',
+          );
+        },
+      }),
+    }),
+    selectFrom: () => select,
+  };
+  const queue = {
+    getJobs: async () => [job],
+    removeJob: jest.fn(async () => {}),
+  };
+  const getActions = Object.assign(
+    jest.fn(async () => {
+      throw new Error('Action lookup unavailable');
+    }),
+    { close: async () => {} },
+  );
+  const publish = jest.fn(async () => {});
+  const service = new JobDecisioning(
+    queue as never,
+    pg as never,
+    getActions as never,
+    publish,
+    { getItemType: async () => undefined } as never,
+    { addSpan: jest.fn() } as never,
+  );
+  const input = {
+    orgId: 'synthetic',
+    queueId: 'queue',
+    jobId: job.id,
+    lockToken: 'lock',
+    reviewerId: 'staff',
+    reviewerEmail: 'synthetic@example.invalid',
+    relatedActions: [],
+    decisionComponents: [{ type: 'IGNORE' }],
+  } as unknown as Parameters<JobDecisioning['submitDecision']>[0];
+  await service.submitDecision(input).catch(() => {});
+  expect(queue.removeJob).toHaveBeenCalledTimes(1);
+  expect(getActions).not.toHaveBeenCalled();
+  expect(publish).not.toHaveBeenCalled();
+});
+
+test.each([undefined, '', '   ', 'x'.repeat(2049)])(
+  'invalid room reasons are rejected before recording immutable intent: %p',
+  async (decisionReason) => {
+    const job = {
+      id: 'synthetic:10000000-0000-4000-8000-000000000004',
+      orgId: 'synthetic',
+      payload: {
+        kind: 'DEFAULT',
+        item: {
+          itemId: 'case',
+          itemTypeIdentifier: { id: 'room-type' },
+          data: {},
+        },
+      },
+    };
+    const record = jest.fn(async () => {});
+    const queue = {
+      getJobs: async () => [job],
+      removeJob: jest.fn(async () => {}),
+    };
+    const publish = jest.fn(async () => {});
+    const service = new JobDecisioning(
+      queue as never,
+      { insertInto: () => ({ values: () => ({ execute: record }) }) } as never,
+      Object.assign(
+        async () => [{ id: 'room-action', name: 'concord_remove_message' }],
+        { close: async () => {} },
+      ) as never,
+      publish,
+      { getItemType: async () => undefined } as never,
+      { addSpan: jest.fn() } as never,
+    );
+    const input = {
+      orgId: 'synthetic',
+      queueId: 'queue',
+      jobId: job.id,
+      lockToken: 'lock',
+      reviewerId: 'staff',
+      reviewerEmail: 'synthetic@example.invalid',
+      relatedActions: [],
+      decisionReason,
+      decisionComponents: [
+        {
+          type: 'CUSTOM_ACTION',
+          actions: [{ id: 'room-action' }],
+          policies: [],
+        },
+      ],
+    } as unknown as Parameters<JobDecisioning['submitDecision']>[0];
+    await expect(service.submitDecision(input)).rejects.toThrow('reason');
+    expect(record).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    expect(queue.removeJob).not.toHaveBeenCalled();
+    await service.submitDecision({
+      ...input,
+      decisionReason: 'Corrected synthetic reason',
+    });
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(queue.removeJob).toHaveBeenCalledTimes(1);
+  },
+);
+
 test('related room actions retain the job and original intent until acceptance', async () => {
   const job = {
     id: 'synthetic:10000000-0000-4000-8000-000000000003',
