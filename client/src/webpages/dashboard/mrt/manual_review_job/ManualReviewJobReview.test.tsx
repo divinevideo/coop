@@ -26,24 +26,14 @@ vi.mock('../../../../graphql/generated', async (original) => ({
   useGQLReleaseJobLockMutation: () => [hooks.mutate],
 }));
 vi.mock('./jobFragment', async () => {
-  const { gql } = await import('@apollo/client');
-  return {
-    JOB_FRAGMENT: gql`
-      fragment ReasonTestJobFields on ManualReviewJob {
-        id
-      }
-    `,
-  };
+  const { GQLJobFieldsFragmentDoc } =
+    await import('../../../../graphql/generated');
+  return { JOB_FRAGMENT: GQLJobFieldsFragmentDoc };
 });
 vi.mock('../../rules/rule_form/RuleForm', async () => {
-  const { gql } = await import('@apollo/client');
-  return {
-    ITEM_TYPE_FRAGMENT: gql`
-      fragment ReasonTestItemTypeFragment on ItemTypeBase {
-        id
-      }
-    `,
-  };
+  const { GQLItemTypeFragmentFragmentDoc } =
+    await import('../../../../graphql/generated');
+  return { ITEM_TYPE_FRAGMENT: GQLItemTypeFragmentFragmentDoc };
 });
 vi.mock('./ReportInfoComponent', () => ({ default: () => null }));
 vi.mock('./MergedReportsComponent', () => ({ default: () => null }));
