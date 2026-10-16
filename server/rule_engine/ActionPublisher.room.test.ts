@@ -58,7 +58,7 @@ test('actual publisher forwards trusted actor, reason and stable execution while
       run({ setAttribute: () => {}, recordException: () => {} }),
   };
   const publisher = new ActionPublisher(
-    {} as never,
+    { logActionExecutions: async () => {} } as never,
     trace as never,
     fetchHTTP as never,
     {} as never,
@@ -71,7 +71,7 @@ test('actual publisher forwards trusted actor, reason and stable execution while
         },
       }),
     } as never,
-    {} as never,
+    { applyUserStrikeFromPublishedActions: async () => {} } as never,
     { getGraphQLUserFromId: async () => actor } as never,
   );
   const action = {
@@ -91,20 +91,31 @@ test('actual publisher forwards trusted actor, reason and stable execution while
     itemId: 'item',
     itemType: { id: 'room-type', kind: 'CONTENT', name: 'concord_message' },
   } as const;
-  const send = async (actorId?: string) =>
-    publisher.publishAction(
-      'synthetic',
-      action,
-      [],
-      item,
-      toCorrelationId({ type: 'mrt-decision', id: 'stable' }),
-      'synthetic@example.invalid',
-      undefined,
-      [],
-      { reportHistory: ['must not leave Coop'], actorId: 'forged' },
-      'Synthetic reason',
-      actorId,
+  const send = async (actorId?: string) => {
+    const outcomes = await publisher.publishActions(
+      [
+        {
+          action,
+          policies: [],
+          matchingRules: undefined,
+          ruleEnvironment: undefined,
+          customMrtApiParamDecisionPayload: {
+            reportHistory: ['must not leave Coop'],
+            actorId: 'forged',
+          },
+        },
+      ],
+      {
+        orgId: 'synthetic',
+        targetItem: item,
+        correlationId: toCorrelationId({ type: 'mrt-decision', id: 'stable' }),
+        actorEmail: 'synthetic@example.invalid',
+        decisionReason: 'Synthetic reason',
+        actorId,
+      },
     );
+    return outcomes.every((outcome) => outcome.success);
+  };
   expect(await send('staff')).toBe(true);
   expect(await send('staff')).toBe(true);
   const requests = fetchHTTP.mock.calls as unknown as [

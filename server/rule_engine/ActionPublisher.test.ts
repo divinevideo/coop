@@ -68,9 +68,10 @@ function makeIsolatedPublisher(opts: { fetchHTTP: jest.Mock }) {
 describe('ActionPublisher', () => {
   describe('publishActions', () => {
     it('should log each action execution exactly once (not N² times)', async () => {
-      const { publisher: actionPublisher, logActionExecutions: logSpy } = makeIsolatedPublisher({
-        fetchHTTP: jest.fn().mockResolvedValue({ ok: true, status: 204 }),
-      });
+      const { publisher: actionPublisher, logActionExecutions: logSpy } =
+        makeIsolatedPublisher({
+          fetchHTTP: jest.fn().mockResolvedValue({ ok: true, status: 204 }),
+        });
 
       // Use 2 actions to catch the N² bug
       // With the bug: 2 actions → 2² = 4 log entries
@@ -171,9 +172,7 @@ describe('ActionPublisher', () => {
     });
 
     it('builds the CUSTOM_ACTION webhook body with parameters merged into `custom` and actorNote at the top level', async () => {
-      const fetchHTTP = jest
-        .fn()
-        .mockResolvedValue({ status: 200, ok: true });
+      const fetchHTTP = jest.fn().mockResolvedValue({ status: 200, ok: true });
       const { publisher } = makeIsolatedPublisher({ fetchHTTP });
 
       await publisher.publishActions(
@@ -215,6 +214,8 @@ describe('ActionPublisher', () => {
           },
           actorEmail: 'mod@example.com',
           actorNote: 'Repeat offender',
+          decisionReason:
+            'Private MRT reason must not replace an explicit note',
         },
       );
 
@@ -233,10 +234,8 @@ describe('ActionPublisher', () => {
       expect(sentBody.actorEmail).toBe('mod@example.com');
     });
 
-    it('omits actorNote from the webhook body entirely when no note is supplied', async () => {
-      const fetchHTTP = jest
-        .fn()
-        .mockResolvedValue({ status: 200, ok: true });
+    it('does not disclose an ordinary MRT decision reason as a webhook actorNote', async () => {
+      const fetchHTTP = jest.fn().mockResolvedValue({ status: 200, ok: true });
       const { publisher } = makeIsolatedPublisher({ fetchHTTP });
 
       await publisher.publishActions(
@@ -264,6 +263,7 @@ describe('ActionPublisher', () => {
           orgId: 'org-789',
           correlationId:
             'manual-action-run:no-note' as CorrelationId<'manual-action-run'>,
+          decisionReason: 'Private moderator reason',
           targetItem: {
             itemId: 'item-no-note',
             itemType: {
@@ -280,9 +280,10 @@ describe('ActionPublisher', () => {
     });
 
     it('forwards moderator-supplied parameter values and actor note to the logger', async () => {
-      const { publisher: actionPublisher, logActionExecutions: logSpy } = makeIsolatedPublisher({
-        fetchHTTP: jest.fn().mockResolvedValue({ ok: true, status: 204 }),
-      });
+      const { publisher: actionPublisher, logActionExecutions: logSpy } =
+        makeIsolatedPublisher({
+          fetchHTTP: jest.fn().mockResolvedValue({ ok: true, status: 204 }),
+        });
 
       const triggeredActions = [
         {
@@ -325,10 +326,7 @@ describe('ActionPublisher', () => {
         actorNote: 'Repeat offender',
       };
 
-      await actionPublisher.publishActions(
-        triggeredActions,
-        executionContext,
-      );
+      await actionPublisher.publishActions(triggeredActions, executionContext);
 
       expect(logSpy).toHaveBeenCalledTimes(1);
       const logged = logSpy.mock.calls[0]?.[0].executions[0];

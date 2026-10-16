@@ -1365,10 +1365,14 @@ export default async function getBottle() {
             }
             const decisionActions = actionIds.map((actionId) => ({
               actionId,
-              customMrtApiParamDecisionPayload: it
-                .actionIdsToMrtApiParamDecisionPayload?.[actionId] as
-                | Record<string, unknown>
-                | undefined,
+              ...(roomDeliveryRequired
+                ? {
+                    customMrtApiParamDecisionPayload: it
+                      .actionIdsToMrtApiParamDecisionPayload?.[actionId] as
+                      | Record<string, unknown>
+                      | undefined,
+                  }
+                : {}),
             }));
 
             if (isNonEmptyArray(decisionActions)) {
