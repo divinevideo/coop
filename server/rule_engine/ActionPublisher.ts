@@ -5,6 +5,11 @@ import { type JsonObject, type ReadonlyDeep } from 'type-fest';
 
 import { type Dependencies } from '../iocContainer/index.js';
 import { inject } from '../iocContainer/utils.js';
+import { roomActor } from '../routes/concord/authorization.js';
+import {
+  loadConcordConfig,
+  publishRoomDecision,
+} from '../routes/concord/service.js';
 import {
   type ActionExecutionCorrelationId,
   type ActionExecutionSourceType,
@@ -25,8 +30,6 @@ import { asyncIterableToArray } from '../utils/collections.js';
 import { getSourceType, type CorrelationId } from '../utils/correlationIds.js';
 import { jsonStringify } from '../utils/encoding.js';
 import { assertUnreachable, safePick, withRetries } from '../utils/misc.js';
-import { roomActor } from '../routes/concord/authorization.js';
-import { loadConcordConfig, publishRoomDecision } from '../routes/concord/service.js';
 import { type RuleEnvironment } from './RuleEngine.js';
 
 export type ActionExecutionData<
@@ -79,8 +82,8 @@ export function getUserFromActionTarget(it: ActionTargetItem) {
   return it.itemType.kind === 'USER'
     ? { id: it.itemId, typeId: it.itemType.id }
     : isFullSubmission(it)
-    ? it.creator
-    : undefined;
+      ? it.creator
+      : undefined;
 }
 
 /**
@@ -102,8 +105,8 @@ export function getUserFromActionTargetItem(it: ActionTargetItem) {
   return it.itemType.kind === 'USER'
     ? { id: it.itemId, typeId: it.itemType.id }
     : isFullSubmission(it)
-    ? it.creator
-    : undefined;
+      ? it.creator
+      : undefined;
 }
 
 /**
@@ -236,7 +239,10 @@ class ActionPublisher {
                 reportedItems,
                 relatedRules,
                 customMrtApiParamDecisionPayload,
-                actorNote ?? executionContext.decisionReason,
+                actorNote ??
+                  (action.name.startsWith('concord_')
+                    ? executionContext.decisionReason
+                    : undefined),
                 actorId,
               );
             },
@@ -340,14 +346,50 @@ class ActionPublisher {
             case ActionType.CUSTOM_ACTION:
               if (action.name.startsWith('concord_')) {
                 const config = loadConcordConfig(process.env);
-                if (action.callbackUrl !== config.origin + '/v1/decisions' || !this.userAPIDataSource) return false;
+                if (
+                  action.callbackUrl !== config.origin + '/v1/decisions' ||
+                  !this.userAPIDataSource
+                )
+                  return false;
                 const item = await getFullItem();
                 const caseId = item?.data.case_id;
                 if (typeof caseId !== 'string') return false;
-                await publishRoomDecision(config, {
-                  fetchHTTP: this.fetchHTTP,
-                  getActor: async (id, orgId) => roomActor({ UserAPIDataSource: this.userAPIDataSource!, ManualReviewToolService: this.manualReviewToolService }, config, id, orgId),
-                }, { orgId, actionId: action.id, actionName: action.name, itemId: targetItem.itemId, itemTypeId: targetItem.itemType.id, itemTypeName: targetItem.itemType.name, caseId, correlationId: String(correlationId), actorId, note: actorNote, parameters: customMrtApiParamDecisionPayload?.discordGuildConfirmed === undefined ? {} : { discordGuildConfirmed: customMrtApiParamDecisionPayload.discordGuildConfirmed } });
+                await publishRoomDecision(
+                  config,
+                  {
+                    fetchHTTP: this.fetchHTTP,
+                    getActor: async (id, orgId) =>
+                      roomActor(
+                        {
+                          UserAPIDataSource: this.userAPIDataSource!,
+                          ManualReviewToolService: this.manualReviewToolService,
+                        },
+                        config,
+                        id,
+                        orgId,
+                      ),
+                  },
+                  {
+                    orgId,
+                    actionId: action.id,
+                    actionName: action.name,
+                    itemId: targetItem.itemId,
+                    itemTypeId: targetItem.itemType.id,
+                    itemTypeName: targetItem.itemType.name,
+                    caseId,
+                    correlationId: String(correlationId),
+                    actorId,
+                    note: actorNote,
+                    parameters:
+                      customMrtApiParamDecisionPayload?.discordGuildConfirmed ===
+                      undefined
+                        ? {}
+                        : {
+                            discordGuildConfirmed:
+                              customMrtApiParamDecisionPayload.discordGuildConfirmed,
+                          },
+                  },
+                );
                 return true;
               }
               const customHeaders = action.callbackUrlHeaders;
