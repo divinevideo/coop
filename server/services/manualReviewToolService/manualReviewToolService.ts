@@ -1082,12 +1082,39 @@ export class ManualReviewToolService {
       });
 
     let shouldBeAutoActioned = queue?.autoCloseJobs ?? false;
-    let job = await this.queueOps.dequeueNextJobWithLock({
-      orgId,
-      queueId,
-      lockToken: userId,
-    });
-    if (!shouldBeAutoActioned || !job) {
+    const dequeue = async () => {
+      let next = await this.queueOps.dequeueNextJobWithLock({
+        orgId,
+        queueId,
+        lockToken: userId,
+      });
+      // Dequeue also resumes persisted room intent; a new reviewer need not
+      // reconstruct another reviewer's exact recorded reason and parameters.
+      while (next) {
+        let resumed: boolean;
+        try {
+          resumed = await this.jobDecisioning.retryRecordedRoomDecision({
+            orgId,
+            queueId,
+            jobId: next.job.id,
+            lockToken: next.lockToken,
+            reviewerId: userId,
+          });
+        } catch {
+          return { job: next, recoveryPending: true };
+        }
+        if (!resumed) break;
+        next = await this.queueOps.dequeueNextJobWithLock({
+          orgId,
+          queueId,
+          lockToken: userId,
+        });
+      }
+      return { job: next, recoveryPending: false };
+    };
+    const initial = await dequeue();
+    let job = initial.job;
+    if (initial.recoveryPending || !shouldBeAutoActioned || !job) {
       return job;
     }
 
@@ -1145,13 +1172,10 @@ export class ManualReviewToolService {
           orgId,
         });
 
-        job = await this.queueOps.dequeueNextJobWithLock({
-          orgId,
-          queueId,
-          lockToken: userId,
-        });
+        const next = await dequeue();
+        job = next.job;
 
-        if (!job) {
+        if (next.recoveryPending || !job) {
           return job;
         }
       }
