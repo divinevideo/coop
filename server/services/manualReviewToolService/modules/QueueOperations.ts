@@ -877,12 +877,16 @@ export default class QueueOperations {
       // queue, but not impossible.
       const decision = await this.pgQueryReadReplica
         .selectFrom('manual_review_tool.manual_review_decisions')
+        .select(['job_payload'])
         .where('created_at', '>=', new Date('2023-10-01'))
         .where('org_id', '=', orgId)
         .where('id', '=', jobIdToGuid(job.data.id))
         .executeTakeFirst();
 
-      hasDecision = decision !== undefined;
+      // A recorded room intent is not proof of durable enforcement acceptance.
+      // Return it for idempotent recovery rather than discarding it on dequeue.
+      hasDecision =
+        decision !== undefined && decision.job_payload.roomDeliveryRequired !== true;
 
       if (hasDecision) {
         await this.removeJob({
@@ -932,13 +936,16 @@ export default class QueueOperations {
       // queue, but not impossible.
       const decision = await this.pgQueryReadReplica
         .selectFrom('manual_review_tool.manual_review_decisions')
-        .select(['decision_components']) // not really necessary to return anything
+        .select(['decision_components', 'job_payload'])
         .where('created_at', '>=', new Date('2023-10-01'))
         .where('org_id', '=', orgId)
         .where('id', '=', jobIdToGuid(convertedJob.data.id))
         .executeTakeFirst();
 
-      hasDecision = decision !== undefined;
+      // Room decisions are recorded before delivery. A later dequeue must not
+      // bypass the awaited acceptance check in JobDecisioning.
+      hasDecision =
+        decision !== undefined && decision.job_payload.roomDeliveryRequired !== true;
 
       if (hasDecision) {
         await this.removeJob({
