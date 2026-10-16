@@ -16,6 +16,7 @@ import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
 import {
   CoopError,
   ErrorType,
+  isCoopErrorOfType,
   type ErrorInstanceData,
 } from '../../../utils/errors.js';
 import { getFieldValueForRole } from '../../itemProcessingService/index.js';
@@ -186,6 +187,38 @@ export default class JobDecisioning {
       orgId: string,
     ) => Promise<StaffActor>,
   ) {}
+
+  /** Resume only persisted room intent; the trigger never supplies new intent. */
+  async retryRecordedRoomDecision(opts: {
+    orgId: string;
+    queueId: string;
+    jobId: JobId;
+    lockToken: string;
+    reviewerId: string;
+  }): Promise<boolean> {
+    const prior = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .where('id', '=', jobIdToGuid(opts.jobId))
+      .where('org_id', '=', opts.orgId)
+      .selectAll()
+      .executeTakeFirst();
+    if (prior?.job_payload.roomDeliveryRequired !== true) return false;
+    if (!prior.reviewer_id || prior.queue_id !== opts.queueId)
+      throw new Error('Recorded room decision unavailable');
+    await this.submitDecision({
+      ...opts,
+      reviewerEmail: '',
+      reportHistory: [],
+      decisionComponents: prior.decision_components,
+      relatedActions: prior.related_actions,
+      decisionReason: prior.decision_reason ?? undefined,
+    }).catch((error: unknown) => {
+      // Existing submit callers receive this after successful duplicate-record
+      // cleanup (or concurrent completion). Both mean recovery can advance.
+      if (!isCoopErrorOfType(error, 'JobHasAlreadyBeenSubmittedError')) throw error;
+    });
+    return true;
+  }
 
   async submitDecision(opts: SubmitDecisionInput) {
     const {
