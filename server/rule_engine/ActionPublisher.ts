@@ -465,7 +465,7 @@ class ActionPublisher {
                 if (isMembership) {
                   if (!this.memberIntentPg)
                     throw new Error('Membership intent storage unavailable');
-                  return deliverMemberIntent(
+                  return await deliverMemberIntent(
                     this.memberIntentPg,
                     config,
                     this.roomDependencies(config),
