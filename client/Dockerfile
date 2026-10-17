@@ -1,4 +1,4 @@
-FROM node:24.14.1-bullseye-slim AS client_base
+FROM node:24.14.1-bookworm-slim@sha256:b506e7321f176aae77317f99d67a24b272c1f09f1d10f1761f2773447d8da26c AS client_base
 WORKDIR /app
 
 # ARG is used to get the release id into the ENV from the command line, and then

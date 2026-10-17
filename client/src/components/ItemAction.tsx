@@ -1,25 +1,28 @@
-import ActionParametersModal, {
-  defaultValuesForParameters,
-} from '@/components/ActionParametersModal';
-import { type ActionParameterValues } from '@/components/ActionParameterInputs';
-import { type JsonObject } from 'type-fest';
 import {
-  type GQLActionParameter,
   namedOperations,
   useGQLBulkActionExecutionMutation,
   useGQLBulkActionsFormDataQuery,
+  type GQLActionParameter,
 } from '@/graphql/generated';
 import { stripTypename } from '@/graphql/inputHelpers';
-import { ItemIdentifier } from '@roostorg/types';
 import Pencil from '@/icons/lni/Education/pencil.svg?react';
+import { ItemIdentifier } from '@roostorg/types';
 import { Button, Input, Select } from 'antd';
 import orderBy from 'lodash/orderBy';
 import { useCallback, useMemo, useState } from 'react';
+import { type JsonObject } from 'type-fest';
 
+import { type ActionParameterValues } from '@/components/ActionParameterInputs';
+import ActionParametersModal, {
+  defaultValuesForParameters,
+} from '@/components/ActionParametersModal';
 import { selectFilterByLabelOption } from '@/webpages/dashboard/components/antDesignUtils';
 import CoopButton from '@/webpages/dashboard/components/CoopButton';
 import CoopModal from '@/webpages/dashboard/components/CoopModal';
 import PolicyDropdown from '@/webpages/dashboard/components/PolicyDropdown';
+
+import ConcordEnforcementStatus from './ConcordEnforcementStatus';
+import { completeRoomOperation, roomOperation } from './roomOperation';
 
 const { Option } = Select;
 
@@ -53,7 +56,23 @@ export default function ItemAction(props: {
           'One or more actions failed. The callback URL may have returned an error. If your org requires a policy for decisions, select a policy and try again.',
         );
       } else {
-        setModalBody('Actions submitted successfully.');
+        if (
+          eligibleActions.some(
+            (action) =>
+              selectedActionIds.includes(action.id) &&
+              action.name.startsWith('concord_'),
+          )
+        )
+          completeRoomOperation(itemIdentifier);
+        setModalBody(
+          eligibleActions.some(
+            (action) =>
+              selectedActionIds.includes(action.id) &&
+              action.name.startsWith('concord_'),
+          )
+            ? 'Room decision queued. Check Room enforcement for verified delivery to each service.'
+            : 'Actions submitted successfully.',
+        );
       }
       setShowModal(true);
     },
@@ -76,7 +95,9 @@ export default function ItemAction(props: {
   const [moderatorNote, setModeratorNote] = useState<string>('');
 
   const eligibleActions: EligibleAction[] = (queryData?.myOrg?.actions ?? [])
-    .filter((it) => it.itemTypes.map((t) => t.id).includes(itemIdentifier.typeId))
+    .filter((it) =>
+      it.itemTypes.map((t) => t.id).includes(itemIdentifier.typeId),
+    )
     .map((it) => ({
       id: it.id,
       name: it.name,
@@ -196,6 +217,13 @@ export default function ItemAction(props: {
       bulkAction({
         variables: {
           input: {
+            operationId: eligibleActions.some(
+              (action) =>
+                selectedActionIds.includes(action.id) &&
+                action.name.startsWith('concord_'),
+            )
+              ? roomOperation(itemIdentifier)
+              : undefined,
             itemTypeId: itemIdentifier.typeId,
             actionIds: selectedActionIds,
             itemIds: [itemIdentifier.id],
@@ -211,14 +239,15 @@ export default function ItemAction(props: {
               Object.keys(parametersByActionId).length > 0
                 ? (parametersByActionId as unknown as JsonObject)
                 : undefined,
-            note: moderatorNote.trim() === '' ? undefined : moderatorNote.trim(),
+            note:
+              moderatorNote.trim() === '' ? undefined : moderatorNote.trim(),
           },
         },
       }),
     [
       bulkAction,
-      itemIdentifier.id,
-      itemIdentifier.typeId,
+      eligibleActions,
+      itemIdentifier,
       selectedActionIds,
       selectedPolicyIds,
       parametersByActionId,
@@ -229,7 +258,7 @@ export default function ItemAction(props: {
   const modalOnClose = useCallback(() => setShowModal(false), []);
 
   if (eligibleActions.length === 0) {
-    return null;
+    return <ConcordEnforcementStatus itemIdentifier={itemIdentifier} />;
   }
 
   const activeParamsAction = paramsModal.open
@@ -238,6 +267,7 @@ export default function ItemAction(props: {
 
   return (
     <div className="flex flex-col">
+      <ConcordEnforcementStatus itemIdentifier={itemIdentifier} />
       <div className="flex flex-col items-start mb-2">
         <div className="text-base font-semibold">{title}</div>
       </div>
@@ -282,7 +312,13 @@ export default function ItemAction(props: {
           size="small"
           onClick={buttonOnClick}
           loading={loading}
-          disabled={selectedActionIds.length === 0}
+          disabled={
+            selectedActionIds.length === 0 ||
+            (selectedActionIds.some((id) =>
+              eligibleActionsById.get(id)?.name.startsWith('concord_'),
+            ) &&
+              !moderatorNote.trim())
+          }
         />
       </div>
       {selectedParameterizedActions.length > 0 && (

@@ -31,7 +31,11 @@ export {
   type ManualReviewAppealJobInput,
 } from './modules/JobEnrichment.js';
 
-export { type ManualReviewDecisionComponent } from './modules/JobDecisioning.js';
+export {
+  type ManualReviewDecisionComponent,
+  assertRoomActionConfigurationAvailable,
+  assertRoomRelatedItemTypeAvailable,
+} from './modules/JobDecisioning.js';
 
 // Needs to be exported because it's used in the contract for
 // warehouse eventual-write tables.

@@ -124,7 +124,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check Divine Coop setup guards
-        run: bash divine/test-coop-setup-guards.sh
+        run: |
+          bash divine/test-coop-setup-guards.sh
+          bash divine/test-coop-setup-concord.sh
 
   # jobs have to be defined in the root workflow file in order to be marked as
   # 'Required Checks' in GitHub CI
@@ -147,6 +149,10 @@ jobs:
         run: |
           docker compose run --rm --quiet-pull test
           echo "ATTENTION: If this step fails, look in the next step for the migration logs."
+
+      - name: Test membership ordering with PostgreSQL
+        run: |
+          docker compose run --rm --no-deps --quiet-pull -v "$PWD/db/src/scripts:/db/src/scripts:ro" -e NODE_ENV=test -e MEMBER_INTENT_TEST_COMPOSE=1 -e JEST_JUNIT_OUTPUT_NAME=jest-member-intent-integration.xml test npm run test:integ -- --runInBand routes/concord/memberIntents.integ.test.ts services/manualReviewToolService/modules/JobDecisioning.memberIntent.integ.test.ts
 
       - # Only output the migration logs if the prior step failed, as they
         # could be helpful for debugging in that case; otherwise, they're just
@@ -175,6 +181,9 @@ jobs:
 
       - name: Lint client
         run: docker compose run --rm --quiet-pull client npm run lint
+
+      - name: Test room moderation UI
+        run: docker compose run --rm --quiet-pull client npm test -- --run src/components/ConcordEnforcementStatus.test.tsx src/components/DiscordGuildConfirmation.test.tsx src/components/roomOperation.test.ts src/webpages/dashboard/mrt/manual_review_job/ManualReviewJobReview.test.tsx
 
       - name: Build client
         run: docker compose run --rm --quiet-pull client npm run build

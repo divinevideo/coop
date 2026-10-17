@@ -3,26 +3,23 @@ import AngleDoubleRight from '@/icons/lni/Direction/angle-double-right.svg?react
 import { __throw } from '@/utils/misc';
 import { isNonEmptyString } from '@/utils/string';
 import { multilevelListFromFlatList } from '@/utils/tree';
-import {
-  DownOutlined,
-  EditOutlined,
-  LoadingOutlined,
-} from '@ant-design/icons';
+import { DownOutlined, EditOutlined, LoadingOutlined } from '@ant-design/icons';
 import { gql } from '@apollo/client';
 import { Button, Dropdown, Input, Select, Tooltip } from 'antd';
 import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { Helmet } from 'react-helmet-async';
 import { useNavigate, useParams } from 'react-router-dom';
+import { type JsonObject } from 'type-fest';
 
-import ActionParametersModal, {
-  defaultValuesForParameters,
-} from '@/components/ActionParametersModal';
-import { type ActionParameterValues } from '@/components/ActionParameterInputs';
 import ComponentLoading from '../../../../components/common/ComponentLoading';
 import CopyTextComponent from '../../../../components/common/CopyTextComponent';
 import CoopModal from '../../components/CoopModal';
 import { CoopModalFooterButtonProps } from '../../components/CoopModalFooter';
 import PolicyDropdown from '../../components/PolicyDropdown';
+import { type ActionParameterValues } from '@/components/ActionParameterInputs';
+import ActionParametersModal, {
+  defaultValuesForParameters,
+} from '@/components/ActionParametersModal';
 import Drawer from '@/components/common/Drawer';
 
 import {
@@ -51,8 +48,8 @@ import { filterNullOrUndefined } from '../../../../utils/collections';
 import { getFieldValueForRole } from '../../../../utils/itemUtils';
 import { recomputeSelectedRelatedActions } from '../../../../utils/manualReviewTool';
 import HTMLRenderer from '../../policies/HTMLRenderer';
-import { JOB_FRAGMENT } from './jobFragment';
 import { ITEM_TYPE_FRAGMENT } from '../../rules/rule_form/RuleForm';
+import { JOB_FRAGMENT } from './jobFragment';
 import ManualReviewJobDequeueErrorComponent from './ManualReviewJobDequeueErrorComponent';
 import MergedReportsComponent from './MergedReportsComponent';
 import ReportInfoComponent from './ReportInfoComponent';
@@ -66,8 +63,8 @@ import {
 } from './v2/ManualReviewJobRelatedActionsStore';
 import NCMECReviewUser from './v2/ncmec/NCMECReviewUser';
 import ManualReviewJobEnqueuedRelatedActions from './v2/related_actions/ManualReviewJobEnqueuedRelatedActions';
-import { useEnqueueActionGate } from './v2/useEnqueueActionGate';
 import ManualReviewJobListOfThreadsComponent from './v2/threads/ManualReviewJobListOfThreadsComponent';
+import { useEnqueueActionGate } from './v2/useEnqueueActionGate';
 import ManualReviewJobPrimaryUserComponent from './v2/user/ManualReviewJobPrimaryUserComponent';
 
 const { Option } = Select;
@@ -76,7 +73,9 @@ const { TextArea } = Input;
 // Narrows the GraphQL union of action types to "this one declares parameter
 // inputs". Only `CustomAction` carries `parameters`; everything else is
 // treated as no-parameter.
-function actionHasParameters(action: { __typename?: string } | undefined): boolean {
+function actionHasParameters(
+  action: { __typename?: string } | undefined,
+): boolean {
   if (!action || !('parameters' in action)) return false;
   const params = (action as { parameters?: readonly unknown[] | null })
     .parameters;
@@ -541,6 +540,15 @@ function ManualReviewJobReviewImpl(props: {
       },
     });
 
+  // Match the server's room-action discriminator for primary and related actions.
+  const requiresRoomDecisionReason = [
+    ...selectedPrimaryActions,
+    ...selectedRelatedActions,
+  ].some(({ action }) => 'id' in action && action.name.startsWith('concord_'));
+  const requiresDecisionReason =
+    Boolean(data?.myOrg?.requiresDecisionReasonInMrt) ||
+    requiresRoomDecisionReason;
+
   const canBeSubmitted = (() => {
     if (selectedPrimaryActions.length === 0 || submissionLoading) {
       return false;
@@ -594,11 +602,12 @@ function ManualReviewJobReviewImpl(props: {
       }
     }
 
-    // If the org requires a decision reason, and no decision reason has been
-    // provided, return false
+    if (requiresDecisionReason && !isNonEmptyString(decisionReason)) {
+      return false;
+    }
     if (
-      data?.myOrg?.requiresDecisionReasonInMrt &&
-      !isNonEmptyString(decisionReason)
+      requiresRoomDecisionReason &&
+      (!decisionReason?.trim() || decisionReason.length > 2048)
     ) {
       return false;
     }
@@ -630,16 +639,16 @@ function ManualReviewJobReviewImpl(props: {
   const job = closedJob
     ? closedJob
     : jobData
-    ? jobData.dequeueManualReviewJob?.job
-    : data?.me?.reviewableQueues
-        .find((queue) => queue.id === queueId)
-        ?.jobs.find((job) => job.id === jobId);
+      ? jobData.dequeueManualReviewJob?.job
+      : data?.me?.reviewableQueues
+          .find((queue) => queue.id === queueId)
+          ?.jobs.find((job) => job.id === jobId);
   const pendingJobCount = jobData?.dequeueManualReviewJob
     ? jobData.dequeueManualReviewJob.numPendingJobs
     : data?.me?.reviewableQueues
-    ? data?.me?.reviewableQueues.find((queue) => queue.id === queueId)
-        ?.pendingJobCount
-    : undefined;
+      ? data?.me?.reviewableQueues.find((queue) => queue.id === queueId)
+          ?.pendingJobCount
+      : undefined;
 
   const [logSkip] = useGQLLogSkipMutation({
     // This is safe because we check it before calling logSkip
@@ -719,7 +728,7 @@ function ManualReviewJobReviewImpl(props: {
   );
   const { payload, policyIds } = job;
   const reportHistory =
-    'reportHistory' in job.payload ? job.payload.reportHistory ?? [] : [];
+    'reportHistory' in job.payload ? (job.payload.reportHistory ?? []) : [];
 
   const modal = (
     <CoopModal
@@ -797,7 +806,8 @@ function ManualReviewJobReviewImpl(props: {
   const threadItems =
     payload.__typename === 'UserManualReviewJobPayload' ||
     payload.__typename === 'ContentManualReviewJobPayload'
-      ? (payload.itemThreadContentItems as ReadonlyArray<GQLContentItem>) ?? []
+      ? ((payload.itemThreadContentItems as ReadonlyArray<GQLContentItem>) ??
+        [])
       : [];
   const policiesFromIds = (policyIds: readonly string[]) =>
     policyIds.map((policyId) => {
@@ -860,17 +870,18 @@ function ManualReviewJobReviewImpl(props: {
 
   // Builds the standard target descriptor for the reported item. Hoisted so
   // both the direct-add path and the modal Save handler use the same shape.
-  const reportedItemTarget = (): ManualReviewJobEnqueuedPrimaryActionData['target'] => ({
-    identifier: {
-      itemId: reportedItem.id,
-      itemTypeId: reportedItem.type.id,
-    },
-    displayName:
-      getFieldValueForRole<GQLSchemaFieldRoles, keyof GQLSchemaFieldRoles>(
-        reportedItem,
-        'displayName',
-      ) ?? reportedItem.id,
-  });
+  const reportedItemTarget =
+    (): ManualReviewJobEnqueuedPrimaryActionData['target'] => ({
+      identifier: {
+        itemId: reportedItem.id,
+        itemTypeId: reportedItem.type.id,
+      },
+      displayName:
+        getFieldValueForRole<GQLSchemaFieldRoles, keyof GQLSchemaFieldRoles>(
+          reportedItem,
+          'displayName',
+        ) ?? reportedItem.id,
+    });
 
   // Returns the parameter spec for a CustomAction by id, or `[]` for
   // built-ins / actions without a spec. Looks up against `decisionActions`
@@ -939,7 +950,8 @@ function ManualReviewJobReviewImpl(props: {
       className="sticky flex flex-col border border-gray-200 border-solid rounded-md shrink-0"
       data-testid="manual-review-decision-action-list"
     >
-      {decisionActions.map((action) => {
+      {decisionActions
+        .map((action) => {
           const { key, selected, label } = (() => {
             if ('type' in action) {
               return {
@@ -1284,6 +1296,7 @@ function ManualReviewJobReviewImpl(props: {
       className="rounded-md"
       placeholder="Reason for decision"
       rows={6}
+      maxLength={requiresRoomDecisionReason ? 2048 : undefined}
       onChange={(e) => setDecisionReason(e.target.value)}
       value={decisionReason}
     />
@@ -1340,8 +1353,8 @@ function ManualReviewJobReviewImpl(props: {
           payload.__typename === 'UserManualReviewJobPayload'
             ? filterNullOrUndefined(payload.reportedItems ?? [])
             : payload.__typename === 'ContentManualReviewJobPayload'
-            ? [{ id: payload.item.id, typeId: payload.item.type.id }]
-            : []
+              ? [{ id: payload.item.id, typeId: payload.item.type.id }]
+              : []
         }
         otherItems={payload.itemThreadContentItems as readonly GQLContentItem[]}
         allActions={filteredActions}
@@ -1521,7 +1534,7 @@ function ManualReviewJobReviewImpl(props: {
               <div className="self-start my-2 text-lg font-bold">Policy</div>
               {policiesSection}
             </div>
-            {org.requiresDecisionReasonInMrt ? (
+            {requiresDecisionReason ? (
               <div className="flex flex-col mb-4">
                 <div className="self-start my-2 text-lg font-bold">Reason</div>
                 {decisionReasonSection}
@@ -1595,8 +1608,7 @@ function ManualReviewJobReviewImpl(props: {
                 onSave={(values) => {
                   if (paramsModal.mode === 'create') {
                     const action = decisionActions.find(
-                      (a) =>
-                        !('type' in a) && a.id === paramsModal.actionId,
+                      (a) => !('type' in a) && a.id === paramsModal.actionId,
                     );
                     if (action) {
                       addPrimaryAction(action, { ...values });
@@ -1771,6 +1783,15 @@ function ManualReviewJobReviewImpl(props: {
                         relatedItemActions: selectedRelatedActions.map(
                           (action) => ({
                             actionIds: [action.action.id],
+                            actionIdsToMrtApiParamDecisionPayload:
+                              action.customMrtApiParamDecisionPayload == null
+                                ? undefined
+                                : {
+                                    [action.action.id]:
+                                      // Parameter form values are JSON; the store
+                                      // uses unknown to support custom controls.
+                                      action.customMrtApiParamDecisionPayload as JsonObject,
+                                  },
                             itemIds: [action.target.identifier.itemId],
                             itemTypeId: action.target.identifier.itemTypeId,
                             policyIds: action.policies.map(

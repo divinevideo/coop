@@ -81,6 +81,8 @@ export type CoopRequestQuery<T extends HandleResponseBody> = {
   url: string;
   method: 'get' | 'post' | 'put' | 'patch' | 'delete' | 'head' | 'options';
   handleResponseBody: T;
+  /** Credential-bound service calls must not forward headers to redirects. */
+  redirect?: 'follow' | 'error';
   headers?: Record<string, string | ReadonlyArray<string>>;
   logRequestAndResponseBody?: 'ALWAYS' | 'ON_FAILURE' | 'NEVER';
   /**
@@ -307,6 +309,7 @@ export async function fetchHTTP<T extends HandleResponseBody>(
         duplex: finalBody instanceof ReadableStream ? 'half' : undefined,
         dispatcher: agentMapping[query.maxResponseSize ?? '5mb'],
         signal,
+        redirect: query.redirect,
       });
 
       span.setAttribute('http.status_code', response.status);

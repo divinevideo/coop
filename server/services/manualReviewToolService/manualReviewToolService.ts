@@ -12,6 +12,8 @@ import {
   type Invoker,
   type UserPermission,
 } from '../../models/types/permissioning.js';
+import { type PreparedMemberIntent } from '../../routes/concord/memberIntents.js';
+import { type StaffActor } from '../../routes/concord/service.js';
 import { jsonStringify } from '../../utils/encoding.js';
 import { isCoopErrorOfType } from '../../utils/errors.js';
 import { isUniqueViolationError } from '../../utils/kysely.js';
@@ -300,6 +302,10 @@ export class ManualReviewToolService {
       input: ManualReviewJobInput | ManualReviewAppealJobInput,
       queueId: string,
     ) => Promise<void>,
+    getRoomActor?: (id: string, orgId: string) => Promise<StaffActor>,
+    prepareRoomIntents?: (
+      input: OnRecordDecisionInput,
+    ) => Promise<PreparedMemberIntent[]>,
   ) {
     this.queueOps = new QueueOperations(
       pgQuery,
@@ -332,6 +338,8 @@ export class ManualReviewToolService {
       onRecordDecision,
       moderationConfigService,
       this.tracer,
+      getRoomActor,
+      prepareRoomIntents,
     );
     this.jobRendering = new JobRendering(pgQuery);
     this.decisionAnalytics = new DecisionAnalytics(pgQueryReadReplica);
@@ -355,7 +363,7 @@ export class ManualReviewToolService {
   async enqueue(input: ManualReviewJobInput, queueId?: string) {
     const MAX_ENQUEUE_ATTEMPTS = 5;
 
-    await this.tracer.addActiveSpan(
+    return this.tracer.addActiveSpan(
       {
         resource: 'mrtService',
         operation: 'enqueue',
@@ -520,6 +528,7 @@ export class ManualReviewToolService {
           const { targetQueueForNewJob } = enqueueResult;
           this.onEnqueue(input, targetQueueForNewJob).catch(() => {});
         }
+        return enqueueResult;
       },
     );
   }
@@ -553,9 +562,8 @@ export class ManualReviewToolService {
             `No item type for org ${input.orgId} with ID ${input.payload.item.itemTypeIdentifier.id}`,
           );
         }
-        const enrichedJobPayload = await this.jobEnrichment.enrichAppealPayload(
-          input,
-        );
+        const enrichedJobPayload =
+          await this.jobEnrichment.enrichAppealPayload(input);
 
         const attemptAppealEnqueue = async (): Promise<
           | { job: ManualReviewAppealJob; targetQueueForNewJob: string }
@@ -688,10 +696,10 @@ export class ManualReviewToolService {
           ? _.uniqBy(
               [
                 ...('itemThreadContentItems' in newJob
-                  ? newJob.itemThreadContentItems ?? []
+                  ? (newJob.itemThreadContentItems ?? [])
                   : []),
                 ...('itemThreadContentItems' in existingJob
-                  ? existingJob.itemThreadContentItems ?? []
+                  ? (existingJob.itemThreadContentItems ?? [])
                   : []),
               ],
               (it) => jsonStringify([it.itemId, it.itemTypeIdentifier.id]),
@@ -704,10 +712,10 @@ export class ManualReviewToolService {
           ? _.uniqBy(
               [
                 ...('reportedItems' in newJob
-                  ? newJob.reportedItems ?? []
+                  ? (newJob.reportedItems ?? [])
                   : []),
                 ...('reportedItems' in existingJob
-                  ? existingJob.reportedItems ?? []
+                  ? (existingJob.reportedItems ?? [])
                   : []),
               ],
               (it) => jsonStringify([it.id, it.typeId]),
@@ -1077,13 +1085,45 @@ export class ManualReviewToolService {
         queueId,
       });
 
-    let shouldBeAutoActioned = queue?.autoCloseJobs ?? false;
-    let job = await this.queueOps.dequeueNextJobWithLock({
-      orgId,
-      queueId,
-      lockToken: userId,
-    });
-    if (!shouldBeAutoActioned || !job) {
+    let shouldBeAutoActioned =
+      !queue?.isAppealsQueue && (queue?.autoCloseJobs ?? false);
+    const getNext = queue?.isAppealsQueue
+      ? this.queueOps.dequeueNextAppealJobWithLock.bind(this.queueOps)
+      : this.queueOps.dequeueNextJobWithLock.bind(this.queueOps);
+    const dequeue = async () => {
+      let next = await getNext({
+        orgId,
+        queueId,
+        lockToken: userId,
+      });
+      // Dequeue also resumes persisted room intent; a new reviewer need not
+      // reconstruct another reviewer's exact recorded reason and parameters.
+      while (next) {
+        let resumed: boolean;
+        try {
+          resumed = await this.jobDecisioning.retryRecordedRoomDecision({
+            orgId,
+            queueId,
+            jobId: next.job.id,
+            lockToken: next.lockToken,
+            reviewerId: userId,
+            ...(queue?.isAppealsQueue ? { isAppealsQueue: true } : {}),
+          });
+        } catch {
+          return { job: next, recoveryPending: true };
+        }
+        if (!resumed) break;
+        next = await getNext({
+          orgId,
+          queueId,
+          lockToken: userId,
+        });
+      }
+      return { job: next, recoveryPending: false };
+    };
+    const initial = await dequeue();
+    let job = initial.job;
+    if (initial.recoveryPending || !shouldBeAutoActioned || !job) {
       return job;
     }
 
@@ -1130,7 +1170,10 @@ export class ManualReviewToolService {
       } else {
         await this.submitDecision({
           queueId,
-          reportHistory: job.job.payload.reportHistory,
+          reportHistory:
+            'reportHistory' in job.job.payload
+              ? job.job.payload.reportHistory
+              : [],
           jobId: job.job.id,
           lockToken: job.lockToken,
           automaticCloseDecision: {
@@ -1141,13 +1184,10 @@ export class ManualReviewToolService {
           orgId,
         });
 
-        job = await this.queueOps.dequeueNextJobWithLock({
-          orgId,
-          queueId,
-          lockToken: userId,
-        });
+        const next = await dequeue();
+        job = next.job;
 
-        if (!job) {
+        if (next.recoveryPending || !job) {
           return job;
         }
       }
@@ -1168,7 +1208,15 @@ export class ManualReviewToolService {
   ) {
     // As submitDecision is a public method, we assume the passed in jobId is an
     // external id (which are the only kind that should leave the mrt service).
-    return this.jobDecisioning.submitDecision(opts as SubmitDecisionInput);
+    const queue =
+      await this.queueOps.getQueueForOrgAndDangerouslyBypassPermissioning({
+        orgId: opts.orgId,
+        queueId: opts.queueId,
+      });
+    return this.jobDecisioning.submitDecision({
+      ...opts,
+      isAppealsQueue: queue?.isAppealsQueue ?? false,
+    } as SubmitDecisionInput);
   }
 
   async getNcmecDecisions(opts: { startDate: Date; endDate: Date }) {

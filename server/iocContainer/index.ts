@@ -18,6 +18,10 @@ import { type JsonObject, type ReadonlyDeep } from 'type-fest';
 import { v1 as uuidv1 } from 'uuid';
 
 import makeDb from '../models/index.js';
+import { assertRoomActionConfigurationAvailable, assertRoomRelatedItemTypeAvailable } from '../services/manualReviewToolService/index.js';
+import { roomActor } from '../routes/concord/authorization.js';
+import { loadConcordConfig, roomAction } from '../routes/concord/service.js';
+import { prepareMemberIntent } from '../routes/concord/memberIntents.js';
 import type { IActionExecutionsAdapter } from '../plugins/warehouse/queries/IActionExecutionsAdapter.js';
 import type { IActionStatisticsAdapter } from '../plugins/warehouse/queries/IActionStatisticsAdapter.js';
 import type { IContentApiRequestsAdapter } from '../plugins/warehouse/queries/IContentApiRequestsAdapter.js';
@@ -834,6 +838,7 @@ export default async function getBottle() {
         reviewerId,
         reviewerEmail,
         decisionReason,
+        roomDeliveryRequired,
       }) {
         const { orgId } = job;
         const { itemId, itemTypeIdentifier, data } = job.payload.item;
@@ -885,9 +890,12 @@ export default async function getBottle() {
           const nonNullActionsWithCustomMrtParams =
             actionsWithCustomMrtParams.filter((a) => a.action !== undefined);
 
+          if (roomDeliveryRequired)
+            assertRoomActionConfigurationAvailable(actionIds, actions);
+          const roomDelivery = roomDeliveryRequired || actions.some((action) => action.name.startsWith('concord_'));
           const correlationId = toCorrelationId({
             type: 'mrt-decision',
-            id: uuidv1(),
+            id: roomDelivery ? job.id : uuidv1(),
           });
           const itemType = await container.getItemTypeEventuallyConsistent({
             orgId,
@@ -904,7 +912,7 @@ export default async function getBottle() {
             'submissionId' in item && !('itemType' in item)
               ? itemSubmissionWithTypeIdentifierToItemSubmission(item, itemType)
               : item;
-          actionPublisher
+          const publishing = actionPublisher
             .publishActions(
               nonNullActionsWithCustomMrtParams.map((action) => ({
                 // we can cast to non-undefined (!) because we know that
@@ -928,9 +936,15 @@ export default async function getBottle() {
                 targetItem: itemSubmission,
                 actorId,
                 actorEmail,
+                decisionReason: params.decisionReason,
               },
-            )
-            .catch((error) => {
+            );
+          if (roomDelivery) {
+            const outcomes = await publishing;
+            if (outcomes.some((outcome) => !outcome.success)) throw new Error('Room enforcement was not durably accepted');
+            return;
+          }
+          publishing.catch((error) => {
               container.Tracer.addSpan(
                 { resource: 'actionPublisher', operation: 'publishAction' },
                 (span) => {
@@ -1121,6 +1135,7 @@ export default async function getBottle() {
                   item: job.payload.item,
                   actorId: reviewerId,
                   actorEmail: reviewerEmail,
+                  decisionReason,
                 });
                 break;
               case 'SUBMIT_NCMEC_REPORT':
@@ -1345,10 +1360,20 @@ export default async function getBottle() {
             });
 
             if (!itemType) {
+              if (roomDeliveryRequired)
+                assertRoomRelatedItemTypeAvailable(itemType);
               return;
             }
             const decisionActions = actionIds.map((actionId) => ({
               actionId,
+              ...(roomDeliveryRequired
+                ? {
+                    customMrtApiParamDecisionPayload: it
+                      .actionIdsToMrtApiParamDecisionPayload?.[actionId] as
+                      | Record<string, unknown>
+                      | undefined,
+                  }
+                : {}),
             }));
 
             if (isNonEmptyArray(decisionActions)) {
@@ -1359,6 +1384,7 @@ export default async function getBottle() {
                 item: { itemId, itemType },
                 actorId: reviewerId,
                 actorEmail: reviewerEmail,
+                decisionReason,
               });
             }
           }),
@@ -1368,6 +1394,120 @@ export default async function getBottle() {
         _input: ManualReviewJobInput | ManualReviewAppealJobInput,
         _queueId: string,
       ) {},
+      async (id, orgId) =>
+        roomActor(
+          {
+            UserAPIDataSource: container.UserAPIDataSource,
+            ManualReviewToolService: container.ManualReviewToolService,
+          },
+          loadConcordConfig(process.env),
+          id,
+          orgId,
+        ),
+      async ({
+        job,
+        decisionComponents,
+        relatedActions,
+        reviewerId,
+        decisionReason,
+      }) => {
+        const orgId = job.orgId;
+        const config = loadConcordConfig(process.env);
+        const deps = {
+          fetchHTTP: container.fetchHTTP,
+          getActor: async (id: string, orgId: string) =>
+            roomActor(
+              {
+                UserAPIDataSource: container.UserAPIDataSource,
+                ManualReviewToolService: container.ManualReviewToolService,
+              },
+              config,
+              id,
+              orgId,
+            ),
+        };
+        const targets = [
+          ...decisionComponents.flatMap((part) =>
+            part.type === 'CUSTOM_ACTION'
+              ? part.actions.map((action) => ({
+                  actionId: action.id,
+                  itemId: job.payload.item.itemId,
+                  itemTypeId: job.payload.item.itemTypeIdentifier.id,
+                  data: job.payload.item.data,
+                  parameters:
+                    part.actionIdsToMrtApiParamDecisionPayload?.[action.id],
+                }))
+              : [],
+          ),
+          ...relatedActions.flatMap((part) =>
+            part.itemIds.flatMap((itemId) =>
+              part.actionIds.map((actionId) => ({
+                actionId,
+                itemId,
+                itemTypeId: part.itemTypeId,
+                data: undefined,
+                parameters:
+                  part.actionIdsToMrtApiParamDecisionPayload?.[actionId],
+              })),
+            ),
+          ),
+        ];
+        const intents = [];
+        for (const target of targets) {
+          const [action] = await container.getActionsByIdEventuallyConsistent({
+            orgId,
+            ids: [target.actionId],
+          });
+          if (!action) throw new Error('Room action configuration unavailable');
+          const kind = roomAction(action.name);
+          if (kind !== 'ban_member' && kind !== 'unban_member') continue;
+          const itemType = await container.getItemTypeEventuallyConsistent({
+            orgId,
+            typeSelector: { id: target.itemTypeId },
+          });
+          const data =
+            target.data ??
+            (
+              await container.ItemInvestigationService.getItemByIdentifier({
+                orgId,
+                itemIdentifier: {
+                  id: target.itemId,
+                  typeId: target.itemTypeId,
+                },
+                latestSubmissionOnly: true,
+              })
+            )?.latestSubmission?.data;
+          if (
+            !itemType ||
+            typeof data?.case_id !== 'string' ||
+            action.callbackUrl !== config.origin + '/v1/decisions'
+          )
+            throw new Error('Membership case configuration unavailable');
+          intents.push(
+            await prepareMemberIntent(config, deps, {
+              orgId,
+              actionId: action.id,
+              actionName: action.name,
+              itemId: target.itemId,
+              itemTypeId: itemType.id,
+              itemTypeName: itemType.name,
+              caseId: data.case_id,
+              correlationId: String(
+                toCorrelationId({ type: 'mrt-decision', id: job.id }),
+              ),
+              actorId: reviewerId,
+              note: decisionReason,
+              parameters:
+                target.parameters &&
+                typeof target.parameters === 'object' &&
+                !Array.isArray(target.parameters)
+                  ? (target.parameters as Record<string, unknown>)
+                  : {},
+            }),
+          );
+        }
+        return intents;
+      },
     );
   });
 

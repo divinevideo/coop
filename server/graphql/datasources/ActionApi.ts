@@ -3,6 +3,7 @@ import pLimit from 'p-limit';
 import { v1 as uuidv1 } from 'uuid';
 
 import { inject, type Dependencies } from '../../iocContainer/index.js';
+import { roomAction, UUID } from '../../routes/concord/service.js';
 import {
   parseStoredParameters,
   validateActionParameterValues,
@@ -100,8 +101,7 @@ class ActionAPI {
         callbackUrlHeaders,
         callbackUrlBody,
         applyUserStrikes: applyUserStrikes ?? undefined,
-        parameters:
-          parameters === undefined ? undefined : (parameters ?? []),
+        parameters: parameters === undefined ? undefined : (parameters ?? []),
       },
       itemTypeIds: itemTypeIds ?? undefined,
     });
@@ -142,6 +142,7 @@ class ActionAPI {
      * `actorNote` and persisted in the audit log (PR 3).
      */
     actorNote?: string | null;
+    operationId?: string | null;
   }) {
     const {
       itemIds,
@@ -186,9 +187,22 @@ class ActionAPI {
       actionIdToParameters ?? null,
     );
 
+    const isRoom = actions.some((action) => action.name.startsWith('concord_'));
+    if (
+      isRoom &&
+      (!opts.operationId ||
+        !UUID.test(opts.operationId) ||
+        actions.length !== 1 ||
+        actionIds.length !== 1 ||
+        itemIds.length !== 1)
+    ) {
+      throw new Error(
+        'Room actions require one item, one action and a persistent operation ID',
+      );
+    }
     const correlationId = toCorrelationId({
       type: 'manual-action-run',
-      id: uuidv1(),
+      id: isRoom ? opts.operationId! : uuidv1(),
     });
     // Limit the number of concurrent requests to avoid overwhelming the
     // custom action endpoints
@@ -212,7 +226,9 @@ class ActionAPI {
             matchingRules: undefined as undefined,
             ruleEnvironment: undefined as undefined,
             policies,
-            customMrtApiParamDecisionPayload: validatedParameters.get(action.id),
+            customMrtApiParamDecisionPayload: validatedParameters.get(
+              action.id,
+            ),
           }));
 
           // If the item isn't found, pass it along to the action publisher
@@ -221,8 +237,33 @@ class ActionAPI {
           // never been submitted to us at all.
           const targetItem = itemSubmission ?? {
             itemId,
-            itemType: { id: itemType.id, kind: itemType.kind, name: itemType.name },
+            itemType: {
+              id: itemType.id,
+              kind: itemType.kind,
+              name: itemType.name,
+            },
           };
+          const membership = actions.filter((action) =>
+            ['ban_member', 'unban_member'].includes(
+              roomAction(action.name) ?? '',
+            ),
+          );
+          for (const action of membership) {
+            const caseId = itemSubmission?.data.case_id;
+            await this.actionPublisher.recordManualRoomIntent({
+              orgId,
+              actionId: action.id,
+              actionName: action.name,
+              itemId,
+              itemTypeId: itemType.id,
+              itemTypeName: itemType.name,
+              caseId: typeof caseId === 'string' ? caseId : '',
+              correlationId: String(correlationId),
+              actorId,
+              note: actorNote ?? undefined,
+              parameters: validatedParameters.get(action.id) ?? {},
+            });
+          }
           return this.actionPublisher.publishActions(triggered, {
             orgId,
             correlationId,
@@ -250,10 +291,15 @@ class ActionAPI {
     const out = new Map<string, Record<string, unknown> | undefined>();
     for (const action of actions) {
       const spec = parseStoredParameters(
-        action.actionType === 'CUSTOM_ACTION' ? action.customMrtApiParams : null,
+        action.actionType === 'CUSTOM_ACTION'
+          ? action.customMrtApiParams
+          : null,
       );
       const supplied = rawByActionId?.[action.id];
-      if (spec.length === 0 && (supplied === undefined || Object.keys(supplied).length === 0)) {
+      if (
+        spec.length === 0 &&
+        (supplied === undefined || Object.keys(supplied).length === 0)
+      ) {
         // No spec, no values — nothing to do for this action.
         continue;
       }
@@ -261,7 +307,10 @@ class ActionAPI {
       // keys, etc. Validation runs even when no values are supplied so that
       // missing-required-with-no-default is caught.
       const validated = validateActionParameterValues(spec, supplied ?? null);
-      out.set(action.id, Object.keys(validated).length > 0 ? validated : undefined);
+      out.set(
+        action.id,
+        Object.keys(validated).length > 0 ? validated : undefined,
+      );
     }
     return out;
   }
