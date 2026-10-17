@@ -1,11 +1,12 @@
 import { type ColumnType, type GeneratedAlways } from 'kysely';
 
-import { type ConditionSetWithResultAsLogged } from '../analyticsLoggers/ruleExecutionLoggingUtils.js';
+import { type MemberIntentPg } from '../../routes/concord/memberIntents.js';
 import {
   type FilterableWarehouseDate,
   type WarehouseDate,
 } from '../../storage/dataWarehouse/warehouseDateTypes.js';
 import { type JsonOf } from '../../utils/encoding.js';
+import { type ConditionSetWithResultAsLogged } from '../analyticsLoggers/ruleExecutionLoggingUtils.js';
 import { type NormalizedItemData } from '../itemProcessingService/toNormalizedItemDataOrErrors.js';
 import {
   type ConditionSet,
@@ -64,7 +65,7 @@ export type RoutingRuleExecutionsRow = {
     }
 );
 
-export type ManualReviewToolServicePg = {
+export type ManualReviewToolServicePg = MemberIntentPg & {
   'manual_review_tool.manual_review_queues': {
     id: string;
     name: string;

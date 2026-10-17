@@ -19,7 +19,7 @@ test.each(['accepted', 'unavailable'])(
       {
         queueOps: {
           getQueueForOrgAndDangerouslyBypassPermissioning: async () => ({
-          autoCloseJobs: kind === 'unavailable',
+            autoCloseJobs: kind === 'unavailable',
           }),
           dequeueNextJobWithLock: dequeue,
         },
@@ -43,3 +43,42 @@ test.each(['accepted', 'unavailable'])(
     expect(dequeue).toHaveBeenCalledTimes(kind === 'accepted' ? 2 : 1);
   },
 );
+
+test('appeal queue metadata selects appeal dequeue and passes the recorded recovery scope', async () => {
+  const recorded = { job: { id: 'recorded-appeal' }, lockToken: 'lock' };
+  const next = { job: { id: 'fresh-appeal' }, lockToken: 'new-lock' };
+  const dequeueAppeal = jest
+    .fn()
+    .mockResolvedValueOnce(recorded)
+    .mockResolvedValue(next);
+  const dequeueDefault = jest.fn();
+  const retry = jest.fn(
+    async ({ jobId }: { jobId: string }) => jobId === 'recorded-appeal',
+  );
+  const service = Object.assign(
+    Object.create(ManualReviewToolService.prototype),
+    {
+      queueOps: {
+        getQueueForOrgAndDangerouslyBypassPermissioning: async () => ({
+          isAppealsQueue: true,
+          autoCloseJobs: true,
+        }),
+        dequeueNextAppealJobWithLock: dequeueAppeal,
+        dequeueNextJobWithLock: dequeueDefault,
+      },
+      jobDecisioning: { retryRecordedRoomDecision: retry },
+    },
+  ) as ManualReviewToolService;
+  await expect(
+    service.dequeueNextJob({
+      orgId: 'synthetic',
+      queueId: 'appeals',
+      userId: 'staff',
+    }),
+  ).resolves.toEqual(next);
+  expect(dequeueDefault).not.toHaveBeenCalled();
+  expect(dequeueAppeal).toHaveBeenCalledTimes(2);
+  expect(retry).toHaveBeenCalledWith(
+    expect.objectContaining({ jobId: 'recorded-appeal', isAppealsQueue: true }),
+  );
+});

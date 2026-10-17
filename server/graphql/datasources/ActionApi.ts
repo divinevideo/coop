@@ -3,7 +3,7 @@ import pLimit from 'p-limit';
 import { v1 as uuidv1 } from 'uuid';
 
 import { inject, type Dependencies } from '../../iocContainer/index.js';
-import { UUID } from '../../routes/concord/service.js';
+import { roomAction, UUID } from '../../routes/concord/service.js';
 import {
   parseStoredParameters,
   validateActionParameterValues,
@@ -243,6 +243,27 @@ class ActionAPI {
               name: itemType.name,
             },
           };
+          const membership = actions.filter((action) =>
+            ['ban_member', 'unban_member'].includes(
+              roomAction(action.name) ?? '',
+            ),
+          );
+          for (const action of membership) {
+            const caseId = itemSubmission?.data.case_id;
+            await this.actionPublisher.recordManualRoomIntent({
+              orgId,
+              actionId: action.id,
+              actionName: action.name,
+              itemId,
+              itemTypeId: itemType.id,
+              itemTypeName: itemType.name,
+              caseId: typeof caseId === 'string' ? caseId : '',
+              correlationId: String(correlationId),
+              actorId,
+              note: actorNote ?? undefined,
+              parameters: validatedParameters.get(action.id) ?? {},
+            });
+          }
           return this.actionPublisher.publishActions(triggered, {
             orgId,
             correlationId,

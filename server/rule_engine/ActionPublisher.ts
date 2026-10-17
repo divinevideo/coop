@@ -1,14 +1,26 @@
 /* eslint-disable max-lines */
 import { type Exception } from '@opentelemetry/api';
 import { type ItemIdentifier } from '@roostorg/types';
+import { type Kysely } from 'kysely';
 import { type JsonObject, type ReadonlyDeep } from 'type-fest';
 
 import { type Dependencies } from '../iocContainer/index.js';
 import { inject } from '../iocContainer/utils.js';
 import { roomActor } from '../routes/concord/authorization.js';
 import {
+  deliverMemberIntent,
+  memberIntentFingerprint,
+  prepareMemberIntent,
+  registerMemberIntents,
+  type MemberDeliveryOutcome,
+  type MemberIntentPg,
+} from '../routes/concord/memberIntents.js';
+import {
   loadConcordConfig,
   publishRoomDecision,
+  roomAction,
+  roomExecutionId,
+  type RoomDecisionInput,
 } from '../routes/concord/service.js';
 import {
   type ActionExecutionCorrelationId,
@@ -76,6 +88,7 @@ export type ActionResult<T extends ActionTargetItem> = {
   actionId: string;
   targetItem: T;
   success: boolean;
+  roomOutcome?: MemberDeliveryOutcome;
 };
 
 export function getUserFromActionTarget(it: ActionTargetItem) {
@@ -127,7 +140,58 @@ class ActionPublisher {
     private itemInvestigationService: Dependencies['ItemInvestigationService'],
     private userStrikeService: Dependencies['UserStrikeService'],
     private userAPIDataSource?: Dependencies['UserAPIDataSource'],
+    private readonly memberIntentPg?: Kysely<MemberIntentPg>,
   ) {}
+
+  async recordManualRoomIntent(input: RoomDecisionInput) {
+    if (!input.correlationId.startsWith('manual-action-run:'))
+      throw new Error('Manual staff operation required');
+    if (!this.memberIntentPg || !this.userAPIDataSource)
+      throw new Error('Membership intent storage unavailable');
+    const prior = await this.memberIntentPg
+      .selectFrom('concord_integration.member_intents')
+      .selectAll()
+      .where('org_id', '=', input.orgId)
+      .where('source_id', '=', input.correlationId)
+      .executeTakeFirst();
+    const config = loadConcordConfig(process.env);
+    if (prior) {
+      // A duplicate operation must preserve its original target and payload even after case expiry.
+      if (
+        prior.fingerprint !==
+        memberIntentFingerprint(
+          { ...input, caseId: input.caseId || prior.case_id },
+          prior.target_key,
+        )
+      )
+        throw new Error('Membership execution intent conflict');
+      return;
+    }
+    const prepared = await prepareMemberIntent(
+      config,
+      this.roomDependencies(config),
+      input,
+    );
+    await this.memberIntentPg
+      .transaction()
+      .execute(async (tx) => registerMemberIntents(tx, [prepared]));
+  }
+
+  private roomDependencies(config: ReturnType<typeof loadConcordConfig>) {
+    return {
+      fetchHTTP: this.fetchHTTP,
+      getActor: async (id: string, orgId: string) =>
+        roomActor(
+          {
+            UserAPIDataSource: this.userAPIDataSource!,
+            ManualReviewToolService: this.manualReviewToolService,
+          },
+          config,
+          id,
+          orgId,
+        ),
+    };
+  }
 
   /**
    * Publishes a set of actions.
@@ -247,7 +311,7 @@ class ActionPublisher {
               );
             },
           );
-          const success = await (async () => {
+          const outcome = await (async () => {
             try {
               return await publishActionWithRetries();
             } catch (e) {
@@ -255,6 +319,7 @@ class ActionPublisher {
             }
           })();
 
+          const success = typeof outcome === 'boolean' ? outcome : true;
           await this.actionExecutionLogger.logActionExecutions({
             executions: [
               {
@@ -289,6 +354,7 @@ class ActionPublisher {
 
           return {
             success,
+            ...(typeof outcome === 'boolean' ? {} : { roomOutcome: outcome }),
             targetItem: executionContext.targetItem,
             actionId: action.id,
           };
@@ -314,7 +380,7 @@ class ActionPublisher {
     >,
     actorNote?: string,
     actorId?: string,
-  ): Promise<boolean> {
+  ): Promise<boolean | MemberDeliveryOutcome> {
     return this.tracer.addActiveSpan(
       { resource: 'actionPublisher', operation: 'publishAction' },
       // eslint-disable-next-line complexity
@@ -351,45 +417,66 @@ class ActionPublisher {
                   !this.userAPIDataSource
                 )
                   return false;
-                const item = await getFullItem();
-                const caseId = item?.data.case_id;
+                const kind = roomAction(action.name);
+                const isMembership =
+                  kind === 'ban_member' || kind === 'unban_member';
+                const recorded =
+                  isMembership && this.memberIntentPg
+                    ? await this.memberIntentPg
+                        .selectFrom('concord_integration.member_intents')
+                        .selectAll()
+                        .where('org_id', '=', orgId)
+                        .where(
+                          'execution_id',
+                          '=',
+                          roomExecutionId({
+                            orgId,
+                            correlationId: String(correlationId),
+                            actionId: action.id,
+                            itemId: targetItem.itemId,
+                            itemTypeId: targetItem.itemType.id,
+                          } as RoomDecisionInput),
+                        )
+                        .executeTakeFirst()
+                    : undefined;
+                const item = recorded ? undefined : await getFullItem();
+                const caseId = recorded?.case_id ?? item?.data.case_id;
                 if (typeof caseId !== 'string') return false;
-                await publishRoomDecision(
-                  config,
-                  {
-                    fetchHTTP: this.fetchHTTP,
-                    getActor: async (id, orgId) =>
-                      roomActor(
-                        {
-                          UserAPIDataSource: this.userAPIDataSource!,
-                          ManualReviewToolService: this.manualReviewToolService,
+                const input: RoomDecisionInput = {
+                  orgId,
+                  actionId: action.id,
+                  actionName: action.name,
+                  itemId: targetItem.itemId,
+                  itemTypeId: targetItem.itemType.id,
+                  itemTypeName: targetItem.itemType.name,
+                  caseId,
+                  correlationId: String(correlationId),
+                  actorId,
+                  note: actorNote,
+                  parameters:
+                    customMrtApiParamDecisionPayload?.discordGuildConfirmed ===
+                    undefined
+                      ? {}
+                      : {
+                          discordGuildConfirmed:
+                            customMrtApiParamDecisionPayload.discordGuildConfirmed,
                         },
-                        config,
-                        id,
-                        orgId,
-                      ),
-                  },
-                  {
-                    orgId,
-                    actionId: action.id,
-                    actionName: action.name,
-                    itemId: targetItem.itemId,
-                    itemTypeId: targetItem.itemType.id,
-                    itemTypeName: targetItem.itemType.name,
-                    caseId,
-                    correlationId: String(correlationId),
-                    actorId,
-                    note: actorNote,
-                    parameters:
-                      customMrtApiParamDecisionPayload?.discordGuildConfirmed ===
-                      undefined
-                        ? {}
-                        : {
-                            discordGuildConfirmed:
-                              customMrtApiParamDecisionPayload.discordGuildConfirmed,
-                          },
-                  },
-                );
+                };
+                if (isMembership) {
+                  if (!this.memberIntentPg)
+                    throw new Error('Membership intent storage unavailable');
+                  return deliverMemberIntent(
+                    this.memberIntentPg,
+                    config,
+                    this.roomDependencies(config),
+                    input,
+                  );
+                } else
+                  await publishRoomDecision(
+                    config,
+                    this.roomDependencies(config),
+                    input,
+                  );
                 return true;
               }
               const customHeaders = action.callbackUrlHeaders;
@@ -652,6 +739,7 @@ export default inject(
     'ItemInvestigationService',
     'UserStrikeService',
     'UserAPIDataSource',
+    'KyselyPg',
   ],
   ActionPublisher,
 );
