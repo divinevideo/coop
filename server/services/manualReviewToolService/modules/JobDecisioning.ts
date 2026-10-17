@@ -232,6 +232,22 @@ export default class JobDecisioning {
     return true;
   }
 
+  async #getJobsForDecision(
+    opts: Pick<
+      SubmitDecisionInput,
+      'orgId' | 'queueId' | 'jobId' | 'isAppealsQueue'
+    >,
+  ) {
+    const query = opts.isAppealsQueue
+      ? this.queueOps.getAppealJobs.bind(this.queueOps)
+      : this.queueOps.getJobs.bind(this.queueOps);
+    return query({
+      orgId: opts.orgId,
+      queueId: opts.queueId,
+      jobIds: [opts.jobId],
+    });
+  }
+
   async submitDecision(opts: SubmitDecisionInput) {
     const {
       queueId,
@@ -246,15 +262,7 @@ export default class JobDecisioning {
       automaticCloseDecision,
     } = opts;
 
-    const [job] = await (
-      opts.isAppealsQueue
-        ? this.queueOps.getAppealJobs.bind(this.queueOps)
-        : this.queueOps.getJobs.bind(this.queueOps)
-    )({
-      orgId,
-      queueId,
-      jobIds: [jobId],
-    });
+    const [job] = await this.#getJobsForDecision(opts);
 
     // If job id is not found in the queue, assume it was already acted on.
     // It could also have never existed, and we could actually check to see

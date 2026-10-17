@@ -1,5 +1,4 @@
 import { type RequestHandler } from 'express';
-import { type Kysely } from 'kysely';
 import { type JsonObject } from 'type-fest';
 
 import { type Dependencies } from '../../iocContainer/index.js';
@@ -9,7 +8,7 @@ import { type Controller } from '../index.js';
 import { accessVerifier } from './access.js';
 import { roomActor } from './authorization.js';
 import { roomIngest } from './ingest.js';
-import { type MemberIntentPg } from './memberIntents.js';
+import { memberIntentStatuses } from './memberIntentStatus.js';
 import {
   loadConcordConfig,
   object,
@@ -108,36 +107,12 @@ export function roomHandler(
         );
         response.status(202).json({ applicable: true, decision: retried });
       } else {
-        const ledger: Kysely<MemberIntentPg> | undefined = deps.KyselyPg;
-        const memberIntents = ledger
-          ? await ledger
-              .selectFrom('concord_integration.member_intents')
-              .select([
-                'execution_id',
-                'revision',
-                'delivery_state',
-                'accepted_decision_id',
-                'superseded_by_execution_id',
-                'bridge_superseded_by_execution_id',
-                'last_attempt_at',
-              ])
-              .where('org_id', '=', actor.orgId)
-              .where('case_id', '=', caseId)
-              .execute()
-          : [];
         response.json({
-          memberIntents: memberIntents.map((intent) => ({
-            executionId: intent.execution_id,
-            sourceOrder: { version: 1, revision: intent.revision },
-            deliveryState: intent.delivery_state,
-            acceptedDecisionId: intent.accepted_decision_id,
-            supersededByExecutionId:
-              intent.superseded_by_execution_id ??
-              intent.bridge_superseded_by_execution_id,
-            acceptanceUnknown:
-              intent.last_attempt_at !== null &&
-              intent.accepted_decision_id === null,
-          })),
+          memberIntents: await memberIntentStatuses(
+            deps.KyselyPg,
+            actor.orgId,
+            caseId,
+          ),
           applicable: true,
           caseId,
           evidenceAvailable: data.evidenceAvailable,

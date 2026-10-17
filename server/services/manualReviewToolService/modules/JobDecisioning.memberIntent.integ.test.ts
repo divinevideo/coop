@@ -5,11 +5,12 @@ import pg from 'pg';
 
 import { UserRole } from '../../../models/types/permissioning.js';
 import { prepareMemberIntent } from '../../../routes/concord/memberIntents.js';
+import { memberIntentTestDatabaseUrl } from '../../../test/memberIntentTestDatabase.js';
 import { type ManualReviewToolServicePg } from '../dbTypes.js';
 import JobDecisioning from './JobDecisioning.js';
 
 const databaseName = `coop_ordering_test_${randomUUID().replaceAll('-', '')}`;
-let admin: pg.Pool;
+let cleanup = async () => {};
 let pgQuery: Kysely<ManualReviewToolServicePg>;
 const config = {
   origin: 'https://moderation.example',
@@ -28,15 +29,11 @@ const getActor = async () => ({
   rejectedByAdmin: false,
 });
 beforeAll(async () => {
-  const value = process.env.MEMBER_INTENT_TEST_DATABASE_URL;
-  if (!value)
-    throw new Error(
-      'Dedicated loopback MEMBER_INTENT_TEST_DATABASE_URL required',
-    );
-  const url = new URL(value);
-  if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))
-    throw new Error('Loopback test database required');
-  admin = new pg.Pool({ connectionString: value });
+  const url = memberIntentTestDatabaseUrl();
+  const admin = new pg.Pool({ connectionString: url.toString() });
+  cleanup = async () => {
+    await admin.end();
+  };
   await admin.query(`CREATE DATABASE ${databaseName}`);
   const databaseUrl = new URL(`/${databaseName}`, url);
   pgQuery = new Kysely({
@@ -44,27 +41,25 @@ beforeAll(async () => {
       pool: new pg.Pool({ connectionString: databaseUrl.toString() }),
     }),
   });
+  cleanup = async () => {
+    await pgQuery.destroy();
+    await admin.query(`DROP DATABASE IF EXISTS ${databaseName}`);
+    await admin.end();
+  };
   await sql`CREATE TABLE public.orgs (id varchar(255) PRIMARY KEY); INSERT INTO public.orgs VALUES ('synthetic'); CREATE SCHEMA manual_review_tool; CREATE TABLE manual_review_tool.manual_review_decisions (id uuid PRIMARY KEY, job_payload jsonb, queue_id text, reviewer_id text, org_id text, decision_components jsonb[], related_actions jsonb[], enqueue_source_info jsonb, item_created_at timestamptz, decision_reason text, created_at timestamptz DEFAULT now())`.execute(
     pgQuery,
   );
   await sql
     .raw(
       await readFile(
-        new URL(
-          '../../../../db/src/scripts/api-server-pg/2026.10.18T00.00.00.add_member_intent_order.sql',
-          import.meta.url,
-        ),
+        '../db/src/scripts/api-server-pg/2026.10.18T00.00.00.add_member_intent_order.sql',
         'utf8',
       ),
     )
     .execute(pgQuery);
 });
 afterAll(async () => {
-  await pgQuery?.destroy();
-  if (admin) {
-    await admin.query(`DROP DATABASE IF EXISTS ${databaseName}`);
-    await admin.end();
-  }
+  await cleanup();
 });
 beforeEach(async () => {
   await sql`TRUNCATE manual_review_tool.manual_review_decisions, concord_integration.member_intent_heads, concord_integration.member_intents, concord_integration.member_intent_quarantine`.execute(

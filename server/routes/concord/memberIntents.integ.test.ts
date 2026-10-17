@@ -4,98 +4,31 @@ import { readFile } from 'node:fs/promises';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 
-import { UserRole } from '../../models/types/permissioning.js';
+import {
+  config,
+  getActor,
+  input,
+  prepared,
+  response,
+} from '../../test/memberIntentFixtures.js';
+import { memberIntentTestDatabaseUrl } from '../../test/memberIntentTestDatabase.js';
 import {
   deliverMemberIntent,
   memberTargetKey,
   prepareMemberIntent,
   registerMemberIntents,
   type MemberIntentPg,
-  type PreparedMemberIntent,
 } from './memberIntents.js';
+import { memberIntentStatuses } from './memberIntentStatus.js';
 import {
   roomExecutionId,
   type RoomDecisionInput,
   type RoomRequest,
-  type RoomStatus,
 } from './service.js';
 
 const databaseName = `coop_ordering_test_${randomUUID().replaceAll('-', '')}`;
-const config = {
-  origin: 'https://moderation.example',
-  orgId: 'synthetic-org',
-  hmacKey: 'ab'.repeat(32),
-  coopOrigin: 'https://coop.example',
-  accessIssuer: 'https://test.cloudflareaccess.com',
-  accessAudience: 'test',
-  queueId: 'queue',
-};
-const actor = {
-  id: 'synthetic-staff',
-  orgId: config.orgId,
-  role: UserRole.ADMIN,
-  approvedByAdmin: true,
-  rejectedByAdmin: false,
-};
-let admin: pg.Pool;
+let cleanup = async () => {};
 let pgQuery: Kysely<MemberIntentPg>;
-const getActor = async () => actor;
-const response = (input: RoomDecisionInput, revision: string): RoomStatus => ({
-  executionId: roomExecutionId(input),
-  sourceOrder: { version: 1, revision },
-  decisionId: randomUUID(),
-  action:
-    input.actionName === 'concord_ban_member' ? 'ban_member' : 'unban_member',
-  target: {
-    communityId: 'a'.repeat(64),
-    channelId: 'b'.repeat(64),
-    rumorId: 'c'.repeat(64),
-  },
-  deliveries: ['divine_relay', 'concord', 'discord'].map((target) => ({
-    target: target as 'concord',
-    state: 'pending',
-    attempts: 0,
-    resultCode: null,
-  })),
-});
-const input = (action = 'concord_ban_member'): RoomDecisionInput => ({
-  orgId: config.orgId,
-  actionId: action,
-  actionName: action,
-  itemId: 'synthetic-item',
-  itemTypeId: 'synthetic-type',
-  itemTypeName: 'concord_member',
-  caseId: randomUUID(),
-  correlationId: `mrt-decision:${randomUUID()}`,
-  actorId: actor.id,
-  note: 'Synthetic reason',
-  parameters: {},
-});
-async function prepared(
-  value: RoomDecisionInput,
-  author = 'd'.repeat(64),
-): Promise<PreparedMemberIntent> {
-  return prepareMemberIntent(
-    config,
-    {
-      getActor,
-      fetchHTTP: async () => ({
-        ok: true,
-        status: 200,
-        body: {
-          caseId: value.caseId,
-          author,
-          target: {
-            communityId: 'a'.repeat(64),
-            channelId: 'b'.repeat(64),
-            rumorId: 'c'.repeat(64),
-          },
-        },
-      }),
-    },
-    value,
-  );
-}
 async function record(value: RoomDecisionInput, author?: string) {
   const intent = await prepared(value, author);
   await pgQuery
@@ -111,19 +44,20 @@ function barrier() {
   return { promise, resolve };
 }
 beforeAll(async () => {
-  const connectionString = process.env.MEMBER_INTENT_TEST_DATABASE_URL;
-  if (!connectionString)
-    throw new Error(
-      'Set MEMBER_INTENT_TEST_DATABASE_URL to a dedicated loopback PostgreSQL test container',
-    );
-  const url = new URL(connectionString);
-  if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))
-    throw new Error('Member intent tests require loopback PostgreSQL');
-  admin = new pg.Pool({ connectionString });
+  const url = memberIntentTestDatabaseUrl();
+  const admin = new pg.Pool({ connectionString: url.toString() });
+  cleanup = async () => {
+    await admin.end();
+  };
   await admin.query(`CREATE DATABASE ${databaseName}`);
   url.pathname = `/${databaseName}`;
   const pool = new pg.Pool({ connectionString: url.toString(), max: 12 });
   pgQuery = new Kysely({ dialect: new PostgresDialect({ pool }) });
+  cleanup = async () => {
+    await pgQuery.destroy();
+    await admin.query(`DROP DATABASE IF EXISTS ${databaseName}`);
+    await admin.end();
+  };
   await sql`CREATE TABLE public.orgs (id varchar(255) PRIMARY KEY)`.execute(
     pgQuery,
   );
@@ -133,21 +67,14 @@ beforeAll(async () => {
   await sql
     .raw(
       await readFile(
-        new URL(
-          '../../../db/src/scripts/api-server-pg/2026.10.18T00.00.00.add_member_intent_order.sql',
-          import.meta.url,
-        ),
+        '../db/src/scripts/api-server-pg/2026.10.18T00.00.00.add_member_intent_order.sql',
         'utf8',
       ),
     )
     .execute(pgQuery);
 });
 afterAll(async () => {
-  await pgQuery?.destroy();
-  if (admin) {
-    await admin.query(`DROP DATABASE IF EXISTS ${databaseName}`);
-    await admin.end();
-  }
+  await cleanup();
 });
 beforeEach(async () => {
   await sql`TRUNCATE concord_integration.member_intent_heads, concord_integration.member_intents, concord_integration.member_intent_quarantine`.execute(
@@ -457,4 +384,77 @@ test('counter mismatch after restore fails closed; exhausted bigint never wraps 
       .selectAll()
       .execute(),
   ).toHaveLength(1);
+});
+
+test('validated bridge stale refusal settles uncertainty and never performs another lookup or POST', async () => {
+  const a = input();
+  await record(a);
+  const successor = randomUUID();
+  const fetchHTTP = jest.fn(async () => ({
+    ok: false,
+    status: 409,
+    body: {
+      error: 'member_intent_superseded',
+      executionId: roomExecutionId(a),
+      currentRevision: '2',
+      supersededByExecutionId: successor,
+    },
+  }));
+  const first = await deliverMemberIntent(
+    pgQuery,
+    config,
+    { getActor, fetchHTTP },
+    a,
+  );
+  expect(first).toMatchObject({
+    outcome: 'superseded',
+    acceptanceUnknown: false,
+    supersededByExecutionId: successor,
+  });
+  expect(
+    await deliverMemberIntent(pgQuery, config, { getActor, fetchHTTP }, a),
+  ).toEqual(first);
+  expect(fetchHTTP).toHaveBeenCalledTimes(1);
+  const stored = await pgQuery
+    .selectFrom('concord_integration.member_intents')
+    .selectAll()
+    .executeTakeFirstOrThrow();
+  expect(stored.last_attempt_at).toBeInstanceOf(Date);
+  expect(await memberIntentStatuses(pgQuery, a.orgId, a.caseId)).toEqual([
+    expect.objectContaining({
+      deliveryState: 'superseded',
+      acceptanceUnknown: false,
+      supersededByExecutionId: successor,
+    }),
+  ]);
+});
+test('local supersession after an uncertain send and lookup404 retains uncertainty in recovery and public status', async () => {
+  const a = input();
+  await record(a);
+  await expect(
+    deliverMemberIntent(
+      pgQuery,
+      config,
+      {
+        getActor,
+        fetchHTTP: async () => {
+          throw new Error('Synthetic lost response');
+        },
+      },
+      a,
+    ),
+  ).rejects.toThrow('lost response');
+  await record(input('concord_unban_member'));
+  const fetchHTTP = jest.fn(async () => ({
+    ok: false,
+    status: 404,
+    body: { error: 'not_found' },
+  }));
+  expect(
+    await deliverMemberIntent(pgQuery, config, { getActor, fetchHTTP }, a),
+  ).toMatchObject({ outcome: 'superseded', acceptanceUnknown: true });
+  expect(fetchHTTP).toHaveBeenCalledTimes(1);
+  expect(await memberIntentStatuses(pgQuery, a.orgId, a.caseId)).toEqual([
+    expect.objectContaining({ acceptanceUnknown: true }),
+  ]);
 });

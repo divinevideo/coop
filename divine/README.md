@@ -88,3 +88,5 @@ npm run test:prepush -- --runInBand --coverage=false concord ActionApi.test.ts A
 npm run typecheck
 npm run lint
 ```
+
+CI runs both PostgreSQL ordering suites explicitly after the normal database suite, using the existing isolated compose test service with `NODE_ENV=test` and `MEMBER_INTENT_TEST_COMPOSE=1`. The shared test helper rejects any other remote host or an unguarded compose connection. Each suite creates and drops only its own uniquely named database; it never resets the existing CI database.
