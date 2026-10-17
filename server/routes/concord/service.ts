@@ -40,7 +40,30 @@ export type RoomRequest = {
 export type RoomTransport = (
   request: RoomRequest,
 ) => Promise<{ ok: boolean; status: number; body: unknown }>;
+export type SourceOrder = { version: 1; revision: string };
+export function parseSourceOrder(value: unknown): SourceOrder {
+  const order = object(value);
+  if (
+    order.version !== 1 ||
+    typeof order.revision !== 'string' ||
+    !/^[1-9][0-9]{0,18}$/.test(order.revision) ||
+    BigInt(order.revision) > 9223372036854775807n
+  )
+    throw new Error('Invalid member source order');
+  return { version: 1, revision: order.revision };
+}
+export class RoomResponseError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    readonly details: Record<string, unknown>,
+  ) {
+    super('Room moderation ' + code);
+  }
+}
 export type RoomStatus = {
+  executionId?: string;
+  sourceOrder?: SourceOrder | null;
   decisionId: string;
   action: RoomAction;
   target: { communityId: string; channelId: string; rumorId: string };
@@ -162,7 +185,7 @@ export async function roomRequest(
   if (actor.orgId !== config.orgId || !roomPermissions(actor).includes('view'))
     throw new Error('Room permission required');
   if (
-    !/^\/v1\/(decisions(?:\/[0-9a-f-]{36}(?:\/retry)?)?|cases\/[0-9a-f-]{36})$/.test(
+    !/^\/v1\/(decisions(?:\/[0-9a-f-]{36}(?:\/retry)?)?|decision-executions\/[0-9a-f-]{36}|cases\/[0-9a-f-]{36})$/.test(
       path,
     )
   )
@@ -207,8 +230,24 @@ export async function roomRequest(
     timeoutMs: 5000,
     redirect: 'error',
   });
-  if (!response.ok || ![200, 202].includes(response.status))
+  if (!response.ok || ![200, 202].includes(response.status)) {
+    const details = object(response.body);
+    if (
+      response.status === 404 ||
+      (response.status === 409 &&
+        [
+          'member_intent_superseded',
+          'member_intent_order_conflict',
+          'member_intent_order_required',
+        ].includes(String(details.error)))
+    )
+      throw new RoomResponseError(
+        response.status,
+        String(details.error),
+        details,
+      );
     throw new Error('Room moderation delivery unavailable');
+  }
   return response.body;
 }
 export function parseRoomStatus(value: unknown): RoomStatus {
@@ -254,6 +293,23 @@ export function parseRoomStatus(value: unknown): RoomStatus {
   )
     throw new Error('Malformed room delivery status');
   return {
+    ...(status.executionId === undefined
+      ? {}
+      : {
+          executionId: UUID.test(String(status.executionId))
+            ? String(status.executionId)
+            : (() => {
+                throw new Error('Malformed execution ID');
+              })(),
+        }),
+    ...(status.sourceOrder === undefined
+      ? {}
+      : {
+          sourceOrder:
+            status.sourceOrder === null
+              ? null
+              : parseSourceOrder(status.sourceOrder),
+        }),
     decisionId: status.decisionId,
     action: status.action as RoomAction,
     target: {
@@ -269,25 +325,43 @@ export function parseRoomStatus(value: unknown): RoomStatus {
     })),
   };
 }
+export type RoomDecisionInput = {
+  orgId: string;
+  actionId: string;
+  actionName: string;
+  itemId: string;
+  itemTypeId: string;
+  itemTypeName: string;
+  caseId: string;
+  correlationId: string;
+  actorId?: string;
+  note?: string;
+  parameters?: Record<string, unknown>;
+};
+export function roomExecutionId(input: RoomDecisionInput): string {
+  return uuidv5(
+    jsonStringify(
+      input.correlationId.startsWith('manual-action-run:')
+        ? [input.orgId, input.correlationId]
+        : [
+            input.orgId,
+            input.correlationId,
+            input.actionId,
+            input.itemTypeId,
+            input.itemId,
+          ],
+    ),
+    '7d6e67c4-c685-4a34-8d53-dd5ca90f1c43',
+  );
+}
 export async function publishRoomDecision(
   config: ConcordConfig,
   dependencies: {
     fetchHTTP: RoomTransport;
     getActor(id: string, orgId: string): Promise<StaffActor>;
+    sourceOrder?: SourceOrder;
   },
-  input: {
-    orgId: string;
-    actionId: string;
-    actionName: string;
-    itemId: string;
-    itemTypeId: string;
-    itemTypeName: string;
-    caseId: string;
-    correlationId: string;
-    actorId?: string;
-    note?: string;
-    parameters?: Record<string, unknown>;
-  },
+  input: RoomDecisionInput,
 ): Promise<RoomStatus> {
   const action = roomAction(input.actionName);
   if (
@@ -303,20 +377,9 @@ export async function publishRoomDecision(
   const actor = await dependencies.getActor(input.actorId, input.orgId);
   const parameters = input.parameters ?? {};
   validateRoomActionPermission(actor, input.actionName, parameters);
-  const executionId = uuidv5(
-    jsonStringify(
-      input.correlationId.startsWith('manual-action-run:')
-        ? [input.orgId, input.correlationId]
-        : [
-            input.orgId,
-            input.correlationId,
-            input.actionId,
-            input.itemTypeId,
-            input.itemId,
-          ],
-    ),
-    '7d6e67c4-c685-4a34-8d53-dd5ca90f1c43',
-  );
+  if (action !== 'remove_message' && !dependencies.sourceOrder)
+    throw new Error('Membership intent must be durably registered');
+  const executionId = roomExecutionId(input);
   const result = parseRoomStatus(
     await roomRequest(
       config,
@@ -327,6 +390,9 @@ export async function publishRoomDecision(
       {
         caseId: input.caseId,
         executionId,
+        ...(action === 'remove_message'
+          ? {}
+          : { sourceOrder: parseSourceOrder(dependencies.sourceOrder) }),
         action,
         reason: input.note,
         scope: action === 'remove_message' ? 'message' : 'community',

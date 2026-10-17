@@ -20,7 +20,8 @@ import { v1 as uuidv1 } from 'uuid';
 import makeDb from '../models/index.js';
 import { assertRoomActionConfigurationAvailable, assertRoomRelatedItemTypeAvailable } from '../services/manualReviewToolService/index.js';
 import { roomActor } from '../routes/concord/authorization.js';
-import { loadConcordConfig } from '../routes/concord/service.js';
+import { loadConcordConfig, roomAction } from '../routes/concord/service.js';
+import { prepareMemberIntent } from '../routes/concord/memberIntents.js';
 import type { IActionExecutionsAdapter } from '../plugins/warehouse/queries/IActionExecutionsAdapter.js';
 import type { IActionStatisticsAdapter } from '../plugins/warehouse/queries/IActionStatisticsAdapter.js';
 import type { IContentApiRequestsAdapter } from '../plugins/warehouse/queries/IContentApiRequestsAdapter.js';
@@ -1403,6 +1404,110 @@ export default async function getBottle() {
           id,
           orgId,
         ),
+      async ({
+        job,
+        decisionComponents,
+        relatedActions,
+        reviewerId,
+        decisionReason,
+      }) => {
+        const orgId = job.orgId;
+        const config = loadConcordConfig(process.env);
+        const deps = {
+          fetchHTTP: container.fetchHTTP,
+          getActor: async (id: string, orgId: string) =>
+            roomActor(
+              {
+                UserAPIDataSource: container.UserAPIDataSource,
+                ManualReviewToolService: container.ManualReviewToolService,
+              },
+              config,
+              id,
+              orgId,
+            ),
+        };
+        const targets = [
+          ...decisionComponents.flatMap((part) =>
+            part.type === 'CUSTOM_ACTION'
+              ? part.actions.map((action) => ({
+                  actionId: action.id,
+                  itemId: job.payload.item.itemId,
+                  itemTypeId: job.payload.item.itemTypeIdentifier.id,
+                  data: job.payload.item.data,
+                  parameters:
+                    part.actionIdsToMrtApiParamDecisionPayload?.[action.id],
+                }))
+              : [],
+          ),
+          ...relatedActions.flatMap((part) =>
+            part.itemIds.flatMap((itemId) =>
+              part.actionIds.map((actionId) => ({
+                actionId,
+                itemId,
+                itemTypeId: part.itemTypeId,
+                data: undefined,
+                parameters:
+                  part.actionIdsToMrtApiParamDecisionPayload?.[actionId],
+              })),
+            ),
+          ),
+        ];
+        const intents = [];
+        for (const target of targets) {
+          const [action] = await container.getActionsByIdEventuallyConsistent({
+            orgId,
+            ids: [target.actionId],
+          });
+          if (!action) throw new Error('Room action configuration unavailable');
+          const kind = roomAction(action.name);
+          if (kind !== 'ban_member' && kind !== 'unban_member') continue;
+          const itemType = await container.getItemTypeEventuallyConsistent({
+            orgId,
+            typeSelector: { id: target.itemTypeId },
+          });
+          const data =
+            target.data ??
+            (
+              await container.ItemInvestigationService.getItemByIdentifier({
+                orgId,
+                itemIdentifier: {
+                  id: target.itemId,
+                  typeId: target.itemTypeId,
+                },
+                latestSubmissionOnly: true,
+              })
+            )?.latestSubmission?.data;
+          if (
+            !itemType ||
+            typeof data?.case_id !== 'string' ||
+            action.callbackUrl !== config.origin + '/v1/decisions'
+          )
+            throw new Error('Membership case configuration unavailable');
+          intents.push(
+            await prepareMemberIntent(config, deps, {
+              orgId,
+              actionId: action.id,
+              actionName: action.name,
+              itemId: target.itemId,
+              itemTypeId: itemType.id,
+              itemTypeName: itemType.name,
+              caseId: data.case_id,
+              correlationId: String(
+                toCorrelationId({ type: 'mrt-decision', id: job.id }),
+              ),
+              actorId: reviewerId,
+              note: decisionReason,
+              parameters:
+                target.parameters &&
+                typeof target.parameters === 'object' &&
+                !Array.isArray(target.parameters)
+                  ? (target.parameters as Record<string, unknown>)
+                  : {},
+            }),
+          );
+        }
+        return intents;
+      },
     );
   });
 

@@ -6,6 +6,11 @@ import { type JsonObject } from 'type-fest';
 
 import { type Dependencies } from '../../../iocContainer/index.js';
 import {
+  registerMemberIntents,
+  type MemberIntentPg,
+  type PreparedMemberIntent,
+} from '../../../routes/concord/memberIntents.js';
+import {
   object,
   validateRoomActionPermission,
   validRoomReason,
@@ -24,6 +29,7 @@ import { type NCMECMediaReport } from '../../ncmecService/ncmecReporting.js';
 import { type ManualReviewToolServicePg } from '../dbTypes.js';
 import { type GetActionsByIdEventuallyConsistent } from '../manualReviewToolQueries.js';
 import {
+  type AppealEnqueueSourceInfo,
   type JobId,
   type ManualReviewAppealJob,
   type ManualReviewJob,
@@ -107,6 +113,7 @@ export type ManualReviewDecisionType =
   | 'RELATED_ACTION';
 
 export type SubmitDecisionInput = {
+  isAppealsQueue?: boolean;
   queueId: string;
   reportHistory: ReportHistory;
   jobId: JobId;
@@ -186,6 +193,9 @@ export default class JobDecisioning {
       id: string,
       orgId: string,
     ) => Promise<StaffActor>,
+    private readonly prepareRoomIntents?: (
+      input: OnRecordDecisionInput,
+    ) => Promise<PreparedMemberIntent[]>,
   ) {}
 
   /** Resume only persisted room intent; the trigger never supplies new intent. */
@@ -195,6 +205,7 @@ export default class JobDecisioning {
     jobId: JobId;
     lockToken: string;
     reviewerId: string;
+    isAppealsQueue?: boolean;
   }): Promise<boolean> {
     const prior = await this.pgQuery
       .selectFrom('manual_review_tool.manual_review_decisions')
@@ -215,7 +226,8 @@ export default class JobDecisioning {
     }).catch((error: unknown) => {
       // Existing submit callers receive this after successful duplicate-record
       // cleanup (or concurrent completion). Both mean recovery can advance.
-      if (!isCoopErrorOfType(error, 'JobHasAlreadyBeenSubmittedError')) throw error;
+      if (!isCoopErrorOfType(error, 'JobHasAlreadyBeenSubmittedError'))
+        throw error;
     });
     return true;
   }
@@ -234,7 +246,11 @@ export default class JobDecisioning {
       automaticCloseDecision,
     } = opts;
 
-    const [job] = await this.queueOps.getJobs({
+    const [job] = await (
+      opts.isAppealsQueue
+        ? this.queueOps.getAppealJobs.bind(this.queueOps)
+        : this.queueOps.getJobs.bind(this.queueOps)
+    )({
       orgId,
       queueId,
       jobIds: [jobId],
@@ -614,13 +630,15 @@ export default class JobDecisioning {
 
   async #logDecision(opts: {
     id: string;
-    job: ManualReviewJob;
+    job: ManualReviewJob | ManualReviewAppealJob;
     queueId: string;
     reviewerId?: string;
     orgId: string;
     decisionComponents: ManualReviewDecisionComponent[];
     relatedActions: ManualReviewDecisionRelatedAction[];
-    enqueueSourceInfo?: ManualReviewJobEnqueueSourceInfo;
+    enqueueSourceInfo?:
+      | ManualReviewJobEnqueueSourceInfo
+      | AppealEnqueueSourceInfo;
     decisionReason?: string;
     roomDeliveryRequired: boolean;
   }) {
@@ -654,23 +672,57 @@ export default class JobDecisioning {
       ? new Date(itemCreatedAtField)
       : null;
 
-    return this.pgQuery
-      .insertInto('manual_review_tool.manual_review_decisions')
-      .values({
+    const values = {
+      id,
+      job_payload: roomDeliveryRequired
+        ? { ...job, roomDeliveryRequired: true as const }
+        : job,
+      queue_id: queueId,
+      reviewer_id: reviewerId,
+      org_id: orgId,
+      decision_components: decisionComponents,
+      related_actions: relatedActions,
+      enqueue_source_info: enqueueSourceInfo,
+      item_created_at: itemCreatedAt,
+      decision_reason: decisionReason,
+    };
+    if (!roomDeliveryRequired || !this.prepareRoomIntents)
+      return this.pgQuery
+        .insertInto('manual_review_tool.manual_review_decisions')
+        .values(values)
+        .execute();
+    const prior = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .select('id')
+      .where('org_id', '=', orgId)
+      .where('id', '=', id)
+      .executeTakeFirst();
+    if (prior)
+      throw new Error(
+        'duplicate key value violates unique constraint "manual_review_decisions_pkey"',
+      );
+    const intents = await this.prepareRoomIntents({
+      job,
+      queueId,
+      reviewerId: reviewerId!,
+      reviewerEmail: '',
+      decisionComponents,
+      relatedActions,
+      decisionReason,
+      roomDeliveryRequired: true,
+    });
+    return this.pgQuery.transaction().execute(async (tx) => {
+      await tx
+        .insertInto('manual_review_tool.manual_review_decisions')
+        .values(values)
+        .execute();
+      // Kysely is invariant in its database schema; this transaction includes the ledger tables.
+      await registerMemberIntents(
+        tx as unknown as Kysely<MemberIntentPg>,
+        intents,
         id,
-        job_payload: roomDeliveryRequired
-          ? { ...job, roomDeliveryRequired: true }
-          : job,
-        queue_id: queueId,
-        reviewer_id: reviewerId,
-        org_id: orgId,
-        decision_components: decisionComponents,
-        related_actions: relatedActions,
-        enqueue_source_info: enqueueSourceInfo,
-        item_created_at: itemCreatedAt,
-        decision_reason: decisionReason,
-      })
-      .execute();
+      );
+    });
   }
 
   async getNcmecDecisions(opts: { startDate: Date; endDate: Date }) {
