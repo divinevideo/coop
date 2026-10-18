@@ -6,6 +6,7 @@ import { type JsonObject, type ReadonlyDeep } from 'type-fest';
 
 import { type Dependencies } from '../iocContainer/index.js';
 import { inject } from '../iocContainer/utils.js';
+import { roomAttemptNotRecorded } from '../routes/concord/attemptOutcome.js';
 import { roomActor } from '../routes/concord/authorization.js';
 import {
   deliverMemberIntent,
@@ -186,7 +187,10 @@ class ActionPublisher {
       config,
       this.roomDependencies(config),
       input,
-    );
+    ).catch((error: unknown) => {
+      // No registration transaction has started for this attempt.
+      throw roomAttemptNotRecorded(error);
+    });
     await this.memberIntentPg
       .transaction()
       .execute(async (tx) => registerMemberIntents(tx, [prepared]));

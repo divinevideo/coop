@@ -22,7 +22,11 @@ import CoopModal from '@/webpages/dashboard/components/CoopModal';
 import PolicyDropdown from '@/webpages/dashboard/components/PolicyDropdown';
 
 import ConcordEnforcementStatus from './ConcordEnforcementStatus';
-import { completeRoomOperation, roomOperation } from './roomOperation';
+import {
+  beginRoomOperation,
+  completeRoomOperation,
+  rejectUnrecordedRoomAttempt,
+} from './roomOperation';
 
 const { Option } = Select;
 
@@ -218,12 +222,39 @@ export default function ItemAction(props: {
         selectedActionIds.includes(action.id) &&
         action.name.startsWith('concord_'),
     );
+    const attempt = roomAction
+      ? beginRoomOperation(itemIdentifier, roomAction.name)
+      : undefined;
     return bulkAction({
+      // A hidden transport retry would invalidate first-attempt rejection certainty.
+      context: { roomOperationAttempt: Boolean(attempt) },
+      onError: (error) => {
+        if (
+          attempt &&
+          error.graphQLErrors.some(
+            (entry) => entry.extensions?.roomAttemptOutcome === 'NOT_RECORDED',
+          ) &&
+          rejectUnrecordedRoomAttempt(
+            itemIdentifier,
+            attempt.operationId,
+            attempt.firstAttempt,
+          )
+        ) {
+          setModalBody(
+            'This attempt was not recorded. You can change the action or reason and submit again.',
+          );
+        } else if (attempt) {
+          setModalBody(
+            'Acceptance is unknown. The original room decision may still execute. Retry the original action and reason, or ask your moderation lead to reconcile it. Changing actions does not cancel it.',
+          );
+        } else {
+          setModalBody('Error submitting actions. Please try again.');
+        }
+        setShowModal(true);
+      },
       variables: {
         input: {
-          operationId: roomAction
-            ? roomOperation(itemIdentifier, roomAction.name)
-            : undefined,
+          operationId: attempt?.operationId,
           itemTypeId: itemIdentifier.typeId,
           actionIds: selectedActionIds,
           itemIds: [itemIdentifier.id],

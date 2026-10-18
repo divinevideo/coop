@@ -47,9 +47,9 @@ test.each(['matching', 'wrong_action'])(
       operationId: `source-order-v1_${kind === 'matching' ? 'ban_member' : 'remove_message'}_10000000-0000-4000-8000-000000000002`,
     };
     if (kind === 'wrong_action') {
-      await expect(api.bulkExecuteActions(opts)).rejects.toThrow(
-        'Room actions require',
-      );
+      await expect(api.bulkExecuteActions(opts)).rejects.toMatchObject({
+        extensions: { roomAttemptOutcome: 'NOT_RECORDED' },
+      });
       expect(recorded).not.toHaveBeenCalled();
       expect(publish).not.toHaveBeenCalled();
       return;
@@ -70,5 +70,67 @@ test.each(['matching', 'wrong_action'])(
       }),
       'https://moderation.example/v1/decisions',
     ]);
+  },
+);
+
+test.each(['validation', 'registration', 'publication'])(
+  'only failures before a recording boundary mark this attempt unrecorded: %s',
+  async (stage) => {
+    const api = new ActionAPI(
+      {
+        recordManualRoomIntent: async () => {
+          if (stage === 'registration')
+            throw new Error('database acknowledgement lost');
+        },
+        publishActions: async () => {
+          throw new Error('response lost');
+        },
+      } as never,
+      {
+        getActions: async () => [
+          {
+            id: 'action',
+            name: 'concord_ban_member',
+            actionType: 'CUSTOM_ACTION',
+            customMrtApiParams: null,
+          },
+        ],
+        getPoliciesByIds: async () => [],
+      } as never,
+      {} as never,
+      {
+        getItemByIdentifier: async () => ({
+          latestSubmission: {
+            data: { case_id: '10000000-0000-4000-8000-000000000001' },
+          },
+        }),
+      } as never,
+      (async () => ({
+        id: 'type',
+        kind: 'USER',
+        name: 'concord_member',
+      })) as never,
+    );
+    const attempt = api.bulkExecuteActions({
+      itemIds: ['item'],
+      actionIds: ['action'],
+      itemTypeId: 'type',
+      policyIds: [],
+      orgId: 'synthetic',
+      actorId: 'staff',
+      actorEmail: 'staff@example.invalid',
+      actorNote: stage === 'validation' ? 'x'.repeat(5001) : 'Reason',
+      operationId:
+        'source-order-v1_ban_member_10000000-0000-4000-8000-000000000002',
+    });
+    if (stage === 'validation') {
+      await expect(attempt).rejects.toMatchObject({
+        extensions: { roomAttemptOutcome: 'NOT_RECORDED' },
+      });
+    } else {
+      await expect(attempt).rejects.not.toHaveProperty(
+        'extensions.roomAttemptOutcome',
+      );
+    }
   },
 );

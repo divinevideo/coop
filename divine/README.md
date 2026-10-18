@@ -92,3 +92,26 @@ npm run lint
 ```
 
 CI runs both PostgreSQL ordering suites explicitly after the normal database suite, using the existing isolated compose test service with `NODE_ENV=test` and `MEMBER_INTENT_TEST_COMPOSE=1`. The shared test helper rejects any other remote host or an unguarded compose connection. Each suite creates and drops only its own uniquely named database; it never resets the existing CI database.
+
+
+### Manual room operation recovery contract
+
+One operation identifies one immutable staff decision. The GraphQL error extension
+`roomAttemptOutcome: NOT_RECORDED` describes only the current request: it failed
+before this attempt could register or publish intent. It is not a statement about
+an earlier request using the same identity. Clients may release an operation only
+when that response belongs to its first attempt and no retry has begun. Persist
+attempt history before HTTP; reloads, browser-held identities, transport failures,
+registration failures and later validation failures retain the original identity.
+A successful retry must use the original action, reason and parameters.
+
+Membership status distinguishes recorded, acceptance unknown, accepted, superseded
+and reconciliation required. Accepted does not mean enforced; superseded does not
+prove an earlier request never executed. A new remove-message decision does not
+cancel a pending membership decision. Lookup 404 recovery retains execution,
+payload, actor and original revision, with a fresh target-head check and bridge
+fencing; it does not create a newer decision.
+
+The explicit replacement interaction, audited terminal refusal/remediation outcome
+and hands-on acceptance remain owner review gates under Coop #24. This recovery
+change does not introduce an archive endpoint or claim unknown acceptance cancelled.
