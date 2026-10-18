@@ -110,3 +110,41 @@ test('errors remain visible without claiming completion', async () => {
   );
   expect(screen.queryByText('Verified')).not.toBeInTheDocument();
 });
+
+test.each([
+  'registered',
+  'acceptance_unknown',
+  'reconciliation_required',
+  'superseded',
+])(
+  'shows recorded membership intent without claiming no submission: %s',
+  async (deliveryState) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        response({
+          ...data,
+          decisions: [],
+          memberIntents: [
+            {
+              executionId: 'synthetic',
+              deliveryState,
+              acceptedDecisionId: null,
+              acceptanceUnknown: true,
+            },
+          ],
+        }),
+      ),
+    );
+    render(
+      <ConcordEnforcementStatus
+        itemIdentifier={{ id: 'synthetic', typeId: 'room' }}
+      />,
+    );
+    expect(await screen.findByRole('status')).toHaveTextContent(/recorded/i);
+    expect(
+      screen.queryByText('No room enforcement decision has been submitted.'),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText('Retry delivery')).not.toBeInTheDocument();
+  },
+);

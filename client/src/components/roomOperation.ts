@@ -17,4 +17,32 @@ export function roomOperation(
 }
 export function completeRoomOperation(item: ItemIdentifier): void {
   sessionStorage.removeItem(key(item));
+  sessionStorage.removeItem(`${key(item)}:attempts`);
+}
+
+/** Persist an attempt count before HTTP; reloads and retries are conservative. */
+export function beginRoomOperation(item: ItemIdentifier, actionName: string) {
+  const existing = sessionStorage.getItem(key(item));
+  const operationId = roomOperation(item, actionName);
+  const attemptsKey = `${key(item)}:attempts`;
+  const attempts = existing
+    ? Number(sessionStorage.getItem(attemptsKey) ?? 1) + 1
+    : 1;
+  sessionStorage.setItem(attemptsKey, String(attempts));
+  return { operationId, firstAttempt: attempts === 1 };
+}
+
+export function rejectUnrecordedRoomAttempt(
+  item: ItemIdentifier,
+  operationId: string,
+  firstAttempt: boolean,
+): boolean {
+  if (
+    !firstAttempt ||
+    sessionStorage.getItem(key(item)) !== operationId ||
+    sessionStorage.getItem(`${key(item)}:attempts`) !== '1'
+  )
+    return false;
+  completeRoomOperation(item);
+  return true;
 }

@@ -16,6 +16,17 @@ type CaseStatus = {
   reason?: string;
   expiresAt?: string;
   decisions?: Decision[];
+  memberIntents?: {
+    executionId: string;
+    deliveryState:
+      | 'registered'
+      | 'acceptance_unknown'
+      | 'accepted'
+      | 'superseded'
+      | 'reconciliation_required';
+    acceptedDecisionId: string | null;
+    acceptanceUnknown: boolean;
+  }[];
   permissions?: string[];
 };
 const targetNames = {
@@ -134,7 +145,21 @@ export default function ConcordEnforcementStatus({
               <p>Evidence expires: {data.expiresAt}</p>
             </div>
           )}
-          {!data.decisions?.length && (
+          {data.memberIntents?.map((intent) => (
+            <p key={intent.executionId} role="status">
+              {intent.deliveryState === 'reconciliation_required'
+                ? 'Recorded membership decision requires reconciliation. Ask your moderation lead to investigate; do not assume it was cancelled.'
+                : intent.deliveryState === 'superseded'
+                  ? 'Recorded membership decision was superseded by a newer decision.'
+                  : intent.deliveryState === 'accepted'
+                    ? 'Membership decision accepted. Check delivery results for enforcement.'
+                    : 'Membership decision recorded; acceptance is not confirmed. It may still execute. Changing actions does not cancel it.'}
+              {intent.deliveryState === 'superseded' &&
+                intent.acceptanceUnknown &&
+                ' Acceptance of the earlier request is still unknown; supersession is not proof it never executed.'}
+            </p>
+          ))}
+          {!data.decisions?.length && !data.memberIntents?.length && (
             <p>No room enforcement decision has been submitted.</p>
           )}
           {data.decisions?.map((decision) => (

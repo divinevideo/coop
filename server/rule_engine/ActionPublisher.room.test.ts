@@ -25,7 +25,13 @@ afterAll(() => {
     else process.env[key] = value;
   }
 });
-test.each(['callback', 'unseen_legacy', 'registered_legacy'])(
+test.each([
+  'callback',
+  'unseen_legacy',
+  'registered_legacy',
+  'reason',
+  'denied',
+])(
   'manual membership validates recording configuration and generation: %s',
   async (kind) => {
     const input = {
@@ -36,9 +42,11 @@ test.each(['callback', 'unseen_legacy', 'registered_legacy'])(
       itemTypeId: 'room-type',
       itemTypeName: 'concord_member',
       caseId: '10000000-0000-4000-8000-000000000001',
-      correlationId: 'manual-action-run:10000000-0000-4000-8000-000000000002',
+      correlationId: ['reason', 'denied'].includes(kind)
+        ? 'manual-action-run:source-order-v1_ban_member_10000000-0000-4000-8000-000000000002'
+        : 'manual-action-run:10000000-0000-4000-8000-000000000002',
       actorId: 'staff',
-      note: 'Synthetic reason',
+      note: kind === 'reason' ? 'x'.repeat(2049) : 'Synthetic reason',
       parameters: {},
     };
     const prior = {
@@ -82,7 +90,7 @@ test.each(['callback', 'unseen_legacy', 'registered_legacy'])(
           id: 'staff',
           orgId: 'synthetic',
           role: UserRole.ADMIN,
-          approvedByAdmin: true,
+          approvedByAdmin: kind !== 'denied',
           rejectedByAdmin: false,
           getPermissions: () => [],
         }),
@@ -100,6 +108,10 @@ test.each(['callback', 'unseen_legacy', 'registered_legacy'])(
     );
     if (kind === 'registered_legacy')
       await expect(result).resolves.toBeUndefined();
+    else if (['reason', 'denied'].includes(kind))
+      await expect(result).rejects.toMatchObject({
+        extensions: { roomAttemptOutcome: 'NOT_RECORDED' },
+      });
     else
       await expect(result).rejects.toThrow(
         kind === 'callback'

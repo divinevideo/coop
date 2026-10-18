@@ -197,4 +197,5 @@ Coop is open source and contributions flow upstream; attribution matters for mai
 - Install with `--legacy-peer-deps` as a workaround.
 - Commit `.env`, credentials, or API keys.
 - Bypass `iocContainer` by importing server singletons directly.
+- Treat a room attempt rejection as proof that earlier attempts never recorded intent. Only a definitively unrecorded first attempt may release the browser operation; retain identity after uncertain responses and retries.
 - Silently modify a migration file that has already been applied to a shared environment — add a new forward migration instead.
