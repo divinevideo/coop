@@ -6,6 +6,7 @@ import { claimMemberIntent } from './memberIntentClaim.js';
 import {
   assertMemberIntentStatus,
   memberIntentAcceptanceUnknown,
+  MemberIntentReconciliationError,
 } from './memberIntentStatus.js';
 import {
   type MemberDeliveryOutcome,
@@ -159,19 +160,29 @@ export async function registerMemberIntents(
       .execute();
   }
 }
-/** No HTTP while a transaction is held. An uncertain send is reconciled by lookup only. */
+/** No HTTP while a transaction is held. Lookup precedes an identical retry. */
 export async function deliverMemberIntent(
   pg: Kysely<MemberIntentPg>,
   config: ConcordConfig,
   dependencies: MemberIntentDependencies,
   input: RoomDecisionInput,
 ): Promise<MemberDeliveryOutcome> {
+  return deliverMemberIntentAttempt(pg, config, dependencies, input, false);
+}
+
+async function deliverMemberIntentAttempt(
+  pg: Kysely<MemberIntentPg>,
+  config: ConcordConfig,
+  dependencies: MemberIntentDependencies,
+  input: RoomDecisionInput,
+  retryAfterLookup: boolean,
+): Promise<MemberDeliveryOutcome> {
   if (!input.actorId || input.orgId !== config.orgId)
     throw new Error('Room staff intent required');
   const actor = await dependencies.getActor(input.actorId, input.orgId);
   validateRoomActionPermission(actor, input.actionName, input.parameters ?? {});
   const executionId = roomExecutionId(input);
-  const claim = await claimMemberIntent(pg, input);
+  const claim = await claimMemberIntent(pg, input, retryAfterLookup);
   if (claim.kind === 'missing') {
     try {
       return {
@@ -204,8 +215,14 @@ export async function deliverMemberIntent(
     }) as const;
   if (claim.kind === 'superseded' && !memberIntentAcceptanceUnknown(intent))
     return superseded();
-  if (claim.kind === 'accepted' && intent.accepted_status)
+  if (claim.kind === 'accepted' && intent.accepted_status) {
+    try {
+      assertMemberIntentStatus(intent.accepted_status, intent);
+    } catch (error) {
+      return settleMemberIntentError(pg, intent, input, error);
+    }
     return { outcome: 'accepted', status: intent.accepted_status };
+  }
   try {
     const status =
       claim.kind === 'send'
@@ -267,6 +284,16 @@ export async function deliverMemberIntent(
     return { outcome: 'accepted', status };
   } catch (error) {
     if (claim.kind === 'superseded') return superseded();
+    if (
+      claim.kind === 'lookup' &&
+      error instanceof RoomResponseError &&
+      error.status === 404
+    ) {
+      // Absence does not prove the first request cannot still commit. Replay
+      // only the same execution/fingerprint/revision, which the bridge dedupes.
+      // Reclaim under the target lock so newly superseded intent never resends.
+      return deliverMemberIntentAttempt(pg, config, dependencies, input, true);
+    }
     return settleMemberIntentError(pg, intent, input, error);
   }
 }
@@ -312,10 +339,11 @@ async function settleMemberIntentError(
     };
   }
   if (
-    error instanceof RoomResponseError &&
-    ['member_intent_order_conflict', 'member_intent_order_required'].includes(
-      error.code,
-    )
+    error instanceof MemberIntentReconciliationError ||
+    (error instanceof RoomResponseError &&
+      ['member_intent_order_conflict', 'member_intent_order_required'].includes(
+        error.code,
+      ))
   )
     await pg
       .updateTable('concord_integration.member_intents')

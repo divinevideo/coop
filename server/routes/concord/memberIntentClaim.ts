@@ -8,6 +8,7 @@ import { roomExecutionId, type RoomDecisionInput } from './service.js';
 export async function claimMemberIntent(
   pg: Kysely<MemberIntentPg>,
   input: RoomDecisionInput,
+  retryAfterLookup = false,
 ) {
   const executionId = roomExecutionId(input);
   return pg.transaction().execute(async (tx) => {
@@ -78,7 +79,10 @@ export async function claimMemberIntent(
       return { kind: 'accepted' as const, intent: fresh };
     if (fresh.delivery_state === 'reconciliation_required')
       return { kind: 'blocked' as const, intent: fresh };
-    if (fresh.delivery_state !== 'registered')
+    if (
+      fresh.delivery_state !== 'registered' &&
+      !(retryAfterLookup && fresh.delivery_state === 'acceptance_unknown')
+    )
       return { kind: 'lookup' as const, intent: fresh };
     await tx
       .updateTable('concord_integration.member_intents')

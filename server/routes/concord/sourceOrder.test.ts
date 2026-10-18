@@ -1,10 +1,27 @@
 import { UserRole } from '../../models/types/permissioning.js';
 import {
+  isSourceOrderedRoomOperationId,
   object,
   parseRoomStatus,
   publishRoomDecision,
+  roomExecutionId,
   roomRequest,
 } from './service.js';
+
+test('source-ordered manual identities cannot collide with pre-cutover execution identities', () => {
+  const legacy = '10000000-0000-4000-8000-000000000001';
+  const current = `source-order-v1_ban_member_${legacy}`;
+  expect(isSourceOrderedRoomOperationId(legacy)).toBe(false);
+  expect(isSourceOrderedRoomOperationId(current)).toBe(true);
+  expect(isSourceOrderedRoomOperationId(current, 'unban_member')).toBe(false);
+  const input = { orgId: 'org', correlationId: `manual-action-run:${legacy}` };
+  expect(roomExecutionId(input as never)).not.toBe(
+    roomExecutionId({
+      ...input,
+      correlationId: `manual-action-run:${current}`,
+    } as never),
+  );
+});
 
 const config = {
   origin: 'https://moderation.example',
