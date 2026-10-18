@@ -60,21 +60,13 @@ export default function ItemAction(props: {
           'One or more actions failed. The callback URL may have returned an error. If your org requires a policy for decisions, select a policy and try again.',
         );
       } else {
-        if (
-          eligibleActions.some(
-            (action) =>
-              selectedActionIds.includes(action.id) &&
-              action.name.startsWith('concord_'),
-          )
-        )
-          completeRoomOperation(itemIdentifier);
         setModalBody(
           eligibleActions.some(
             (action) =>
               selectedActionIds.includes(action.id) &&
               action.name.startsWith('concord_'),
           )
-            ? 'Room decision queued. Check Room enforcement for verified delivery to each service.'
+            ? 'Room request processed. Check Room enforcement for its recorded outcome and verified delivery.'
             : 'Actions submitted successfully.',
         );
       }
@@ -273,6 +265,16 @@ export default function ItemAction(props: {
           note: moderatorNote.trim() === '' ? undefined : moderatorNote.trim(),
         },
       },
+    }).then((response) => {
+      const results = response.data?.bulkExecuteActions?.results;
+      if (
+        attempt &&
+        !response.errors?.length &&
+        results?.length &&
+        results.every((result) => result.success)
+      )
+        completeRoomOperation(itemIdentifier, attempt.operationId);
+      return response;
     });
   }, [
     bulkAction,
@@ -342,6 +344,7 @@ export default function ItemAction(props: {
           onClick={buttonOnClick}
           loading={loading}
           disabled={
+            loading ||
             selectedActionIds.length === 0 ||
             (selectedActionIds.some((id) =>
               eligibleActionsById.get(id)?.name.startsWith('concord_'),
