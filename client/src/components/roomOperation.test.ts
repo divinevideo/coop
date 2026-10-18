@@ -13,7 +13,7 @@ test('retries reuse the persisted opaque operation until acceptance', () => {
   expect(roomOperation(item, 'concord_remove_message')).toBe(first);
   expect(roomOperation(item, 'concord_ban_member')).toBe(first);
   expect(sessionStorage.length).toBe(1);
-  completeRoomOperation(item);
+  completeRoomOperation(item, first);
   expect(roomOperation(item, 'concord_remove_message')).not.toBe(first);
 });
 
@@ -25,7 +25,7 @@ test('source-ordered clients never relabel a browser-held legacy operation', () 
   const current = roomOperation(item, 'concord_ban_member');
   expect(current).toMatch(/^source-order-v1_ban_member_/);
   expect(current).not.toBe(sessionStorage.getItem(oldKey));
-  completeRoomOperation(item);
+  completeRoomOperation(item, current);
   expect(sessionStorage.getItem(oldKey)).toBe(
     '10000000-0000-4000-8000-000000000001',
   );
@@ -77,4 +77,17 @@ test('browser-held operations without attempt metadata remain conservative', () 
     rejectUnrecordedRoomAttempt(item, retry.operationId, retry.firstAttempt),
   ).toBe(false);
   expect(retry.operationId).toBe(original);
+});
+
+test('a late success never releases a newer operation or its attempt history', () => {
+  sessionStorage.clear();
+  const item = { id: 'overlapping', typeId: 'room' };
+  const old = beginRoomOperation(item, 'concord_ban_member');
+  completeRoomOperation(item, old.operationId);
+  const next = beginRoomOperation(item, 'concord_remove_message');
+  completeRoomOperation(item, old.operationId);
+  expect(roomOperation(item, 'concord_remove_message')).toBe(next.operationId);
+  expect(
+    rejectUnrecordedRoomAttempt(item, next.operationId, next.firstAttempt),
+  ).toBe(true);
 });

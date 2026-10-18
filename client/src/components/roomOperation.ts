@@ -15,9 +15,14 @@ export function roomOperation(
   sessionStorage.setItem(key(item), id);
   return id;
 }
-export function completeRoomOperation(item: ItemIdentifier): void {
+export function completeRoomOperation(
+  item: ItemIdentifier,
+  expectedId: string,
+): boolean {
+  if (sessionStorage.getItem(key(item)) !== expectedId) return false;
   sessionStorage.removeItem(key(item));
   sessionStorage.removeItem(`${key(item)}:attempts`);
+  return true;
 }
 
 /** Persist an attempt count before HTTP; reloads and retries are conservative. */
@@ -43,6 +48,5 @@ export function rejectUnrecordedRoomAttempt(
     sessionStorage.getItem(`${key(item)}:attempts`) !== '1'
   )
     return false;
-  completeRoomOperation(item);
-  return true;
+  return completeRoomOperation(item, operationId);
 }
