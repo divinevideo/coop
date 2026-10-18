@@ -1,12 +1,12 @@
 import {
   ApolloLink,
   execute,
-  gql,
   Observable,
   type FetchResult,
 } from '@apollo/client';
 import { vi } from 'vitest';
 
+import { GQLBulkActionExecutionDocument } from './graphql/generated';
 import { requestRetryLink } from './requestRetryLink';
 
 afterEach(() => vi.useRealTimers());
@@ -22,11 +22,7 @@ test.each([true, false])(
     );
     const failed = vi.fn();
     execute(ApolloLink.from([requestRetryLink(), new ApolloLink(transport)]), {
-      query: gql`
-        mutation {
-          synthetic
-        }
-      `,
+      query: GQLBulkActionExecutionDocument,
       context: { roomOperationAttempt },
     }).subscribe({ error: failed });
     await vi.runAllTimersAsync();
