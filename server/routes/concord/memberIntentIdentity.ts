@@ -34,6 +34,7 @@ export async function prepareMemberIntent(
   const action = roomAction(input.actionName);
   if (
     (action !== 'ban_member' && action !== 'unban_member') ||
+    !['concord_message', 'concord_member'].includes(input.itemTypeName) ||
     !input.actorId ||
     input.orgId !== config.orgId ||
     !UUID.test(input.caseId) ||

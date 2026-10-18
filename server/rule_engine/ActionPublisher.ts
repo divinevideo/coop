@@ -143,18 +143,23 @@ class ActionPublisher {
     private readonly memberIntentPg?: Kysely<MemberIntentPg>,
   ) {}
 
-  async recordManualRoomIntent(input: RoomDecisionInput) {
+  async recordManualRoomIntent(
+    input: RoomDecisionInput,
+    callbackUrl: string | null | undefined,
+  ) {
     if (!input.correlationId.startsWith('manual-action-run:'))
       throw new Error('Manual staff operation required');
     if (!this.memberIntentPg || !this.userAPIDataSource)
       throw new Error('Membership intent storage unavailable');
+    const config = loadConcordConfig(process.env);
+    if (callbackUrl !== config.origin + '/v1/decisions')
+      throw new Error('Membership callback configuration unavailable');
     const prior = await this.memberIntentPg
       .selectFrom('concord_integration.member_intents')
       .selectAll()
       .where('org_id', '=', input.orgId)
       .where('source_id', '=', input.correlationId)
       .executeTakeFirst();
-    const config = loadConcordConfig(process.env);
     if (prior) {
       // A duplicate operation must preserve its original target and payload even after case expiry.
       if (

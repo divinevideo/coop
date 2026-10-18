@@ -24,6 +24,71 @@ afterAll(() => {
     else process.env[key] = value;
   }
 });
+test('manual membership rejects an invalid callback before durable registration', async () => {
+  const register = jest.fn(async () => {});
+  const query = {
+    selectAll: () => query,
+    where: () => query,
+    executeTakeFirst: async () => undefined,
+  };
+  const fetchHTTP = jest.fn(async () => ({
+    ok: true,
+    status: 200,
+    body: {
+      caseId: '10000000-0000-4000-8000-000000000001',
+      author: 'd'.repeat(64),
+      target: {
+        communityId: 'a'.repeat(64),
+        channelId: 'b'.repeat(64),
+        rumorId: 'c'.repeat(64),
+      },
+    },
+  }));
+  const publisher = new ActionPublisher(
+    {} as never,
+    {} as never,
+    fetchHTTP as never,
+    {} as never,
+    { getReviewableQueuesForUser: async () => [{ id: 'room-queue' }] } as never,
+    {} as never,
+    {} as never,
+    {} as never,
+    {
+      getGraphQLUserFromId: async () => ({
+        id: 'staff',
+        orgId: 'synthetic',
+        role: UserRole.ADMIN,
+        approvedByAdmin: true,
+        rejectedByAdmin: false,
+        getPermissions: () => [],
+      }),
+    } as never,
+    {
+      selectFrom: () => query,
+      transaction: () => ({ execute: register }),
+    } as never,
+  );
+  await expect(
+    Reflect.apply(publisher.recordManualRoomIntent, publisher, [
+      {
+        orgId: 'synthetic',
+        actionId: 'ban',
+        actionName: 'concord_ban_member',
+        itemId: 'item',
+        itemTypeId: 'room-type',
+        itemTypeName: 'concord_member',
+        caseId: '10000000-0000-4000-8000-000000000001',
+        correlationId: 'manual-action-run:stable',
+        actorId: 'staff',
+        note: 'Synthetic reason',
+        parameters: {},
+      },
+      'https://wrong-callback.example/v1/decisions',
+    ]),
+  ).rejects.toThrow();
+  expect(register).not.toHaveBeenCalled();
+  expect(fetchHTTP).not.toHaveBeenCalled();
+});
 test('actual publisher forwards trusted actor, reason and stable execution while dropping unrelated parameters', async () => {
   const actor = {
     id: 'staff',
