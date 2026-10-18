@@ -29,16 +29,28 @@ export async function memberIntentStatuses(
     .where('org_id', '=', orgId)
     .where('case_id', '=', caseId)
     .execute();
-  return intents.map((intent) => ({
-    executionId: intent.execution_id,
-    sourceOrder: { version: 1 as const, revision: intent.revision },
-    deliveryState: intent.delivery_state,
-    acceptedDecisionId: intent.accepted_decision_id,
-    supersededByExecutionId:
-      intent.superseded_by_execution_id ??
-      intent.bridge_superseded_by_execution_id,
-    acceptanceUnknown: memberIntentAcceptanceUnknown(intent),
-  }));
+  return intents.map((intent) => {
+    let deliveryState = intent.delivery_state;
+    if (deliveryState === 'accepted') {
+      try {
+        if (!intent.accepted_status)
+          throw new MemberIntentReconciliationError();
+        assertMemberIntentStatus(intent.accepted_status, intent);
+      } catch {
+        deliveryState = 'reconciliation_required';
+      }
+    }
+    return {
+      executionId: intent.execution_id,
+      sourceOrder: { version: 1 as const, revision: intent.revision },
+      deliveryState,
+      acceptedDecisionId: intent.accepted_decision_id,
+      supersededByExecutionId:
+        intent.superseded_by_execution_id ??
+        intent.bridge_superseded_by_execution_id,
+      acceptanceUnknown: memberIntentAcceptanceUnknown(intent),
+    };
+  });
 }
 
 export function assertMemberIntentStatus(
