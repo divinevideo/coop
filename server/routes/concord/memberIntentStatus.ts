@@ -48,8 +48,12 @@ export function assertMemberIntentStatus(
   if (
     status.executionId !== intent.execution_id ||
     status.action !== intent.action ||
-    (status.sourceOrder !== null &&
-      status.sourceOrder?.revision !== intent.revision)
+    status.sourceOrder?.version !== 1 ||
+    status.sourceOrder?.revision !== intent.revision
   )
-    throw new Error('Mismatched membership reconciliation');
+    throw new MemberIntentReconciliationError(
+      'Mismatched membership reconciliation',
+    );
 }
+
+export class MemberIntentReconciliationError extends Error {}

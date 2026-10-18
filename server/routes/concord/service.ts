@@ -41,6 +41,20 @@ export type RoomTransport = (
   request: RoomRequest,
 ) => Promise<{ ok: boolean; status: number; body: unknown }>;
 export type SourceOrder = { version: 1; revision: string };
+export const SOURCE_ORDER_OPERATION_PREFIX = 'source-order-v1_';
+export function isSourceOrderedRoomOperationId(
+  value: string,
+  expectedAction?: RoomAction,
+): boolean {
+  return (
+    expectedAction
+      ? [expectedAction]
+      : ['remove_message', 'ban_member', 'unban_member']
+  ).some((action) => {
+    const prefix = `${SOURCE_ORDER_OPERATION_PREFIX}${action}_`;
+    return value.startsWith(prefix) && UUID.test(value.slice(prefix.length));
+  });
+}
 export function parseSourceOrder(value: unknown): SourceOrder {
   const order = object(value);
   if (

@@ -16,6 +16,7 @@ import {
   type MemberIntentPg,
 } from '../routes/concord/memberIntents.js';
 import {
+  isSourceOrderedRoomOperationId,
   loadConcordConfig,
   publishRoomDecision,
   roomAction,
@@ -172,6 +173,15 @@ class ActionPublisher {
         throw new Error('Membership execution intent conflict');
       return;
     }
+    if (
+      !isSourceOrderedRoomOperationId(
+        input.correlationId.slice('manual-action-run:'.length),
+        roomAction(input.actionName),
+      )
+    )
+      throw new Error(
+        'Unseen legacy manual operation requires reconciliation before a new staff decision',
+      );
     const prepared = await prepareMemberIntent(
       config,
       this.roomDependencies(config),

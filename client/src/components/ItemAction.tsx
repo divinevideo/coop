@@ -212,48 +212,46 @@ export default function ItemAction(props: {
     [],
   );
 
-  const buttonOnClick = useCallback(
-    async () =>
-      bulkAction({
-        variables: {
-          input: {
-            operationId: eligibleActions.some(
-              (action) =>
-                selectedActionIds.includes(action.id) &&
-                action.name.startsWith('concord_'),
-            )
-              ? roomOperation(itemIdentifier)
+  const buttonOnClick = useCallback(async () => {
+    const roomAction = eligibleActions.find(
+      (action) =>
+        selectedActionIds.includes(action.id) &&
+        action.name.startsWith('concord_'),
+    );
+    return bulkAction({
+      variables: {
+        input: {
+          operationId: roomAction
+            ? roomOperation(itemIdentifier, roomAction.name)
+            : undefined,
+          itemTypeId: itemIdentifier.typeId,
+          actionIds: selectedActionIds,
+          itemIds: [itemIdentifier.id],
+          policyIds: selectedPolicyIds,
+          // Drop empty per-action entries so the input doesn't carry
+          // meaningless `{}` payloads. GQL `JSONObject` constrains values
+          // to `JsonValue`; our per-action map's inner values are
+          // `unknown` because each parameter type produces a different
+          // concrete value. They're all JSON-serializable in practice
+          // (string, number, boolean, string[]) and the server
+          // re-validates. Cast through unknown to satisfy the input type.
+          parameters:
+            Object.keys(parametersByActionId).length > 0
+              ? (parametersByActionId as unknown as JsonObject)
               : undefined,
-            itemTypeId: itemIdentifier.typeId,
-            actionIds: selectedActionIds,
-            itemIds: [itemIdentifier.id],
-            policyIds: selectedPolicyIds,
-            // Drop empty per-action entries so the input doesn't carry
-            // meaningless `{}` payloads. GQL `JSONObject` constrains values
-            // to `JsonValue`; our per-action map's inner values are
-            // `unknown` because each parameter type produces a different
-            // concrete value. They're all JSON-serializable in practice
-            // (string, number, boolean, string[]) and the server
-            // re-validates. Cast through unknown to satisfy the input type.
-            parameters:
-              Object.keys(parametersByActionId).length > 0
-                ? (parametersByActionId as unknown as JsonObject)
-                : undefined,
-            note:
-              moderatorNote.trim() === '' ? undefined : moderatorNote.trim(),
-          },
+          note: moderatorNote.trim() === '' ? undefined : moderatorNote.trim(),
         },
-      }),
-    [
-      bulkAction,
-      eligibleActions,
-      itemIdentifier,
-      selectedActionIds,
-      selectedPolicyIds,
-      parametersByActionId,
-      moderatorNote,
-    ],
-  );
+      },
+    });
+  }, [
+    bulkAction,
+    eligibleActions,
+    itemIdentifier,
+    selectedActionIds,
+    selectedPolicyIds,
+    parametersByActionId,
+    moderatorNote,
+  ]);
 
   const modalOnClose = useCallback(() => setShowModal(false), []);
 

@@ -1,5 +1,6 @@
 /* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
 import { UserRole } from '../models/types/permissioning.js';
+import { memberIntentFingerprint } from '../routes/concord/memberIntents.js';
 import { ActionType } from '../services/moderationConfigService/index.js';
 import { toCorrelationId } from '../utils/correlationIds.js';
 import { tryJsonParse } from '../utils/encoding.js';
@@ -24,71 +25,91 @@ afterAll(() => {
     else process.env[key] = value;
   }
 });
-test('manual membership rejects an invalid callback before durable registration', async () => {
-  const register = jest.fn(async () => {});
-  const query = {
-    selectAll: () => query,
-    where: () => query,
-    executeTakeFirst: async () => undefined,
-  };
-  const fetchHTTP = jest.fn(async () => ({
-    ok: true,
-    status: 200,
-    body: {
+test.each(['callback', 'unseen_legacy', 'registered_legacy'])(
+  'manual membership validates recording configuration and generation: %s',
+  async (kind) => {
+    const input = {
+      orgId: 'synthetic',
+      actionId: 'ban',
+      actionName: 'concord_ban_member',
+      itemId: 'item',
+      itemTypeId: 'room-type',
+      itemTypeName: 'concord_member',
       caseId: '10000000-0000-4000-8000-000000000001',
-      author: 'd'.repeat(64),
-      target: {
-        communityId: 'a'.repeat(64),
-        channelId: 'b'.repeat(64),
-        rumorId: 'c'.repeat(64),
-      },
-    },
-  }));
-  const publisher = new ActionPublisher(
-    {} as never,
-    {} as never,
-    fetchHTTP as never,
-    {} as never,
-    { getReviewableQueuesForUser: async () => [{ id: 'room-queue' }] } as never,
-    {} as never,
-    {} as never,
-    {} as never,
-    {
-      getGraphQLUserFromId: async () => ({
-        id: 'staff',
-        orgId: 'synthetic',
-        role: UserRole.ADMIN,
-        approvedByAdmin: true,
-        rejectedByAdmin: false,
-        getPermissions: () => [],
-      }),
-    } as never,
-    {
-      selectFrom: () => query,
-      transaction: () => ({ execute: register }),
-    } as never,
-  );
-  await expect(
-    Reflect.apply(publisher.recordManualRoomIntent, publisher, [
-      {
-        orgId: 'synthetic',
-        actionId: 'ban',
-        actionName: 'concord_ban_member',
-        itemId: 'item',
-        itemTypeId: 'room-type',
-        itemTypeName: 'concord_member',
+      correlationId: 'manual-action-run:10000000-0000-4000-8000-000000000002',
+      actorId: 'staff',
+      note: 'Synthetic reason',
+      parameters: {},
+    };
+    const prior = {
+      case_id: input.caseId,
+      target_key: 'a'.repeat(64),
+      fingerprint: memberIntentFingerprint(input, 'a'.repeat(64)),
+    };
+    const register = jest.fn(async () => {});
+    const query = {
+      selectAll: () => query,
+      where: () => query,
+      executeTakeFirst: async () =>
+        kind === 'registered_legacy' ? prior : undefined,
+    };
+    const fetchHTTP = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: {
         caseId: '10000000-0000-4000-8000-000000000001',
-        correlationId: 'manual-action-run:stable',
-        actorId: 'staff',
-        note: 'Synthetic reason',
-        parameters: {},
+        author: 'd'.repeat(64),
+        target: {
+          communityId: 'a'.repeat(64),
+          channelId: 'b'.repeat(64),
+          rumorId: 'c'.repeat(64),
+        },
       },
-      'https://wrong-callback.example/v1/decisions',
-    ]),
-  ).rejects.toThrow();
-  expect(register).not.toHaveBeenCalled();
-  expect(fetchHTTP).not.toHaveBeenCalled();
-});
+    }));
+    const publisher = new ActionPublisher(
+      {} as never,
+      {} as never,
+      fetchHTTP as never,
+      {} as never,
+      {
+        getReviewableQueuesForUser: async () => [{ id: 'room-queue' }],
+      } as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {
+        getGraphQLUserFromId: async () => ({
+          id: 'staff',
+          orgId: 'synthetic',
+          role: UserRole.ADMIN,
+          approvedByAdmin: true,
+          rejectedByAdmin: false,
+          getPermissions: () => [],
+        }),
+      } as never,
+      {
+        selectFrom: () => query,
+        transaction: () => ({ execute: register }),
+      } as never,
+    );
+    const result = publisher.recordManualRoomIntent(
+      input,
+      kind === 'callback'
+        ? 'https://wrong-callback.example/v1/decisions'
+        : config.CONCORD_MODERATION_ORIGIN + '/v1/decisions',
+    );
+    if (kind === 'registered_legacy')
+      await expect(result).resolves.toBeUndefined();
+    else
+      await expect(result).rejects.toThrow(
+        kind === 'callback'
+          ? 'configuration unavailable'
+          : 'legacy manual operation',
+      );
+    expect(register).not.toHaveBeenCalled();
+    expect(fetchHTTP).not.toHaveBeenCalled();
+  },
+);
 test('actual publisher forwards trusted actor, reason and stable execution while dropping unrelated parameters', async () => {
   const actor = {
     id: 'staff',

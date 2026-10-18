@@ -3,7 +3,11 @@ import pLimit from 'p-limit';
 import { v1 as uuidv1 } from 'uuid';
 
 import { inject, type Dependencies } from '../../iocContainer/index.js';
-import { roomAction, UUID } from '../../routes/concord/service.js';
+import {
+  isSourceOrderedRoomOperationId,
+  roomAction,
+  UUID,
+} from '../../routes/concord/service.js';
 import {
   parseStoredParameters,
   validateActionParameterValues,
@@ -191,7 +195,11 @@ class ActionAPI {
     if (
       isRoom &&
       (!opts.operationId ||
-        !UUID.test(opts.operationId) ||
+        (!UUID.test(opts.operationId) &&
+          !isSourceOrderedRoomOperationId(
+            opts.operationId,
+            roomAction(actions[0]?.name ?? ''),
+          )) ||
         actions.length !== 1 ||
         actionIds.length !== 1 ||
         itemIds.length !== 1)

@@ -11,6 +11,11 @@ import {
   prepared,
   response,
 } from '../../test/memberIntentFixtures.js';
+import {
+  checkConcurrentRecovery,
+  checkNullOrderReconciliation,
+  checkTransportRecovery,
+} from '../../test/memberIntentRecoveryChecks.js';
 import { memberIntentTestDatabaseUrl } from '../../test/memberIntentTestDatabase.js';
 import {
   deliverMemberIntent,
@@ -236,36 +241,16 @@ test('late A acknowledgement preserves supersession by latest C and accepted his
     ).current_execution_id,
   ).toBe(roomExecutionId(c));
 });
-test('concurrent delivery claims produce one POST and uncertain lookup404 never resends', async () => {
-  const a = input();
-  await record(a);
-  const entered = barrier(),
-    release = barrier();
-  const fetchHTTP = jest.fn(async (request: RoomRequest) => {
-    if (request.method === 'get')
-      return { ok: false, status: 404, body: { error: 'not_found' } };
-    entered.resolve();
-    await release.promise;
-    throw new Error('Synthetic response loss');
-  });
-  const delivering = deliverMemberIntent(
-    pgQuery,
-    config,
-    { getActor, fetchHTTP },
-    a,
-  );
-  await entered.promise;
-  await expect(
-    deliverMemberIntent(pgQuery, config, { getActor, fetchHTTP }, a),
-  ).rejects.toMatchObject({ status: 404 });
-  release.resolve();
-  await expect(delivering).rejects.toThrow('response loss');
-  await expect(
-    deliverMemberIntent(pgQuery, config, { getActor, fetchHTTP }, a),
-  ).rejects.toMatchObject({ status: 404 });
-  expect(
-    fetchHTTP.mock.calls.filter(([request]) => request.method === 'post'),
-  ).toHaveLength(1);
+test('concurrent uncertain recovery repeats only the same execution and accepted retries never resend', async () => {
+  await checkConcurrentRecovery(pgQuery);
+});
+
+test('pre-commit transport failure recovers after lookup404 without allocating new order', async () => {
+  await checkTransportRecovery(pgQuery);
+});
+
+test('registered execution with legacy null order requires reconciliation, never acceptance', async () => {
+  await checkNullOrderReconciliation(pgQuery);
 });
 test('old unregistered payload is quarantined without assigning a source revision or posting', async () => {
   const a = input();
