@@ -183,7 +183,7 @@ jobs:
         run: docker compose run --rm --quiet-pull client npm run lint
 
       - name: Test room moderation UI
-        run: docker compose run --rm --quiet-pull client npm test -- --run src/components/ConcordEnforcementStatus.test.tsx src/components/DiscordGuildConfirmation.test.tsx src/components/roomOperation.test.ts src/webpages/dashboard/mrt/manual_review_job/ManualReviewJobReview.test.tsx
+        run: docker compose run --rm --quiet-pull client npm test -- --run src/components/ConcordEnforcementStatus.test.tsx src/components/DiscordGuildConfirmation.test.tsx src/components/ItemAction.roomRecovery.test.tsx src/components/roomOperation.test.ts src/requestRetryLink.test.ts src/webpages/dashboard/mrt/manual_review_job/ManualReviewJobReview.test.tsx
 
       - name: Build client
         run: docker compose run --rm --quiet-pull client npm run build
