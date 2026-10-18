@@ -5,6 +5,7 @@ import {
   registerMemberIntents,
   type MemberIntentPg,
 } from '../routes/concord/memberIntents.js';
+import { memberIntentStatuses } from '../routes/concord/memberIntentStatus.js';
 import {
   type RoomDecisionInput,
   type RoomRequest,
@@ -151,6 +152,12 @@ export async function checkNullOrderReconciliation(pg: Kysely<MemberIntentPg>) {
       accepted_status: legacy,
     })
     .execute();
+  expect(await memberIntentStatuses(pg, a.orgId, a.caseId)).toEqual([
+    expect.objectContaining({
+      deliveryState: 'reconciliation_required',
+      acceptedDecisionId: legacy.decisionId,
+    }),
+  ]);
   await expect(
     deliverMemberIntent(pg, config, { getActor, fetchHTTP }, a),
   ).rejects.toThrow('Mismatched');
