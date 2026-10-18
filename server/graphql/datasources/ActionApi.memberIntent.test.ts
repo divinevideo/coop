@@ -11,6 +11,7 @@ test('manual membership operation durably registers before publisher retries and
           id: 'action',
           name: 'concord_ban_member',
           actionType: 'CUSTOM_ACTION',
+          callbackUrl: 'https://moderation.example/v1/decisions',
           customMrtApiParams: null,
         },
       ],
@@ -57,5 +58,6 @@ test('manual membership operation durably registers before publisher retries and
       note: opts.actorNote,
       parameters: {},
     }),
+    'https://moderation.example/v1/decisions',
   ]);
 });

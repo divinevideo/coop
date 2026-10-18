@@ -250,19 +250,22 @@ class ActionAPI {
           );
           for (const action of membership) {
             const caseId = itemSubmission?.data.case_id;
-            await this.actionPublisher.recordManualRoomIntent({
-              orgId,
-              actionId: action.id,
-              actionName: action.name,
-              itemId,
-              itemTypeId: itemType.id,
-              itemTypeName: itemType.name,
-              caseId: typeof caseId === 'string' ? caseId : '',
-              correlationId: String(correlationId),
-              actorId,
-              note: actorNote ?? undefined,
-              parameters: validatedParameters.get(action.id) ?? {},
-            });
+            await this.actionPublisher.recordManualRoomIntent(
+              {
+                orgId,
+                actionId: action.id,
+                actionName: action.name,
+                itemId,
+                itemTypeId: itemType.id,
+                itemTypeName: itemType.name,
+                caseId: typeof caseId === 'string' ? caseId : '',
+                correlationId: String(correlationId),
+                actorId,
+                note: actorNote ?? undefined,
+                parameters: validatedParameters.get(action.id) ?? {},
+              },
+              'callbackUrl' in action ? action.callbackUrl : undefined,
+            );
           }
           return this.actionPublisher.publishActions(triggered, {
             orgId,
