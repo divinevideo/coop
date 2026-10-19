@@ -3,6 +3,7 @@ import fc from 'fast-check';
 
 import {
   ArrayFieldWithValueArbitrary,
+  DateStringArbitrary,
   FieldArbitrary,
   MapFieldWithValueArbitrary,
   ScalarFieldWithValueArbitrary,
@@ -100,4 +101,14 @@ describe('getValuesFromFields', () => {
       }),
     );
   });
+});
+
+test('valid datetime samples remain ISO strings for an invalid-date-producing seed', () => {
+  // Seed 8 includes Invalid Date when fc.date uses its default constraints.
+  const dates = fc.sample(DateStringArbitrary, { seed: 8, numRuns: 100 });
+  expect(dates).toHaveLength(100);
+  for (const value of dates) {
+    expect(typeof value).toBe('string');
+    expect(new Date(value).toISOString()).toBe(value);
+  }
 });
