@@ -1,5 +1,6 @@
 /* eslint-disable functional/immutable-data -- Authorization boundary fixtures vary deliberately. */
 import { randomUUID } from 'node:crypto';
+import { buildSchema, graphql } from 'graphql';
 
 import { UserRole } from '../../models/types/permissioning.js';
 import {
@@ -8,6 +9,7 @@ import {
   input,
   response,
 } from '../../test/memberIntentFixtures.js';
+import { ManualRoomOperationConflict } from './manualRoomOperations.js';
 import { prepareReversalMemberIntent } from './memberIntentIdentity.js';
 import { roomLifecycleHandler } from './roomLifecycle.js';
 import {
@@ -189,4 +191,33 @@ test('hold creation accepts the bridge 201 response for the hold route only', as
   await expect(
     roomRequest(config, deps, actor, 'get', `/v1/decisions/${prior}`),
   ).rejects.toThrow();
+});
+
+test('retirement conflicts retain typed current state in the GraphQL response', async () => {
+  const status = {
+    operationId: `source-order-v2_remove_message_${prior}`,
+    executionId: prior,
+    phase: 'acceptance_unknown' as const,
+    recorded: false,
+    acceptanceUnknown: true,
+    acceptedDecisionId: null,
+    sourceOrder: null,
+    refusalCode: null,
+    disposition: 'none' as const,
+    successorExecutionId: null,
+    allowedNextActions: ['recover' as const],
+  };
+  const result = await graphql({
+    schema: buildSchema('type Query { retire: String }'),
+    source: '{ retire }',
+    rootValue: {
+      retire: () => {
+        throw new ManualRoomOperationConflict(status);
+      },
+    },
+  });
+  expect(result.errors?.[0].extensions).toMatchObject({
+    code: 'ROOM_OPERATION_CONFLICT',
+    roomOperationStatus: status,
+  });
 });
