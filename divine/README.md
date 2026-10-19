@@ -151,6 +151,9 @@ unban `actionId`/room `itemTypeId`, `note` and parameters. The backend obtains t
 prior ban's authenticated target, issues a new receipt and source revision, and
 posts a new reversal even after the original case has expired. It never recreates
 evidence or reopens old delivery Retry. Existing fingerprints are unchanged.
+Recover an uncertain reversal by calling `reverseRoomDecision` again with the
+same nonce and exact input; do not pass its receipt to `bulkExecuteActions`.
+The generic `send`/`recover` status affordances do not change this entry point.
 Decision status preserves `discordRestriction` (state, observation time, code)
 and `auditAvailable`; a community unban does not imply a Discord guild unban.
 

@@ -110,9 +110,16 @@ async function statusOf(
         ? ['replace']
         : !attempted && !recorded
           ? ['send', 'retire']
-          : acceptanceUnknown
-            ? ['recover']
-            : [],
+          : !attempted &&
+              recorded &&
+              !acceptedDecisionId &&
+              !successorExecutionId &&
+              !receipt.refusal_code &&
+              !disposition?.refusalCode
+            ? ['send']
+            : acceptanceUnknown
+              ? ['recover']
+              : [],
   };
 }
 export async function beginManualRoomOperation(
