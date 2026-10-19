@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { GraphQLError } from 'graphql';
 import { sql, type Kysely } from 'kysely';
 
 import { UserRole } from '../../models/types/permissioning.js';
@@ -241,9 +242,14 @@ export async function retirePreparedManualRoomOperation(
     return statusOf(tx, updated);
   });
 }
-export class ManualRoomOperationConflict extends Error {
+export class ManualRoomOperationConflict extends GraphQLError {
   constructor(readonly status: ManualRoomOperationStatus) {
-    super('Room operation already recorded or attempted');
+    super('Room operation already recorded or attempted', {
+      extensions: {
+        code: 'ROOM_OPERATION_CONFLICT',
+        roomOperationStatus: status,
+      },
+    });
   }
 }
 /** Call under the existing execution lock, after awaited authoritative preparation. */
