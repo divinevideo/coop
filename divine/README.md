@@ -134,6 +134,10 @@ register or send new work. Accepted legacy operations retain lookup recovery.
 it contains no evidence or staff reason. `retireRoomOperation(operationId,
 reason)` can retire only an unregistered, unattempted receipt. Recorded or
 uncertain execution conflicts; retirement never recalls already-sent HTTP.
+The existing form releases only its matching local receipt when the server
+confirms retirement, no registration or unknown acceptance, and permits
+`replace`. This neither closes durable attention nor reports enforcement success.
+Preparation errors and delivery refusals alone do not release a receipt.
 An exact recovery after lookup 404 keeps the original execution, payload and
 source revision, rechecks the latest member head, and never resets delivery.
 
