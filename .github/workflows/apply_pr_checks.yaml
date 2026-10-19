@@ -152,7 +152,7 @@ jobs:
 
       - name: Test membership ordering with PostgreSQL
         run: |
-          docker compose run --rm --no-deps --quiet-pull -v "$PWD/db/src/scripts:/db/src/scripts:ro" -e NODE_ENV=test -e MEMBER_INTENT_TEST_COMPOSE=1 -e JEST_JUNIT_OUTPUT_NAME=jest-member-intent-integration.xml test npm run test:integ -- --runInBand routes/concord/memberIntents.integ.test.ts services/manualReviewToolService/modules/JobDecisioning.memberIntent.integ.test.ts
+          docker compose run --rm --no-deps --quiet-pull -v "$PWD/db/src/scripts:/db/src/scripts:ro" -e NODE_ENV=test -e MEMBER_INTENT_TEST_COMPOSE=1 -e JEST_JUNIT_OUTPUT_NAME=jest-member-intent-integration.xml test npm run test:integ -- --runInBand routes/concord/memberIntents.integ.test.ts routes/concord/manualRoomOperations.integ.test.ts services/manualReviewToolService/modules/JobDecisioning.memberIntent.integ.test.ts
 
       - # Only output the migration logs if the prior step failed, as they
         # could be helpful for debugging in that case; otherwise, they're just

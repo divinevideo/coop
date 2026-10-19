@@ -1,5 +1,6 @@
 import { type Generated } from 'kysely';
 
+import { type ManualRoomOperationPg } from './manualRoomOperationTypes.js';
 import {
   type RoomDecisionInput,
   type RoomStatus,
@@ -13,7 +14,7 @@ export type MemberDeliveryState =
   | 'accepted'
   | 'superseded'
   | 'reconciliation_required';
-export type MemberIntentPg = {
+export type MemberIntentPg = ManualRoomOperationPg & {
   'concord_integration.member_intent_heads': {
     org_id: string;
     target_key: string;
