@@ -10,6 +10,7 @@ import {
   config,
   input,
   prepared,
+  response,
 } from '../../test/memberIntentFixtures.js';
 import { memberIntentTestDatabaseUrl } from '../../test/memberIntentTestDatabase.js';
 import { jsonStringify } from '../../utils/encoding.js';
@@ -20,14 +21,22 @@ import {
   retirePreparedManualRoomOperation,
 } from './manualRoomOperations.js';
 import {
+  deliverMemberIntent,
   prepareMemberIntent,
   registerMemberIntents,
   type MemberIntentPg,
 } from './memberIntents.js';
+import { roomExecutionId } from './service.js';
 
 const databaseName = `coop_receipts_test_${randomUUID().replaceAll('-', '')}`;
 let pgQuery: Kysely<MemberIntentPg>;
 let cleanup = async () => {};
+const legacy = {
+  ...input(),
+  correlationId: `manual-action-run:source-order-v1_ban_member_${randomUUID()}`,
+};
+let legacyFingerprint = '';
+const legacyAccepted = response(legacy, '1');
 beforeAll(async () => {
   const url = memberIntentTestDatabaseUrl();
   const admin = new pg.Pool({ connectionString: url.toString() });
@@ -55,6 +64,17 @@ beforeAll(async () => {
       ),
     )
     .execute(pgQuery);
+  const old = await prepared(legacy);
+  legacyFingerprint = old.fingerprint;
+  await sql`INSERT INTO concord_integration.member_intent_heads (org_id, target_key, revision) VALUES (${config.orgId}, ${old.targetKey}, 1)`.execute(
+    pgQuery,
+  );
+  await sql`INSERT INTO concord_integration.member_intents (org_id, execution_id, target_key, revision, case_id, source_kind, source_id, action, actor_id, fingerprint, request_payload, delivery_state, accepted_decision_id, accepted_status) VALUES (${config.orgId}, ${old.executionId}::uuid, ${old.targetKey}, 1, ${legacy.caseId}::uuid, 'manual-action-run', ${legacy.correlationId}, 'ban_member', ${actor.id}, ${old.fingerprint}, ${jsonStringify(legacy)}::jsonb, 'accepted', ${legacyAccepted.decisionId}::uuid, ${jsonStringify(legacyAccepted)}::jsonb)`.execute(
+    pgQuery,
+  );
+  await sql`UPDATE concord_integration.member_intent_heads SET current_execution_id = ${old.executionId}::uuid WHERE org_id = ${config.orgId} AND target_key = ${old.targetKey}`.execute(
+    pgQuery,
+  );
   await sql
     .raw(
       await readFile(
@@ -65,6 +85,29 @@ beforeAll(async () => {
     .execute(pgQuery);
 });
 afterAll(async () => cleanup());
+test('populated upgrade preserves registered v1 identity/fingerprint and recovers without rehashing or sending', async () => {
+  const fetchHTTP = jest.fn();
+  expect(
+    await deliverMemberIntent(
+      pgQuery,
+      config,
+      { getActor: async () => actor, fetchHTTP },
+      legacy,
+    ),
+  ).toMatchObject({
+    outcome: 'accepted',
+    status: { decisionId: legacyAccepted.decisionId },
+  });
+  expect(fetchHTTP).not.toHaveBeenCalled();
+  const row = await pgQuery
+    .selectFrom('concord_integration.member_intents')
+    .selectAll()
+    .where('execution_id', '=', roomExecutionId(legacy))
+    .executeTakeFirstOrThrow();
+  expect(row.fingerprint).toBe(legacyFingerprint);
+  expect(row.prior_decision_id).toBeNull();
+  expect(row.request_payload).toEqual(legacy);
+});
 test('unissued v2 execution cannot allocate a member revision', async () => {
   const value = {
     ...input(),
@@ -82,7 +125,7 @@ test('unissued v2 execution cannot allocate a member revision', async () => {
       .selectFrom('concord_integration.member_intent_heads')
       .selectAll()
       .execute(),
-  ).toHaveLength(0);
+  ).toHaveLength(1);
 });
 
 const dependencies = {

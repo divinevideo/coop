@@ -4,7 +4,17 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 
 import { UserRole } from '../../../models/types/permissioning.js';
-import { prepareMemberIntent } from '../../../routes/concord/memberIntents.js';
+import {
+  deliverMemberIntent,
+  prepareMemberIntent,
+  type MemberIntentPg,
+} from '../../../routes/concord/memberIntents.js';
+import {
+  getRoomExecutionDisposition,
+  listRoomNeedsAttention,
+  roomJobQueueComplete,
+} from '../../../routes/concord/roomDispositions.js';
+import { roomExecutionId } from '../../../routes/concord/service.js';
 import { memberIntentTestDatabaseUrl } from '../../../test/memberIntentTestDatabase.js';
 import { type ManualReviewToolServicePg } from '../dbTypes.js';
 import JobDecisioning from './JobDecisioning.js';
@@ -53,6 +63,14 @@ beforeAll(async () => {
     .raw(
       await readFile(
         '../db/src/scripts/api-server-pg/2026.10.18T00.00.00.add_member_intent_order.sql',
+        'utf8',
+      ),
+    )
+    .execute(pgQuery);
+  await sql
+    .raw(
+      await readFile(
+        '../db/src/scripts/api-server-pg/2026.10.19T00.14.35.add_room_operation_lifecycle.sql',
         'utf8',
       ),
     )
@@ -176,5 +194,160 @@ test.each([false, true])(
     ).toHaveLength(failRegistration ? 0 : 1);
     expect(removeJob).not.toHaveBeenCalled();
     expect(onRecord).toHaveBeenCalledTimes(failRegistration ? 0 : 1);
+  },
+);
+
+test.each([false, true])(
+  'durable refusal survives failed Redis cleanup and completes recovery for appeal=%s',
+  async (isAppealsQueue) => {
+    const guid = randomUUID(),
+      caseId = randomUUID();
+    const job = {
+      id: `aXRlbQ:${Buffer.from(guid).toString('base64url')}`,
+      orgId: 'synthetic',
+      payload: {
+        kind: 'DEFAULT',
+        item: {
+          itemId: 'case',
+          itemTypeIdentifier: { id: 'room-type' },
+          data: { case_id: caseId },
+        },
+      },
+    };
+    const request = {
+      orgId: 'synthetic',
+      actionId: 'action',
+      actionName: 'concord_ban_member',
+      itemId: 'case',
+      itemTypeId: 'room-type',
+      itemTypeName: 'concord_member',
+      caseId,
+      actorId: 'staff',
+      note: 'Original synthetic reason',
+      correlationId: `mrt-decision:${job.id}`,
+      parameters: {},
+    };
+    const executionId = roomExecutionId(request);
+    const delivery = jest.fn(async () => ({
+      ok: false,
+      status: 409,
+      body: { error: 'decision_source_unavailable', executionId },
+    }));
+    const removeJob = jest
+      .fn(async () => {
+        expect(
+          await getRoomExecutionDisposition(
+            pgQuery as unknown as Kysely<MemberIntentPg>,
+            'synthetic',
+            executionId,
+          ),
+        ).toMatchObject({
+          attentionState: 'needs_attention',
+          refusalCode: 'decision_source_unavailable',
+        });
+      })
+      .mockRejectedValueOnce(new Error('Synthetic Redis cleanup loss'));
+    const service = new JobDecisioning(
+      {
+        getJobs: async () => [job],
+        getAppealJobs: async () => [job],
+        removeJob,
+      } as never,
+      pgQuery,
+      Object.assign(
+        async () => [{ id: 'action', name: 'concord_ban_member' }],
+        { close: async () => {} },
+      ) as never,
+      async () => {
+        const outcome = await deliverMemberIntent(
+          pgQuery as unknown as Kysely<MemberIntentPg>,
+          config,
+          { getActor, fetchHTTP: delivery },
+          request,
+        );
+        expect(['refused', 'stopped']).toContain(outcome.outcome);
+      },
+      { getItemType: async () => undefined } as never,
+      {} as never,
+      getActor,
+      async () => [
+        await prepareMemberIntent(
+          config,
+          {
+            getActor,
+            fetchHTTP: async () => ({
+              ok: true,
+              status: 200,
+              body: {
+                caseId,
+                author: 'd'.repeat(64),
+                target: {
+                  communityId: 'a'.repeat(64),
+                  channelId: 'b'.repeat(64),
+                  rumorId: 'c'.repeat(64),
+                },
+              },
+            }),
+          },
+          request,
+        ),
+      ],
+    );
+    const submit = {
+      queueId: 'queue',
+      orgId: 'synthetic',
+      jobId: job.id,
+      lockToken: 'lock',
+      reviewerId: 'staff',
+      reviewerEmail: 'staff@example.invalid',
+      decisionReason: request.note,
+      reportHistory: [],
+      relatedActions: [],
+      isAppealsQueue,
+      decisionComponents: [
+        {
+          type: 'CUSTOM_ACTION',
+          actions: [{ id: 'action' }],
+          policies: [],
+          itemIds: ['case'],
+          itemTypeId: 'room-type',
+        },
+      ],
+    };
+    await expect(service.submitDecision(submit as never)).rejects.toThrow();
+    expect(
+      await roomJobQueueComplete(
+        pgQuery as unknown as Kysely<MemberIntentPg>,
+        'synthetic',
+        request.correlationId,
+        1,
+      ),
+    ).toBe(true);
+    expect(
+      await service.retryRecordedRoomDecision({
+        orgId: 'synthetic',
+        queueId: 'queue',
+        jobId: job.id as never,
+        lockToken: 'lock',
+        reviewerId: 'staff',
+        isAppealsQueue,
+      }),
+    ).toBe(true);
+    expect(delivery).toHaveBeenCalledTimes(1);
+    expect(removeJob).toHaveBeenCalledTimes(2);
+    expect(
+      (
+        await listRoomNeedsAttention(
+          pgQuery as unknown as Kysely<MemberIntentPg>,
+          { getActor, fetchHTTP: delivery },
+          { orgId: 'synthetic', actorId: 'staff', limit: 100 },
+        )
+      ).items,
+    ).toContainEqual(
+      expect.objectContaining({
+        executionId,
+        attentionState: 'needs_attention',
+      }),
+    );
   },
 );

@@ -943,7 +943,7 @@ export default async function getBottle() {
             );
           if (roomDelivery) {
             const outcomes = await publishing;
-            if (outcomes.some((outcome) => !outcome.success)) throw new Error('Room enforcement was not durably accepted');
+            if (outcomes.some((outcome) => !outcome.queueComplete)) throw new Error('Room execution requires durable recovery');
             return;
           }
           publishing.catch((error) => {

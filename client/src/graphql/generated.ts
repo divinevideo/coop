@@ -385,6 +385,15 @@ export type GQLBaseField = GQLField & {
   readonly type: GQLFieldType;
 };
 
+export type GQLBeginRoomOperationInput = {
+  readonly actionId: Scalars['ID']['input'];
+  readonly clientNonce: Scalars['ID']['input'];
+  readonly itemId: Scalars['ID']['input'];
+  readonly itemTypeId: Scalars['ID']['input'];
+  readonly note: Scalars['String']['input'];
+  readonly parameters?: InputMaybe<Scalars['JSONObject']['input']>;
+};
+
 export type GQLCannotDeleteDefaultUserError = GQLError & {
   readonly __typename: 'CannotDeleteDefaultUserError';
   readonly detail?: Maybe<Scalars['String']['output']>;
@@ -2403,8 +2412,10 @@ export type GQLMutation = {
   readonly addFavoriteRule: GQLAddFavoriteRuleSuccessResponse;
   readonly addPolicies: GQLAddPoliciesResponse;
   readonly approveUser?: Maybe<Scalars['Boolean']['output']>;
+  readonly beginRoomOperation: GQLRoomOperationStatus;
   readonly bulkExecuteActions: GQLExecuteBulkActionResponse;
   readonly changePassword: GQLChangePasswordResponse;
+  readonly closeRoomExecution: GQLRoomExecutionDisposition;
   readonly createAction: GQLMutateActionResponse;
   readonly createBacktest?: Maybe<GQLCreateBacktestResponse>;
   readonly createContentItemType: GQLMutateContentItemTypeResponse;
@@ -2448,6 +2459,8 @@ export type GQLMutation = {
   readonly reorderRoutingRules: GQLReorderRoutingRulesResponse;
   readonly requestDemo?: Maybe<Scalars['Boolean']['output']>;
   readonly resetPassword: Scalars['Boolean']['output'];
+  readonly retireRoomOperation: GQLRoomOperationStatus;
+  readonly reverseRoomDecision: GQLRoomOperationStatus;
   readonly rotateApiKey: GQLRotateApiKeyResponse;
   readonly rotateWebhookSigningKey: GQLRotateWebhookSigningKeyResponse;
   readonly runRetroaction?: Maybe<GQLRunRetroactionResponse>;
@@ -2459,6 +2472,7 @@ export type GQLMutation = {
   readonly setOrgDefaultSafetySettings?: Maybe<GQLSetModeratorSafetySettingsSuccessResponse>;
   readonly setPluginIntegrationConfig: GQLSetIntegrationConfigResponse;
   readonly signUp: GQLSignUpResponse;
+  readonly stopRoomAutomation: GQLRoomExecutionDisposition;
   readonly submitManualReviewDecision: GQLSubmitDecisionResponse;
   readonly updateAccountInfo?: Maybe<Scalars['Boolean']['output']>;
   readonly updateAction: GQLMutateActionResponse;
@@ -2503,12 +2517,21 @@ export type GQLMutationApproveUserArgs = {
   id: Scalars['ID']['input'];
 };
 
+export type GQLMutationBeginRoomOperationArgs = {
+  input: GQLBeginRoomOperationInput;
+};
+
 export type GQLMutationBulkExecuteActionsArgs = {
   input: GQLExecuteBulkActionInput;
 };
 
 export type GQLMutationChangePasswordArgs = {
   input: GQLChangePasswordInput;
+};
+
+export type GQLMutationCloseRoomExecutionArgs = {
+  executionId: Scalars['ID']['input'];
+  reason: Scalars['String']['input'];
 };
 
 export type GQLMutationCreateActionArgs = {
@@ -2679,6 +2702,15 @@ export type GQLMutationResetPasswordArgs = {
   input: GQLResetPasswordInput;
 };
 
+export type GQLMutationRetireRoomOperationArgs = {
+  operationId: Scalars['String']['input'];
+  reason: Scalars['String']['input'];
+};
+
+export type GQLMutationReverseRoomDecisionArgs = {
+  input: GQLReverseRoomDecisionInput;
+};
+
 export type GQLMutationRotateApiKeyArgs = {
   input: GQLRotateApiKeyInput;
 };
@@ -2717,6 +2749,11 @@ export type GQLMutationSetPluginIntegrationConfigArgs = {
 
 export type GQLMutationSignUpArgs = {
   input: GQLSignUpInput;
+};
+
+export type GQLMutationStopRoomAutomationArgs = {
+  executionId: Scalars['ID']['input'];
+  reason: Scalars['String']['input'];
 };
 
 export type GQLMutationSubmitManualReviewDecisionArgs = {
@@ -3294,6 +3331,8 @@ export type GQLQuery = {
   readonly recentUserStrikeActions: ReadonlyArray<GQLRecentUserStrikeActions>;
   readonly reportingInsights: GQLReportingInsights;
   readonly reportingRule?: Maybe<GQLReportingRule>;
+  readonly roomNeedsAttention: GQLRoomNeedsAttentionPage;
+  readonly roomOperationStatus: GQLRoomOperationStatus;
   readonly rule?: Maybe<GQLRule>;
   readonly spotTestRule: GQLRuleExecutionResult;
   readonly textBank?: Maybe<GQLTextBank>;
@@ -3479,6 +3518,15 @@ export type GQLQueryRecentUserStrikeActionsArgs = {
 
 export type GQLQueryReportingRuleArgs = {
   id: Scalars['ID']['input'];
+};
+
+export type GQLQueryRoomNeedsAttentionArgs = {
+  cursor?: InputMaybe<Scalars['String']['input']>;
+  limit?: InputMaybe<Scalars['Int']['input']>;
+};
+
+export type GQLQueryRoomOperationStatusArgs = {
+  operationId: Scalars['String']['input'];
 };
 
 export type GQLQueryRuleArgs = {
@@ -3798,6 +3846,52 @@ export type GQLResolvedJobCount = {
   readonly queueId?: Maybe<Scalars['String']['output']>;
   readonly reviewerId?: Maybe<Scalars['String']['output']>;
   readonly time: Scalars['String']['output'];
+};
+
+export type GQLReverseRoomDecisionInput = {
+  readonly actionId: Scalars['ID']['input'];
+  readonly clientNonce: Scalars['ID']['input'];
+  readonly decisionId: Scalars['ID']['input'];
+  readonly itemTypeId: Scalars['ID']['input'];
+  readonly note: Scalars['String']['input'];
+  readonly parameters?: InputMaybe<Scalars['JSONObject']['input']>;
+};
+
+export type GQLRoomExecutionDisposition = {
+  readonly __typename: 'RoomExecutionDisposition';
+  readonly acceptanceUnknown: Scalars['Boolean']['output'];
+  readonly attentionState: Scalars['String']['output'];
+  readonly automationStopped: Scalars['Boolean']['output'];
+  readonly executionId: Scalars['ID']['output'];
+  readonly latestEventId: Scalars['ID']['output'];
+  readonly refusalCode?: Maybe<Scalars['String']['output']>;
+};
+
+export type GQLRoomNeedsAttentionPage = {
+  readonly __typename: 'RoomNeedsAttentionPage';
+  readonly items: ReadonlyArray<GQLRoomExecutionDisposition>;
+  readonly nextCursor?: Maybe<Scalars['String']['output']>;
+};
+
+export type GQLRoomOperationStatus = {
+  readonly __typename: 'RoomOperationStatus';
+  readonly acceptanceUnknown: Scalars['Boolean']['output'];
+  readonly acceptedDecisionId?: Maybe<Scalars['ID']['output']>;
+  readonly allowedNextActions: ReadonlyArray<Scalars['String']['output']>;
+  readonly disposition: Scalars['String']['output'];
+  readonly executionId: Scalars['ID']['output'];
+  readonly operationId: Scalars['String']['output'];
+  readonly phase: Scalars['String']['output'];
+  readonly recorded: Scalars['Boolean']['output'];
+  readonly refusalCode?: Maybe<Scalars['String']['output']>;
+  readonly sourceOrder?: Maybe<GQLRoomSourceOrder>;
+  readonly successorExecutionId?: Maybe<Scalars['ID']['output']>;
+};
+
+export type GQLRoomSourceOrder = {
+  readonly __typename: 'RoomSourceOrder';
+  readonly revision: Scalars['String']['output'];
+  readonly version: Scalars['Int']['output'];
 };
 
 export type GQLRotateApiKeyError = GQLError & {

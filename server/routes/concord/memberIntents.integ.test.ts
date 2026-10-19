@@ -77,6 +77,14 @@ beforeAll(async () => {
       ),
     )
     .execute(pgQuery);
+  await sql
+    .raw(
+      await readFile(
+        '../db/src/scripts/api-server-pg/2026.10.19T00.14.35.add_room_operation_lifecycle.sql',
+        'utf8',
+      ),
+    )
+    .execute(pgQuery);
 });
 afterAll(async () => {
   await cleanup();

@@ -24,7 +24,8 @@ export type ManualRoomOperationPg = {
     item_id: string;
     item_type_id: string;
     action: RoomAction;
-    case_id: string;
+    case_id: string | null;
+    prior_decision_id: string | null;
     fingerprint: string;
     request_payload: RoomDecisionInput;
     phase: ManualRoomOperationPhase;

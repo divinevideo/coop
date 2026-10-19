@@ -9,6 +9,7 @@ import { accessVerifier } from './access.js';
 import { roomActor } from './authorization.js';
 import { roomIngest } from './ingest.js';
 import { memberIntentStatuses } from './memberIntentStatus.js';
+import { roomLifecycleHandler } from './roomLifecycle.js';
 import {
   loadConcordConfig,
   object,
@@ -135,6 +136,12 @@ export function roomHandler(
 export default {
   pathPrefix: '/concord',
   routes: [
+    route.get<JsonObject>('/:resource/:id', (deps) =>
+      roomLifecycleHandler(deps),
+    ),
+    route.post<JsonObject, JsonObject>('/:resource/:id/:operation', (deps) =>
+      roomLifecycleHandler(deps),
+    ),
     route.post<JsonObject, JsonObject>('/cases', (deps) => [
       createApiKeyMiddleware(deps),
       roomIngest(deps),

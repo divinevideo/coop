@@ -1,8 +1,10 @@
 import { type Kysely } from 'kysely';
 
 import { jsonStringify } from '../../utils/encoding.js';
+import { lockRoomExecution } from './manualRoomOperations.js';
 import { memberIntentFingerprint } from './memberIntentIdentity.js';
 import { type MemberIntentPg } from './memberIntentTypes.js';
+import { getRoomExecutionDisposition } from './roomDispositions.js';
 import { roomExecutionId, type RoomDecisionInput } from './service.js';
 
 export async function claimMemberIntent(
@@ -12,6 +14,13 @@ export async function claimMemberIntent(
 ) {
   const executionId = roomExecutionId(input);
   return pg.transaction().execute(async (tx) => {
+    await lockRoomExecution(tx, input.orgId, executionId);
+    const disposition = await getRoomExecutionDisposition(
+      tx,
+      input.orgId,
+      executionId,
+    );
+
     const intent = await tx
       .selectFrom('concord_integration.member_intents')
       .selectAll()
@@ -37,12 +46,16 @@ export async function claimMemberIntent(
         .executeTakeFirstOrThrow();
       if (jsonStringify(quarantined.request_payload) !== jsonStringify(input))
         throw new Error('Membership execution intent conflict');
+      if (disposition?.automationStopped)
+        return { kind: 'stopped' as const, disposition };
       return { kind: 'missing' as const };
     }
     if (
       intent.fingerprint !== memberIntentFingerprint(input, intent.target_key)
     )
       throw new Error('Membership execution intent conflict');
+    if (disposition?.automationStopped)
+      return { kind: 'stopped' as const, disposition };
     const head = await tx
       .selectFrom('concord_integration.member_intent_heads')
       .selectAll()

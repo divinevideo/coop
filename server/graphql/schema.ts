@@ -21,6 +21,7 @@ import { typeDefs as policyTypeDefs } from './modules/policy.js';
 import { typeDefs as reportingTypeDefs } from './modules/reporting.js';
 import { typeDefs as reportingRulesTypeDefs } from './modules/reportingRule.js';
 import { typeDefs as retroactionTypeDefs } from './modules/retroaction.js';
+import { typeDefs as roomActionModule } from './modules/roomAction.js';
 import { typeDefs as routingRulesTypeDefs } from './modules/routingRule.js';
 import { typeDefs as ruleTypeDefs } from './modules/rule.js';
 import { typeDefs as signalTypeDefs } from './modules/signal.js';
@@ -331,7 +332,7 @@ const typeDefs = /* GraphQL */ `
   }
 
   union InviteUserTokenResponse =
-      InviteUserTokenSuccessResponse
+    | InviteUserTokenSuccessResponse
     | InviteUserTokenExpiredError
     | InviteUserTokenMissingError
 
@@ -499,6 +500,7 @@ export default mergeTypeDefs([
   genericTypeDefs,
   // Modules
   actionStatisticsTypeDefs,
+  roomActionModule,
   actionTypeDefs,
   apiKeyTypeDefs,
   authenticationTypeDefs,

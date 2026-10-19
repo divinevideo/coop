@@ -1,8 +1,7 @@
 /* eslint-disable max-lines */
 
 import { type ItemIdentifier } from '@roostorg/types';
-import { Queue, Worker } from 'bullmq';
-import { type Job } from 'bullmq';
+import { Queue, Worker, type Job } from 'bullmq';
 import { type Cluster } from 'ioredis';
 import type IORedis from 'ioredis';
 import { type Kysely, type Transaction } from 'kysely';
@@ -15,6 +14,8 @@ import {
   UserPermission,
   type Invoker,
 } from '../../../models/types/permissioning.js';
+import { type MemberIntentPg } from '../../../routes/concord/memberIntentTypes.js';
+import { roomJobQueueComplete } from '../../../routes/concord/roomDispositions.js';
 import { cached, type Cached } from '../../../utils/caching.js';
 import { filterNullOrUndefined } from '../../../utils/collections.js';
 import {
@@ -877,7 +878,7 @@ export default class QueueOperations {
       // queue, but not impossible.
       const decision = await this.pgQueryReadReplica
         .selectFrom('manual_review_tool.manual_review_decisions')
-        .select(['job_payload'])
+        .select(['job_payload', 'decision_components', 'related_actions'])
         .where('created_at', '>=', new Date('2023-10-01'))
         .where('org_id', '=', orgId)
         .where('id', '=', jobIdToGuid(job.data.id))
@@ -886,7 +887,24 @@ export default class QueueOperations {
       // A recorded room intent is not proof of durable enforcement acceptance.
       // Return it for idempotent recovery rather than discarding it on dequeue.
       hasDecision =
-        decision !== undefined && decision.job_payload.roomDeliveryRequired !== true;
+        decision !== undefined &&
+        (decision.job_payload.roomDeliveryRequired !== true ||
+          (await roomJobQueueComplete(
+            this.pgQuery as unknown as Kysely<MemberIntentPg>,
+            orgId,
+            `mrt-decision:${job.data.id}`,
+            decision.decision_components.reduce(
+              (count, part) =>
+                count +
+                (part.type === 'CUSTOM_ACTION' ? part.actions.length : 0),
+              0,
+            ) +
+              decision.related_actions.reduce(
+                (count, part) =>
+                  count + part.actionIds.length * part.itemIds.length,
+                0,
+              ),
+          )));
 
       if (hasDecision) {
         await this.removeJob({
@@ -936,7 +954,7 @@ export default class QueueOperations {
       // queue, but not impossible.
       const decision = await this.pgQueryReadReplica
         .selectFrom('manual_review_tool.manual_review_decisions')
-        .select(['decision_components', 'job_payload'])
+        .select(['decision_components', 'job_payload', 'related_actions'])
         .where('created_at', '>=', new Date('2023-10-01'))
         .where('org_id', '=', orgId)
         .where('id', '=', jobIdToGuid(convertedJob.data.id))
@@ -945,7 +963,24 @@ export default class QueueOperations {
       // Room decisions are recorded before delivery. A later dequeue must not
       // bypass the awaited acceptance check in JobDecisioning.
       hasDecision =
-        decision !== undefined && decision.job_payload.roomDeliveryRequired !== true;
+        decision !== undefined &&
+        (decision.job_payload.roomDeliveryRequired !== true ||
+          (await roomJobQueueComplete(
+            this.pgQuery as unknown as Kysely<MemberIntentPg>,
+            orgId,
+            `mrt-decision:${convertedJob.data.id}`,
+            decision.decision_components.reduce(
+              (count, part) =>
+                count +
+                (part.type === 'CUSTOM_ACTION' ? part.actions.length : 0),
+              0,
+            ) +
+              decision.related_actions.reduce(
+                (count, part) =>
+                  count + part.actionIds.length * part.itemIds.length,
+                0,
+              ),
+          )));
 
       if (hasDecision) {
         await this.removeJob({
@@ -1017,8 +1052,8 @@ export default class QueueOperations {
     // putting the payload kind in a variable to help TS do some type narrowing.
     const jobKind = job.data.payload.kind;
     if (jobKind === 'DEFAULT') {
-      const { allMediaItems: _omitted, ...storedPayloadWithoutNcmec } =
-        job.data.payload as Record<string, unknown> & { allMediaItems?: unknown };
+      const { allMediaItems: _omitted, ...storedPayloadWithoutNcmec } = job.data
+        .payload as Record<string, unknown> & { allMediaItems?: unknown };
       payload = {
         ...storedPayloadWithoutNcmec,
         kind: 'DEFAULT',
@@ -1112,8 +1147,8 @@ export default class QueueOperations {
       'policyIds' in job.data
         ? job.data.policyIds
         : 'policyId' in job.data.payload && job.data.payload.policyId
-        ? [job.data.payload.policyId]
-        : [];
+          ? [job.data.payload.policyId]
+          : [];
 
     const convertedJobData = {
       ...safePick(job.data, [

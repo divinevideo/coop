@@ -16,6 +16,10 @@ import {
   type PreparedMemberIntent,
 } from './memberIntentTypes.js';
 import {
+  definitiveRoomRefusal,
+  recordPermanentRefusal,
+} from './roomDispositions.js';
+import {
   parseRoomStatus,
   publishRoomDecision,
   roomExecutionId,
@@ -117,7 +121,8 @@ export async function registerMemberIntents(
         execution_id: executionId,
         target_key: targetKey,
         revision,
-        case_id: input.caseId,
+        case_id: input.caseId ?? null,
+        prior_decision_id: input.priorDecisionId ?? null,
         source_kind: input.correlationId.startsWith('mrt-decision:')
           ? 'mrt-decision'
           : 'manual-action-run',
@@ -202,6 +207,13 @@ async function deliverMemberIntentAttempt(
       );
     }
   }
+  if (claim.kind === 'stopped')
+    return {
+      outcome: 'stopped',
+      executionId,
+      queueComplete: true,
+      acceptanceUnknown: claim.disposition.acceptanceUnknown,
+    };
   const intent = claim.intent;
   if (claim.kind === 'blocked')
     throw new Error('Membership intent requires reconciliation');
@@ -215,7 +227,10 @@ async function deliverMemberIntentAttempt(
       acceptedDecisionId: intent.accepted_decision_id,
       acceptanceUnknown: memberIntentAcceptanceUnknown(intent),
     }) as const;
-  if (claim.kind === 'superseded' && !memberIntentAcceptanceUnknown(intent))
+  if (
+    claim.kind === 'superseded' &&
+    (retryAfterLookup || !memberIntentAcceptanceUnknown(intent))
+  )
     return superseded();
   if (claim.kind === 'accepted' && intent.accepted_status) {
     try {
@@ -307,6 +322,21 @@ async function settleMemberIntentError(
   error: unknown,
 ): Promise<MemberDeliveryOutcome> {
   const executionId = roomExecutionId(input);
+  if (definitiveRoomRefusal(error, executionId)) {
+    await recordPermanentRefusal(pg, {
+      orgId: input.orgId,
+      executionId,
+      refusalCode: 'decision_source_unavailable',
+      sourceId: input.correlationId,
+    });
+    return {
+      outcome: 'refused',
+      executionId,
+      refusalCode: 'decision_source_unavailable',
+      queueComplete: true,
+      acceptanceUnknown: false,
+    };
+  }
   if (
     error instanceof RoomResponseError &&
     error.code === 'member_intent_superseded'
