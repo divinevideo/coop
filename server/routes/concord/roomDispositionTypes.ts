@@ -1,5 +1,7 @@
 import { type Generated } from 'kysely';
 
+import { type RoomDecisionInput, type RoomStatus } from './service.js';
+
 export type RoomExecutionDisposition = {
   executionId: string;
   attentionState: 'none' | 'needs_attention' | 'closed';
@@ -9,6 +11,16 @@ export type RoomExecutionDisposition = {
   latestEventId: string;
 };
 export type RoomDispositionPg = {
+  'concord_integration.room_execution_acceptances': {
+    org_id: string;
+    execution_id: string;
+    source_id: string;
+    fingerprint: string;
+    request_payload: RoomDecisionInput;
+    accepted_decision_id: string;
+    accepted_status: RoomStatus;
+    recorded_at: Generated<Date>;
+  };
   'concord_integration.room_execution_dispositions': {
     id: string;
     org_id: string;

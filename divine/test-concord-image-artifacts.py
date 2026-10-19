@@ -35,7 +35,7 @@ class Artifacts(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.migrations = {p: hashlib.sha256(p.encode()).hexdigest() for p in a.REQUIRED_MIGRATIONS}
         if a.KIND == 'coop':
-            self.migrations['db/src/scripts/api-server-pg/2026.10.19T00.14.35.add_room_operation_lifecycle.sql'] = hashlib.sha256(b'lifecycle').hexdigest()
+            self.migrations.setdefault('db/src/scripts/api-server-pg/2026.10.19T00.14.35.add_room_operation_lifecycle.sql', hashlib.sha256(b'lifecycle').hexdigest())
         self.contract = {'migrations': self.migrations, 'client_inputs': {'src/Room.tsx': '3' * 64} if a.KIND == 'coop' else {}}
         self.manifest = {'version': 1, 'kind': a.KIND, 'source_sha': SHA, 'harness_sha': HARNESS,
                          'platform': 'linux/amd64', 'source_contract': self.contract, 'images': []}

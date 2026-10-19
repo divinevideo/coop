@@ -5,11 +5,12 @@ import { ActionAPI } from '../graphql/datasources/ActionApi.js';
 import { type MemberIntentPg } from '../routes/concord/memberIntentTypes.js';
 import { roomAction, type RoomRequest } from '../routes/concord/service.js';
 import { ActionPublisher } from '../rule_engine/ActionPublisher.js';
+import { toCorrelationId } from '../utils/correlationIds.js';
 import { tryJsonParse } from '../utils/encoding.js';
 import { actor, config, input, response } from './memberIntentFixtures.js';
 
 /** Exercise the exact begin/bulk boundary used by ItemAction with the real publisher and PG. */
-export async function checkManualRoomClientReceipt(
+export function roomActionFixture(
   pgQuery: Kysely<MemberIntentPg>,
   actionName: string,
 ) {
@@ -28,17 +29,17 @@ export async function checkManualRoomClientReceipt(
   };
   const itemType = {
     id: request.itemTypeId,
-    kind: 'USER',
+    kind: 'USER' as const,
     name: request.itemTypeName,
   };
   const investigation = {
-    getItemByIdentifier: async () => ({
+    getItemByIdentifier: jest.fn(async () => ({
       latestSubmission: {
         itemId: request.itemId,
         itemType,
         data: { case_id: request.caseId },
       },
-    }),
+    })),
   };
   const fetchHTTP = jest.fn(async (wire: RoomRequest) => {
     if (wire.url.includes('/v1/cases/'))
@@ -115,6 +116,38 @@ export async function checkManualRoomClientReceipt(
     policyIds: [],
     actorNote: request.note,
   };
+  const sendMrt = async () =>
+    publisher.publishActions(
+      [
+        {
+          action: action as never,
+          policies: [],
+          matchingRules: undefined,
+          ruleEnvironment: undefined,
+        },
+      ],
+      {
+        orgId: config.orgId,
+        targetItem: { itemId: request.itemId, itemType },
+        correlationId: toCorrelationId({
+          type: 'mrt-decision',
+          id: request.correlationId.slice('mrt-decision:'.length),
+        }),
+        actorId: actor.id,
+        actorNote: request.note,
+      },
+    );
+  return { api, request, fetchHTTP, bulk, action, sendMrt, investigation };
+}
+
+export async function checkManualRoomClientReceipt(
+  pgQuery: Kysely<MemberIntentPg>,
+  actionName: string,
+) {
+  const { api, request, fetchHTTP, bulk, action } = roomActionFixture(
+    pgQuery,
+    actionName,
+  );
   // Before this client fix, a brand-new browser v1 ID could only look up, never send.
   const legacy = await api.bulkExecuteActions({
     ...bulk,
@@ -163,4 +196,30 @@ export async function checkManualRoomClientReceipt(
     acceptanceUnknown: false,
   });
   expect(status.acceptedDecisionId).toBeTruthy();
+}
+
+export async function withRoomTestEnvironment(run: () => Promise<void>) {
+  const environment = {
+    CONCORD_MODERATION_ORIGIN: config.origin,
+    CONCORD_ORG_ID: config.orgId,
+    CONCORD_MODERATION_HMAC_KEY: config.hmacKey,
+    CONCORD_COOP_ORIGIN: config.coopOrigin,
+    CONCORD_ACCESS_ISSUER: config.accessIssuer,
+    CONCORD_ACCESS_AUDIENCE: config.accessAudience,
+    CONCORD_QUEUE_ID: config.queueId,
+  };
+  const previous = Object.fromEntries(
+    Object.keys(environment).map((key) => [key, process.env[key]]),
+  );
+  // eslint-disable-next-line functional/immutable-data -- Scoped test configuration is restored below.
+  Object.assign(process.env, environment);
+  try {
+    await run();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) Reflect.deleteProperty(process.env, key);
+      // eslint-disable-next-line functional/immutable-data -- Restore scoped test configuration.
+      else process.env[key] = value;
+    }
+  }
 }
