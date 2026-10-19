@@ -167,13 +167,20 @@ Refresh returns 202/current status and schedules upstream operator work; Coop
 never settles publication proof. Ordinary case reads retain expiry behavior.
 
 All new GraphQL room operations also verify the Access assertion and same origin
-for mutations. The assigned UI owner, mbradley (#24), must adopt server begin,
-recovery/retirement and truthful attention/supersession/restriction displays.
+for mutations. Basic manual actions use server begin and preserve receipt identity on retry.
+The assigned UI owner, mbradley (#24), retains broader recovery/retirement and
+truthful attention/supersession/restriction displays.
 The existing first-attempt and late-A-success/B-pending identity cleanup
 regressions remain required. Backend delivery does not complete that UI work.
 
-Deploy this additive lifecycle migration with compatible API/worker/client
+MRT message removals append exact-execution, request-bound Bridge acceptance to
+`room_execution_acceptances` before queue cleanup. Retries reuse that immutable
+acceptance even after transient evidence disappears; missing or mismatched
+responses never complete a queue job. Stopped, durably retired unsent receipts
+can be administratively closed without removing their retirement fence.
+
+Deploy the additive lifecycle and `2026.10.19T01.38.51.add_room_execution_acceptances.sql` migrations with compatible API/worker/client
 writers after draining old writers. Preserve receipts, retirement records,
-dispositions and source heads on rollback. Never resume old unfenced writers.
+dispositions, accepted-removal facts and source heads on rollback. Never resume old unfenced writers.
 Audit retention configuration, owner UI acceptance, paired Bridge validation,
 artifact publication and live rollout remain separate release gates.

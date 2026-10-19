@@ -44,16 +44,30 @@ async function executionFacts(
     .where('org_id', '=', orgId)
     .where('execution_id', '=', executionId)
     .executeTakeFirst();
+  const removal = await pg
+    .selectFrom('concord_integration.room_execution_acceptances')
+    .selectAll()
+    .where('org_id', '=', orgId)
+    .where('execution_id', '=', executionId)
+    .executeTakeFirst();
   return {
-    known: Boolean(receipt || intent || quarantine),
+    retiredUnsent: Boolean(
+      receipt?.phase === 'retired' &&
+      !receipt.attempted_at &&
+      !intent &&
+      !quarantine,
+    ),
+    known: Boolean(receipt || intent || quarantine || removal),
     sourceId:
       receipt?.request_payload.correlationId ??
       intent?.source_id ??
-      quarantine?.source_id,
+      quarantine?.source_id ??
+      removal?.source_id,
     accepted: Boolean(
       receipt?.accepted_decision_id ||
       intent?.accepted_decision_id ||
-      quarantine?.accepted_decision_id,
+      quarantine?.accepted_decision_id ||
+      removal?.accepted_decision_id,
     ),
     uncertain: Boolean(
       (receipt?.attempted_at || intent?.last_attempt_at || quarantine) &&
@@ -61,6 +75,7 @@ async function executionFacts(
         receipt?.accepted_decision_id ||
         intent?.accepted_decision_id ||
         quarantine?.accepted_decision_id ||
+        removal?.accepted_decision_id ||
         intent?.bridge_superseded_by_execution_id
       ),
     ),
@@ -120,7 +135,10 @@ async function appendDisposition(
       throw new Error('Unknown room execution');
     if (
       input.kind === 'closed' &&
-      (current?.acceptanceUnknown || (!facts.accepted && !current?.refusalCode))
+      (current?.acceptanceUnknown ||
+        (!facts.accepted &&
+          !current?.refusalCode &&
+          !(current?.automationStopped && facts.retiredUnsent)))
     )
       throw new Error('Unsettled room execution cannot close');
     if (
@@ -154,15 +172,13 @@ async function appendDisposition(
         latest_event_id: id,
       })
       .onConflict((oc) =>
-        oc
-          .columns(['org_id', 'execution_id'])
-          .doUpdateSet({
-            attention_state:
-              input.kind === 'closed' ? 'closed' : 'needs_attention',
-            automation_stopped: true,
-            latest_event_id: id,
-            updated_at: new Date(),
-          }),
+        oc.columns(['org_id', 'execution_id']).doUpdateSet({
+          attention_state:
+            input.kind === 'closed' ? 'closed' : 'needs_attention',
+          automation_stopped: true,
+          latest_event_id: id,
+          updated_at: new Date(),
+        }),
       )
       .execute();
     return (await getRoomExecutionDisposition(
@@ -293,8 +309,15 @@ export async function roomJobQueueComplete(
       ]),
     )
     .execute();
+  const removals = await pg
+    .selectFrom('concord_integration.room_execution_acceptances')
+    .select('execution_id')
+    .where('org_id', '=', orgId)
+    .where('source_id', '=', sourceId)
+    .execute();
   return (
-    new Set([...stopped, ...accepted].map((row) => row.execution_id)).size ===
-    expectedExecutions
+    new Set(
+      [...stopped, ...accepted, ...removals].map((row) => row.execution_id),
+    ).size === expectedExecutions
   );
 }

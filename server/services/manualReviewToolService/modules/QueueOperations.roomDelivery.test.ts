@@ -9,7 +9,9 @@ test.each(['default', 'appeal'])(
       };
       const row = {
         job_payload: { roomDeliveryRequired },
-        decision_components: [{ type: 'CUSTOM_ACTION', actions: ['room-action'] }],
+        decision_components: [
+          { type: 'CUSTOM_ACTION', actions: ['room-action'] },
+        ],
         related_actions: [],
       };
       const query = {
@@ -50,15 +52,17 @@ test.each(['default', 'appeal'])(
         queueId: 'queue',
         lockToken: 'lock',
       };
-      const result = kind === 'appeal'
-        ? await service.dequeueNextAppealJobWithLock(input)
-        : await service.dequeueNextJobWithLock(input);
+      const result =
+        kind === 'appeal'
+          ? await service.dequeueNextAppealJobWithLock(input)
+          : await service.dequeueNextJobWithLock(input);
       if (roomDeliveryRequired) {
         expect(result).toEqual({ job: job.data, lockToken: 'lock' });
         expect(remove).not.toHaveBeenCalled();
         expect(primarySelect.mock.calls).toEqual([
           ['concord_integration.room_execution_state'],
           ['concord_integration.member_intents'],
+          ['concord_integration.room_execution_acceptances'],
         ]);
       } else {
         expect(result).toBeNull();

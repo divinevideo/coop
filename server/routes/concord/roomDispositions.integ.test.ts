@@ -5,12 +5,23 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 
 import {
+  roomActionFixture,
+  withRoomTestEnvironment,
+} from '../../test/manualRoomClientReceipt.js';
+import {
   actor,
   config,
   input,
   prepared,
 } from '../../test/memberIntentFixtures.js';
 import { memberIntentTestDatabaseUrl } from '../../test/memberIntentTestDatabase.js';
+import { checkRoomRemovalAcceptances } from '../../test/roomRemovalAcceptances.js';
+import { checkRoomRemovalPublisher } from '../../test/roomRemovalPublisher.js';
+import {
+  beginManualRoomOperation,
+  claimManualRoomOperation,
+  retirePreparedManualRoomOperation,
+} from './manualRoomOperations.js';
 import {
   deliverMemberIntent,
   registerMemberIntents,
@@ -60,6 +71,14 @@ beforeAll(async () => {
     .raw(
       await readFile(
         '../db/src/scripts/api-server-pg/2026.10.19T00.14.35.add_room_operation_lifecycle.sql',
+        'utf8',
+      ),
+    )
+    .execute(pgQuery);
+  await sql
+    .raw(
+      await readFile(
+        '../db/src/scripts/api-server-pg/2026.10.19T01.38.51.add_room_execution_acceptances.sql',
         'utf8',
       ),
     )
@@ -258,4 +277,173 @@ test('ADMIN close records independent audit without rewriting original actor/rea
   await expect(
     sql`TRUNCATE concord_integration.room_execution_state`.execute(pgQuery),
   ).rejects.toThrow('append-only');
+});
+
+test('stopped and durably retired unsent receipt can close without erasing its fence', async () => {
+  const { correlationId: _, ...request } = input('concord_remove_message');
+  const receipt = await beginManualRoomOperation(pgQuery, config, deps, {
+    orgId: config.orgId,
+    actorId: actor.id,
+    clientNonce: randomUUID(),
+    request,
+  });
+  const identity = {
+    orgId: config.orgId,
+    actorId: actor.id,
+    executionId: receipt.executionId,
+    reason: 'Reviewed unsent request',
+  };
+  await stopRoomAutomation(pgQuery, deps, identity);
+  await expect(closeRoomExecution(pgQuery, deps, identity)).rejects.toThrow(
+    'Unsettled',
+  );
+  await retirePreparedManualRoomOperation(pgQuery, deps, {
+    ...identity,
+    operationId: receipt.operationId,
+  });
+  expect(await closeRoomExecution(pgQuery, deps, identity)).toMatchObject({
+    attentionState: 'closed',
+    acceptanceUnknown: false,
+  });
+  const row = await pgQuery
+    .selectFrom('concord_integration.room_manual_operations')
+    .selectAll()
+    .where('execution_id', '=', receipt.executionId)
+    .executeTakeFirstOrThrow();
+  expect(row.phase).toBe('retired');
+  expect(row.attempted_at).toBeNull();
+  expect(row.request_payload.note).toBe(request.note);
+});
+
+test('accepted MRT removal survives cleanup loss and completes the queue without another POST', async () => {
+  await withRoomTestEnvironment(async () => {
+    const fixture = roomActionFixture(pgQuery, 'concord_remove_message');
+    expect((await fixture.sendMrt())[0].success).toBe(true);
+    expect(
+      await roomJobQueueComplete(
+        pgQuery,
+        config.orgId,
+        fixture.request.correlationId,
+        1,
+      ),
+    ).toBe(true);
+    expect(
+      await roomJobQueueComplete(
+        pgQuery,
+        config.orgId,
+        fixture.request.correlationId,
+        2,
+      ),
+    ).toBe(false);
+    fixture.investigation.getItemByIdentifier.mockRejectedValueOnce(
+      new Error('Transient source deleted'),
+    );
+    expect((await fixture.sendMrt())[0].success).toBe(true);
+    expect(fixture.investigation.getItemByIdentifier).toHaveBeenCalledTimes(1);
+    expect(
+      fixture.fetchHTTP.mock.calls.filter(([wire]) => wire.method === 'post'),
+    ).toHaveLength(1);
+  });
+});
+
+test('closing a retired receipt fences an already prepared late registration', async () => {
+  const { correlationId: _, ...request } = input();
+  const receipt = await beginManualRoomOperation(pgQuery, config, deps, {
+    orgId: config.orgId,
+    actorId: actor.id,
+    clientNonce: randomUUID(),
+    request,
+  });
+  const captured = await prepared({
+    ...request,
+    correlationId: `manual-action-run:${receipt.operationId}`,
+  });
+  let release!: () => void;
+  let entered!: () => void;
+  const pause = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const late = pgQuery.transaction().execute(async (tx) => {
+    entered();
+    await pause;
+    return registerMemberIntents(tx, [captured]);
+  });
+  const rejectedLate = expect(late).rejects.toThrow(/receipt|operation/i);
+  await ready;
+  const identity = {
+    orgId: config.orgId,
+    actorId: actor.id,
+    executionId: receipt.executionId,
+    reason: 'Retire before late registration',
+  };
+  try {
+    await stopRoomAutomation(pgQuery, deps, identity);
+    await retirePreparedManualRoomOperation(pgQuery, deps, {
+      ...identity,
+      operationId: receipt.operationId,
+    });
+    expect(await closeRoomExecution(pgQuery, deps, identity)).toMatchObject({
+      attentionState: 'closed',
+    });
+  } finally {
+    release();
+  }
+  await rejectedLate;
+  expect(
+    await pgQuery
+      .selectFrom('concord_integration.member_intents')
+      .selectAll()
+      .where('execution_id', '=', receipt.executionId)
+      .execute(),
+  ).toEqual([]);
+});
+
+test('claimed manual removal cannot retire or close while its request may be in flight', async () => {
+  const { correlationId: _, ...request } = input('concord_remove_message');
+  const receipt = await beginManualRoomOperation(pgQuery, config, deps, {
+    orgId: config.orgId,
+    actorId: actor.id,
+    clientNonce: randomUUID(),
+    request,
+  });
+  const access = {
+    orgId: config.orgId,
+    actorId: actor.id,
+    operationId: receipt.operationId,
+  };
+  expect(await claimManualRoomOperation(pgQuery, deps, access)).toMatchObject({
+    kind: 'send',
+  });
+  const identity = {
+    ...access,
+    executionId: receipt.executionId,
+    reason: 'Stop an in-flight request',
+  };
+  await stopRoomAutomation(pgQuery, deps, identity);
+  await expect(
+    retirePreparedManualRoomOperation(pgQuery, deps, identity),
+  ).rejects.toThrow('attempted');
+  await expect(closeRoomExecution(pgQuery, deps, identity)).rejects.toThrow(
+    'Unsettled',
+  );
+  expect(
+    await getRoomExecutionDisposition(
+      pgQuery,
+      config.orgId,
+      receipt.executionId,
+    ),
+  ).toMatchObject({
+    attentionState: 'needs_attention',
+    acceptanceUnknown: true,
+  });
+});
+
+test('actual publisher forwards trusted actor/reason, rejects unauthorized retries and replays stable acceptance', async () => {
+  await withRoomTestEnvironment(async () => checkRoomRemovalPublisher(pgQuery));
+});
+test('removal journal binds responses and requests, rejects malformed facts, and survives owner mutation attempts', async () => {
+  await checkRoomRemovalAcceptances(pgQuery);
 });

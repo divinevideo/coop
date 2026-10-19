@@ -28,16 +28,16 @@ import {
 } from '../routes/concord/memberIntents.js';
 import {
   closeRoomExecution,
-  definitiveRoomRefusal,
-  getRoomExecutionDisposition,
   listRoomNeedsAttention,
-  recordPermanentRefusal,
   stopRoomAutomation,
 } from '../routes/concord/roomDispositions.js';
 import {
+  deliverMrtRemoval,
+  storedRoomRemoval,
+} from '../routes/concord/roomRemovalDelivery.js';
+import {
   isServerRoomOperationId,
   loadConcordConfig,
-  publishRoomDecision,
   roomAction,
   roomExecutionId,
   validateRoomActionPermission,
@@ -635,10 +635,31 @@ class ActionPublisher {
                         )
                         .executeTakeFirst()
                     : undefined;
+                const removal =
+                  !isMembership &&
+                  this.memberIntentPg &&
+                  String(correlationId).startsWith('mrt-decision:')
+                    ? await storedRoomRemoval(
+                        this.memberIntentPg,
+                        orgId,
+                        roomExecutionId({
+                          orgId,
+                          correlationId: String(correlationId),
+                          actionId: action.id,
+                          itemId: targetItem.itemId,
+                          itemTypeId: targetItem.itemType.id,
+                        } as RoomDecisionInput),
+                      )
+                    : undefined;
                 const item =
-                  recorded || receipt ? undefined : await getFullItem();
+                  recorded || receipt || removal
+                    ? undefined
+                    : await getFullItem();
                 const caseId =
-                  recorded?.case_id ?? receipt?.case_id ?? item?.data.case_id;
+                  recorded?.case_id ??
+                  receipt?.case_id ??
+                  removal?.request_payload.caseId ??
+                  item?.data.case_id;
                 if (typeof caseId !== 'string') return false;
                 const input: RoomDecisionInput = {
                   orgId,
@@ -680,46 +701,14 @@ class ActionPublisher {
                     input,
                   );
                 } else {
-                  const executionId = roomExecutionId(input);
                   if (!this.memberIntentPg)
                     throw new Error('Room disposition storage unavailable');
-                  const disposition = await getRoomExecutionDisposition(
+                  return await deliverMrtRemoval(
                     this.memberIntentPg,
-                    orgId,
-                    executionId,
+                    config,
+                    this.roomDependencies(config),
+                    input,
                   );
-                  if (disposition?.automationStopped)
-                    return {
-                      outcome: 'stopped',
-                      executionId,
-                      queueComplete: true,
-                      acceptanceUnknown: disposition.acceptanceUnknown,
-                    };
-                  try {
-                    return {
-                      outcome: 'accepted',
-                      status: await publishRoomDecision(
-                        config,
-                        this.roomDependencies(config),
-                        input,
-                      ),
-                    };
-                  } catch (error) {
-                    if (!definitiveRoomRefusal(error, executionId)) throw error;
-                    await recordPermanentRefusal(this.memberIntentPg, {
-                      orgId,
-                      executionId,
-                      refusalCode: 'decision_source_unavailable',
-                      sourceId: input.correlationId,
-                    });
-                    return {
-                      outcome: 'refused',
-                      executionId,
-                      refusalCode: 'decision_source_unavailable',
-                      queueComplete: true,
-                      acceptanceUnknown: false,
-                    };
-                  }
                 }
               }
               const customHeaders = action.callbackUrlHeaders;
