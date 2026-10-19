@@ -1,7 +1,7 @@
 import ActionAPI from './ActionApi.js';
 
 type ActionAPICtor = new (
-  actionPublisher: { publishActions: jest.Mock },
+  actionPublisher: { publishActions: jest.Mock; recordManualRoomIntent: jest.Mock },
   moderationConfigService: {
     getActions: jest.Mock;
     getPoliciesByIds: jest.Mock;
@@ -42,11 +42,13 @@ function makeApi(overrides?: { action?: Record<string, unknown> }) {
   };
 
   const publishActions = jest.fn().mockResolvedValue([]);
+  const recordManualRoomIntent = jest.fn().mockResolvedValue(undefined);
   const getActions = jest.fn().mockResolvedValue([action]);
   const getPoliciesByIds = jest.fn().mockResolvedValue([]);
   const getItemByIdentifier = jest.fn().mockResolvedValue({
     latestSubmission: {
       itemId: 'item-1',
+      data: { case_id: '10000000-0000-4000-8000-000000000002' },
       itemType: { id: 'type-1', kind: 'CONTENT', name: 'Social Post' },
     },
   });
@@ -57,7 +59,7 @@ function makeApi(overrides?: { action?: Record<string, unknown> }) {
   });
 
   const api = new (ActionAPI as unknown as ActionAPICtor)(
-    { publishActions },
+    { publishActions, recordManualRoomIntent },
     { getActions, getPoliciesByIds },
     {},
     { getItemByIdentifier },
@@ -67,6 +69,7 @@ function makeApi(overrides?: { action?: Record<string, unknown> }) {
   return {
     api,
     publishActions,
+    recordManualRoomIntent,
     getActions,
   };
 }
@@ -180,7 +183,7 @@ describe('ActionAPI.bulkExecuteActions', () => {
 });
 
 test('manual room retry reuses its operation after acceptance response loss', async () => {
-  const { api, publishActions } = makeApi({
+  const { api, publishActions, recordManualRoomIntent } = makeApi({
     action: {
       id: 'action-1',
       name: 'concord_remove_message',
@@ -198,6 +201,10 @@ test('manual room retry reuses its operation after acceptance response loss', as
     .mockResolvedValueOnce([]);
   await expect(api.bulkExecuteActions(input)).rejects.toThrow('response lost');
   await api.bulkExecuteActions(input);
+  expect(recordManualRoomIntent).toHaveBeenCalledTimes(2);
+  expect(recordManualRoomIntent.mock.calls[0]).toEqual(
+    recordManualRoomIntent.mock.calls[1],
+  );
   expect(publishActions.mock.calls[0][1].correlationId).toBe(
     publishActions.mock.calls[1][1].correlationId,
   );
