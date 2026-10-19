@@ -7,6 +7,10 @@ import {
   UserRole,
 } from '../../models/types/permissioning.js';
 import { jsonStringify } from '../../utils/encoding.js';
+import {
+  parseDiscordRestriction,
+  type DiscordRestriction,
+} from './lifecycleContracts.js';
 
 export type StaffActor = {
   id: string;
@@ -90,6 +94,8 @@ export class RoomResponseError extends Error {
   }
 }
 export type RoomStatus = {
+  discordRestriction?: DiscordRestriction;
+  auditAvailable?: boolean;
   executionId?: string;
   sourceOrder?: SourceOrder | null;
   decisionId: string;
@@ -170,7 +176,9 @@ export function roomPermissions(actor: StaffActor): string[] {
     ...([UserRole.ADMIN, UserRole.MODERATOR_MANAGER].includes(actor.role)
       ? ['ban_member', 'unban_member']
       : []),
-    ...(actor.role === UserRole.ADMIN ? ['discord_guild_ban'] : []),
+    ...(actor.role === UserRole.ADMIN
+      ? ['discord_guild_ban', 'manage_moderation_records', 'view_held_evidence']
+      : []),
   ];
 }
 export function roomAction(name: string): RoomAction | undefined {
@@ -213,7 +221,7 @@ export async function roomRequest(
   if (actor.orgId !== config.orgId || !roomPermissions(actor).includes('view'))
     throw new Error('Room permission required');
   if (
-    !/^\/v1\/(decisions(?:\/[0-9a-f-]{36}(?:\/retry)?)?|decision-executions\/[0-9a-f-]{36}|cases\/[0-9a-f-]{36})$/.test(
+    !/^\/v1\/(decisions(?:\/[0-9a-f-]{36}(?:\/(?:retry|reversal-context|reversals|appeal|close|restriction-refresh|publication-refresh))?)?|decision-executions\/[0-9a-f-]{36}|cases\/[0-9a-f-]{36}(?:\/(?:holds|held-evidence))?|holds\/[0-9a-f-]{36}\/release)$/.test(
       path,
     )
   )
@@ -258,12 +266,17 @@ export async function roomRequest(
     timeoutMs: 5000,
     redirect: 'error',
   });
-  if (!response.ok || ![200, 202].includes(response.status)) {
+  const holdCreated =
+    method === 'post' &&
+    /^\/v1\/cases\/[0-9a-f-]{36}\/holds$/.test(path) &&
+    response.status === 201;
+  if (!response.ok || (!holdCreated && ![200, 202].includes(response.status))) {
     const details = object(response.body);
     if (
       response.status === 404 ||
       (response.status === 409 &&
         [
+          'decision_source_unavailable',
           'member_intent_superseded',
           'member_intent_order_conflict',
           'member_intent_order_required',
@@ -321,6 +334,23 @@ export function parseRoomStatus(value: unknown): RoomStatus {
   )
     throw new Error('Malformed room delivery status');
   return {
+    ...(status.discordRestriction === undefined
+      ? {}
+      : {
+          discordRestriction: parseDiscordRestriction(
+            status.discordRestriction,
+          ),
+        }),
+    ...(status.auditAvailable === undefined
+      ? {}
+      : {
+          auditAvailable:
+            typeof status.auditAvailable === 'boolean'
+              ? status.auditAvailable
+              : (() => {
+                  throw new Error('Invalid audit availability');
+                })(),
+        }),
     ...(status.executionId === undefined
       ? {}
       : {
@@ -360,7 +390,8 @@ export type RoomDecisionInput = {
   itemId: string;
   itemTypeId: string;
   itemTypeName: string;
-  caseId: string;
+  caseId?: string;
+  priorDecisionId?: string;
   correlationId: string;
   actorId?: string;
   note?: string;
@@ -398,7 +429,11 @@ export async function publishRoomDecision(
     input.orgId !== config.orgId ||
     !/^(manual-action-run|mrt-decision):.+/.test(input.correlationId) ||
     !['concord_message', 'concord_member'].includes(input.itemTypeName) ||
-    !UUID.test(input.caseId) ||
+    !(input.priorDecisionId
+      ? input.caseId === undefined &&
+        action === 'unban_member' &&
+        UUID.test(input.priorDecisionId)
+      : UUID.test(input.caseId ?? '')) ||
     !validRoomReason(input.note)
   )
     throw new Error('Room action requires a staff decision and reason');
@@ -414,9 +449,11 @@ export async function publishRoomDecision(
       dependencies.fetchHTTP,
       actor,
       'post',
-      '/v1/decisions',
+      input.priorDecisionId
+        ? `/v1/decisions/${input.priorDecisionId}/reversals`
+        : '/v1/decisions',
       {
-        caseId: input.caseId,
+        ...(input.priorDecisionId ? {} : { caseId: input.caseId }),
         executionId,
         ...(action === 'remove_message'
           ? {}

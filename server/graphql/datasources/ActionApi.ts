@@ -5,6 +5,7 @@ import { v1 as uuidv1 } from 'uuid';
 import { inject, type Dependencies } from '../../iocContainer/index.js';
 import { roomAttemptNotRecorded } from '../../routes/concord/attemptOutcome.js';
 import {
+  isServerRoomOperationId,
   isSourceOrderedRoomOperationId,
   roomAction,
   UUID,
@@ -33,6 +34,114 @@ class ActionAPI {
     private readonly itemInvestigationService: Dependencies['ItemInvestigationService'],
     private readonly getItemTypeEventuallyConsistent: Dependencies['getItemTypeEventuallyConsistent'],
   ) {}
+
+  async authorizeRoomRequest(input: {
+    orgId: string;
+    actorId: string;
+    token?: string;
+    origin?: string;
+    mutation: boolean;
+  }) {
+    return this.actionPublisher.authorizeRoomAccess(input);
+  }
+  async beginRoomOperation(
+    input: {
+      orgId: string;
+      actorId: string;
+      clientNonce: string;
+      actionId: string;
+      itemTypeId: string;
+      itemId: string;
+      note: string;
+      parameters?: Record<string, unknown>;
+    },
+    priorDecisionId?: string,
+  ) {
+    const action = await this.getGraphQLActionFromId({
+      orgId: input.orgId,
+      id: input.actionId,
+    });
+    const itemType = await this.getItemTypeEventuallyConsistent({
+      orgId: input.orgId,
+      typeSelector: { id: input.itemTypeId },
+    });
+    if (
+      !itemType ||
+      !['concord_message', 'concord_member'].includes(itemType.name) ||
+      !roomAction(action.name) ||
+      (priorDecisionId && action.name !== 'concord_unban_member')
+    )
+      throw new Error('Room action or item type unavailable');
+    const parameters =
+      this.#validateParametersForActions([action], {
+        [action.id]: input.parameters ?? {},
+      }).get(action.id) ?? {};
+    const item = priorDecisionId
+      ? undefined
+      : await this.itemInvestigationService.getItemByIdentifier({
+          orgId: input.orgId,
+          itemIdentifier: { id: input.itemId, typeId: input.itemTypeId },
+          latestSubmissionOnly: true,
+        });
+    const caseId = item?.latestSubmission?.data.case_id;
+    if (!priorDecisionId && typeof caseId !== 'string')
+      throw new Error('Room case unavailable');
+    const request = {
+      orgId: input.orgId,
+      actorId: input.actorId,
+      actionId: action.id,
+      actionName: action.name,
+      itemId: priorDecisionId ?? input.itemId,
+      itemTypeId: itemType.id,
+      itemTypeName: itemType.name,
+      ...(priorDecisionId ? { priorDecisionId } : { caseId: String(caseId) }),
+      note: input.note,
+      parameters,
+    };
+    const args = {
+      orgId: input.orgId,
+      actorId: input.actorId,
+      clientNonce: input.clientNonce,
+      request,
+    };
+    return priorDecisionId
+      ? this.actionPublisher.reverseRoomDecision(args)
+      : this.actionPublisher.beginRoomOperation(args);
+  }
+  async roomOperationStatus(input: {
+    orgId: string;
+    actorId: string;
+    operationId: string;
+  }) {
+    return this.actionPublisher.roomOperationStatus(input);
+  }
+  async retireRoomOperation(input: {
+    orgId: string;
+    actorId: string;
+    operationId: string;
+    reason: string;
+  }) {
+    return this.actionPublisher.retireRoomOperation(input);
+  }
+  async roomNeedsAttention(input: {
+    orgId: string;
+    actorId: string;
+    cursor?: string;
+    limit: number;
+  }) {
+    return this.actionPublisher.roomNeedsAttention(input);
+  }
+  async roomDisposition(
+    input: {
+      orgId: string;
+      actorId: string;
+      executionId: string;
+      reason: string;
+    },
+    close: boolean,
+  ) {
+    return this.actionPublisher.roomDisposition(input, close);
+  }
 
   async getGraphQLActionFromId(opts: { id: string; orgId: string }) {
     const { id, orgId } = opts;
@@ -201,6 +310,10 @@ class ActionAPI {
         isRoom &&
         (!opts.operationId ||
           (!UUID.test(opts.operationId) &&
+            !isServerRoomOperationId(
+              opts.operationId,
+              roomAction(actions[0]?.name ?? ''),
+            ) &&
             !isSourceOrderedRoomOperationId(
               opts.operationId,
               roomAction(actions[0]?.name ?? ''),
@@ -257,7 +370,7 @@ class ActionAPI {
               },
             };
             const membership = actions.filter((action) =>
-              ['ban_member', 'unban_member'].includes(
+              ['remove_message', 'ban_member', 'unban_member'].includes(
                 roomAction(action.name) ?? '',
               ),
             );

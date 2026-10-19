@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { jsonStringify } from '../../utils/encoding.js';
+import { parseReversalContext } from './lifecycleContracts.js';
 import {
   type MemberIntentDependencies,
   type PreparedMemberIntent,
@@ -37,7 +38,7 @@ export async function prepareMemberIntent(
     !['concord_message', 'concord_member'].includes(input.itemTypeName) ||
     !input.actorId ||
     input.orgId !== config.orgId ||
-    !UUID.test(input.caseId) ||
+    !UUID.test(input.caseId ?? '') ||
     !validRoomReason(input.note) ||
     !/^(mrt-decision|manual-action-run):.+/.test(input.correlationId)
   )
@@ -81,4 +82,44 @@ export function memberIntentFingerprint(
   return createHash('sha256')
     .update(jsonStringify([targetKey, input]))
     .digest('hex');
+}
+
+export async function prepareReversalMemberIntent(
+  config: ConcordConfig,
+  dependencies: MemberIntentDependencies,
+  input: RoomDecisionInput,
+): Promise<PreparedMemberIntent> {
+  if (
+    input.actionName !== 'concord_unban_member' ||
+    input.caseId !== undefined ||
+    !UUID.test(input.priorDecisionId ?? '') ||
+    !input.actorId ||
+    input.orgId !== config.orgId ||
+    !validRoomReason(input.note)
+  )
+    throw new Error('Invalid reversal intent');
+  const actor = await dependencies.getActor(input.actorId, input.orgId);
+  validateRoomActionPermission(actor, input.actionName, input.parameters ?? {});
+  const context = parseReversalContext(
+    await roomRequest(
+      config,
+      dependencies.fetchHTTP,
+      actor,
+      'get',
+      `/v1/decisions/${input.priorDecisionId}/reversal-context`,
+    ),
+    input.priorDecisionId!,
+  );
+  const targetKey = memberTargetKey(
+    input.orgId,
+    context.communityId,
+    context.author,
+  );
+  return {
+    input,
+    targetKey,
+    executionId: roomExecutionId(input),
+    fingerprint: memberIntentFingerprint(input, targetKey),
+    action: 'unban_member',
+  };
 }

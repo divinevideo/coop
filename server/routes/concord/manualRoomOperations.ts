@@ -4,11 +4,13 @@ import { sql, type Kysely } from 'kysely';
 import { UserRole } from '../../models/types/permissioning.js';
 import { jsonStringify } from '../../utils/encoding.js';
 import { type ManualRoomOperationStatus } from './manualRoomOperationTypes.js';
+import { assertMemberIntentStatus } from './memberIntentStatus.js';
 import {
   type MemberDeliveryOutcome,
   type MemberIntentDependencies,
   type MemberIntentPg,
 } from './memberIntentTypes.js';
+import { getRoomExecutionDisposition } from './roomDispositions.js';
 import {
   MANUAL_ROOM_OPERATION_PREFIX,
   roomAction,
@@ -68,6 +70,11 @@ async function statusOf(
     .where('org_id', '=', receipt.org_id)
     .where('execution_id', '=', receipt.execution_id)
     .executeTakeFirst();
+  const disposition = await getRoomExecutionDisposition(
+    pg,
+    receipt.org_id,
+    receipt.execution_id,
+  );
   const recorded = Boolean(intent);
   const acceptedDecisionId =
     receipt.accepted_decision_id ?? intent?.accepted_decision_id ?? null;
@@ -83,6 +90,7 @@ async function statusOf(
     attempted &&
     !acceptedDecisionId &&
     !receipt.refusal_code &&
+    !disposition?.refusalCode &&
     !intent?.bridge_superseded_by_execution_id;
   return {
     operationId: receipt.operation_id,
@@ -92,11 +100,12 @@ async function statusOf(
     acceptanceUnknown,
     acceptedDecisionId,
     sourceOrder: intent ? { version: 1, revision: intent.revision } : null,
-    refusalCode: receipt.refusal_code,
-    disposition: receipt.refusal_code ? 'needs_attention' : 'none',
+    refusalCode: receipt.refusal_code ?? disposition?.refusalCode ?? null,
+    disposition: disposition?.attentionState ?? 'none',
     successorExecutionId,
-    allowedNextActions:
-      phase === 'retired'
+    allowedNextActions: disposition?.automationStopped
+      ? []
+      : phase === 'retired'
         ? ['replace']
         : !attempted && !recorded
           ? ['send', 'retire']
@@ -124,7 +133,11 @@ export async function beginManualRoomOperation(
     request.orgId !== input.orgId ||
     input.orgId !== config.orgId ||
     request.actorId !== input.actorId ||
-    !UUID.test(request.caseId) ||
+    !(request.priorDecisionId
+      ? request.caseId === undefined &&
+        action === 'unban_member' &&
+        UUID.test(request.priorDecisionId)
+      : UUID.test(request.caseId ?? '')) ||
     !request.itemId ||
     !request.itemTypeId ||
     !request.actionId ||
@@ -157,7 +170,8 @@ export async function beginManualRoomOperation(
         item_id: request.itemId,
         item_type_id: request.itemTypeId,
         action,
-        case_id: request.caseId,
+        case_id: request.caseId ?? null,
+        prior_decision_id: request.priorDecisionId ?? null,
         fingerprint: fingerprint(request),
         request_payload: payload,
         phase: 'prepared',
@@ -271,6 +285,13 @@ export async function claimManualRoomOperation(
     const receipt = await authorizedReceipt(tx, dependencies, access);
     const status = await statusOf(tx, receipt);
     if (
+      (
+        await getRoomExecutionDisposition(
+          tx,
+          access.orgId,
+          receipt.execution_id,
+        )
+      )?.automationStopped ||
       ['retired', 'refused'].includes(receipt.phase) ||
       status.successorExecutionId
     )
@@ -323,6 +344,15 @@ export async function settleManualRoomOperation(
         (receipt.action === 'remove_message' && accepted.sourceOrder !== null)
       )
         throw new Error('Mismatched room operation acceptance');
+      if (receipt.action !== 'remove_message') {
+        const intent = await tx
+          .selectFrom('concord_integration.member_intents')
+          .selectAll()
+          .where('org_id', '=', input.orgId)
+          .where('execution_id', '=', input.executionId)
+          .executeTakeFirstOrThrow();
+        assertMemberIntentStatus(accepted, intent);
+      }
       const updated = await tx
         .updateTable('concord_integration.room_manual_operations')
         .set({
@@ -337,6 +367,44 @@ export async function settleManualRoomOperation(
         .executeTakeFirstOrThrow();
       return statusOf(tx, updated);
     }
+    if (input.outcome.outcome === 'refused') {
+      const updated = await tx
+        .updateTable('concord_integration.room_manual_operations')
+        .set({
+          phase: 'refused',
+          refusal_code: input.outcome.refusalCode,
+          updated_at: new Date(),
+        })
+        .where('org_id', '=', input.orgId)
+        .where('execution_id', '=', input.executionId)
+        .returningAll()
+        .executeTakeFirstOrThrow();
+      return statusOf(tx, updated);
+    }
     return statusOf(tx, receipt);
   });
+}
+
+/** Validate the immutable request before preparation or transport; expired evidence is unnecessary. */
+export async function manualRoomRequest(
+  pg: Kysely<MemberIntentPg>,
+  dependencies: MemberIntentDependencies,
+  input: RoomDecisionInput,
+) {
+  const receipt = await authorizedReceipt(pg, dependencies, {
+    orgId: input.orgId,
+    actorId: input.actorId ?? '',
+    operationId: input.correlationId.slice('manual-action-run:'.length),
+  });
+  const candidate = input.priorDecisionId
+    ? input
+    : { ...input, caseId: input.caseId || receipt.case_id };
+  if (
+    receipt.actor_id !== input.actorId ||
+    jsonStringify(candidate) !== jsonStringify(receipt.request_payload)
+  )
+    throw new Error('Room operation request conflict');
+  if (receipt.phase === 'retired')
+    throw new Error('Room operation receipt retired');
+  return receipt.request_payload;
 }

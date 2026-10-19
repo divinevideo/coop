@@ -106,12 +106,14 @@ test.each([
         ? 'https://wrong-callback.example/v1/decisions'
         : config.CONCORD_MODERATION_ORIGIN + '/v1/decisions',
     );
-    if (kind === 'registered_legacy')
+    if (['registered_legacy', 'unseen_legacy'].includes(kind))
       await expect(result).resolves.toBeUndefined();
-    else if (['reason', 'denied'].includes(kind))
+    else if (kind === 'reason')
       await expect(result).rejects.toMatchObject({
         extensions: { roomAttemptOutcome: 'NOT_RECORDED' },
       });
+    else if (kind === 'denied')
+      await expect(result).rejects.toThrow('permission');
     else
       await expect(result).rejects.toThrow(
         kind === 'callback'
@@ -171,6 +173,16 @@ test('actual publisher forwards trusted actor, reason and stable execution while
     } as never,
     { applyUserStrikeFromPublishedActions: async () => {} } as never,
     { getGraphQLUserFromId: async () => actor } as never,
+    {
+      selectFrom: () => {
+        const query = {
+          selectAll: () => query,
+          where: () => query,
+          executeTakeFirst: async () => undefined,
+        };
+        return query;
+      },
+    } as never,
   );
   const action = {
     id: 'action',

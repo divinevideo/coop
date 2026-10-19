@@ -115,3 +115,62 @@ fencing; it does not create a newer decision.
 The explicit replacement interaction, audited terminal refusal/remediation outcome
 and hands-on acceptance remain owner review gates under Coop #24. This recovery
 change does not introduce an archive endpoint or claim unknown acceptance cancelled.
+
+### Durable room operation API (owner UI integration)
+
+Manual room actions now begin with `beginRoomOperation(input)` using a UUID
+`clientNonce`, the selected `actionId`, `itemId`, `itemTypeId`, a nonblank `note`
+(maximum 2048 characters), and validated `parameters`. Actor, organization,
+queue permission and action configuration come from the authenticated server
+session. The response supplies `operationId` (`source-order-v2_<action>_<uuid>`)
+and immutable `executionId`. Pass that operation ID to `bulkExecuteActions`.
+Repeat begin with the same nonce and exact claim to recover the same receipt;
+changing its actor-bound request conflicts. Unseen old browser IDs cannot
+register or send new work. Accepted legacy operations retain lookup recovery.
+
+`roomOperationStatus(operationId)` works after evidence expiry. It returns
+`phase`, `recorded`, `acceptanceUnknown`, `acceptedDecisionId`, `sourceOrder`,
+`refusalCode`, `disposition`, `successorExecutionId` and `allowedNextActions`;
+it contains no evidence or staff reason. `retireRoomOperation(operationId,
+reason)` can retire only an unregistered, unattempted receipt. Recorded or
+uncertain execution conflicts; retirement never recalls already-sent HTTP.
+An exact recovery after lookup 404 keeps the original execution, payload and
+source revision, rechecks the latest member head, and never resets delivery.
+
+`roomNeedsAttention(cursor, limit)` reads committed primary-database attention
+independently of Redis (limit 1–100). ADMIN `stopRoomAutomation(executionId,
+reason)` preserves unknown acceptance and visibility. ADMIN
+`closeRoomExecution(executionId, reason)` refuses unsettled acceptance and
+records separate audit; archive is not enforcement success. A matching typed
+`decision_source_unavailable` refusal is durable before queue completion;
+generic authentication, configuration, timeout and transport failures are not
+classified as permanent. Publisher `queueComplete` is separate from `success`.
+
+`reverseRoomDecision(input)` takes `decisionId`, a new `clientNonce`, the configured
+unban `actionId`/room `itemTypeId`, `note` and parameters. The backend obtains the
+prior ban's authenticated target, issues a new receipt and source revision, and
+posts a new reversal even after the original case has expired. It never recreates
+evidence or reopens old delivery Retry. Existing fingerprints are unchanged.
+Decision status preserves `discordRestriction` (state, observation time, code)
+and `auditAvailable`; a community unban does not imply a Discord guild unban.
+
+Decision metadata is available through GET `/api/v1/concord/decisions/:id`.
+POST lifecycle routes mirror `/api/v1/concord/cases/:id/holds`,
+`/api/v1/concord/cases/:id/held-evidence`, `/api/v1/concord/holds/:id/release`,
+and `/api/v1/concord/decisions/:id/{appeal,close,restriction-refresh,publication-refresh}`.
+They enforce current queue/org/session/Access and same-origin checks. ADMIN-only
+capabilities separate lifecycle management from audited held-evidence access.
+Refresh returns 202/current status and schedules upstream operator work; Coop
+never settles publication proof. Ordinary case reads retain expiry behavior.
+
+All new GraphQL room operations also verify the Access assertion and same origin
+for mutations. The assigned UI owner, mbradley (#24), must adopt server begin,
+recovery/retirement and truthful attention/supersession/restriction displays.
+The existing first-attempt and late-A-success/B-pending identity cleanup
+regressions remain required. Backend delivery does not complete that UI work.
+
+Deploy this additive lifecycle migration with compatible API/worker/client
+writers after draining old writers. Preserve receipts, retirement records,
+dispositions and source heads on rollback. Never resume old unfenced writers.
+Audit retention configuration, owner UI acceptance, paired Bridge validation,
+artifact publication and live rollout remain separate release gates.

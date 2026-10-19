@@ -4,8 +4,8 @@ import { type PassportContext } from 'graphql-passport';
 
 import { type GQLServices } from '../api.js';
 import { type DataSources } from '../iocContainer/index.js';
-import { type GraphQLUserParent } from './datasources/userKyselyPersistence.js';
 import { CoopError, isCoopErrorOfType } from '../utils/errors.js';
+import { type GraphQLUserParent } from './datasources/userKyselyPersistence.js';
 import {
   type GQLInviteUserToken,
   type GQLMutationResolvers,
@@ -18,27 +18,28 @@ import { resolvers as authenticationResolvers } from './modules/authentication.j
 import { resolvers as backtestResolvers } from './modules/backtest.js';
 import { resolvers as contentTypeResolvers } from './modules/contentType.js';
 import { resolvers as genericResolvers } from './modules/generic.js';
+import { resolvers as hashBankResolvers } from './modules/hashBanks/resolvers.js';
 import { resolvers as insightsResolvers } from './modules/insights.js';
 import { resolvers as integrationResolvers } from './modules/integration.js';
 import { resolvers as investigationResolvers } from './modules/investigation.js';
 import { resolvers as itemTypeResolvers } from './modules/itemType.js';
 import { resolvers as locationBankResolvers } from './modules/locationBank.js';
 import { resolvers as manualReviewToolResolvers } from './modules/manualReviewTool.js';
-import { resolvers as hashBankResolvers } from './modules/hashBanks/resolvers.js';
 import { resolvers as ncmecResolvers } from './modules/ncmec.js';
 import { resolvers as orgResolvers } from './modules/org.js';
 import { resolvers as policyResolvers } from './modules/policy.js';
 import { resolvers as reportingResolvers } from './modules/reporting.js';
 import { resolvers as reportingRulesResolvers } from './modules/reportingRule.js';
 import { resolvers as retroactionResolvers } from './modules/retroaction.js';
+import { resolvers as roomActionModule } from './modules/roomAction.js';
 import { resolvers as routingRulesResolvers } from './modules/routingRule.js';
 import { resolvers as ruleResolvers } from './modules/rule.js';
 import { resolvers as signalResolvers } from './modules/signal.js';
 import { resolvers as spotTestResolvers } from './modules/spotTest.js';
 import { resolvers as textBankResolvers } from './modules/textBank.js';
 import { resolvers as userResolvers } from './modules/user.js';
-import { gqlErrorResult, gqlSuccessResult } from './utils/gqlResult.js';
 import { forbiddenError, unauthenticatedError } from './utils/errors.js';
+import { gqlErrorResult, gqlSuccessResult } from './utils/gqlResult.js';
 
 // eslint-disable-next-line @typescript-eslint/no-restricted-types
 export type Context = PassportContext<GraphQLUserParent, {}> & {
@@ -72,9 +73,8 @@ const Query: GQLQueryResolvers = {
   },
   async inviteUserToken(_, { token }, { dataSources }) {
     try {
-      const inviteUserToken = await dataSources.orgAPI.getInviteUserToken(
-        token,
-      );
+      const inviteUserToken =
+        await dataSources.orgAPI.getInviteUserToken(token);
       return gqlSuccessResult(
         { tokenData: inviteUserToken as unknown as GQLInviteUserToken },
         'InviteUserTokenSuccessResponse',
@@ -105,7 +105,10 @@ const Query: GQLQueryResolvers = {
       )) as any;
     } catch (e) {
       // eslint-disable-next-line no-console
-      console.error('allRuleInsights: warehouse query failed:', (e as Error).message);
+      console.error(
+        'allRuleInsights: warehouse query failed:',
+        (e as Error).message,
+      );
       return null;
     }
   },
@@ -118,7 +121,10 @@ const Query: GQLQueryResolvers = {
       return true;
     } catch (e) {
       // eslint-disable-next-line no-console
-      console.error('isWarehouseAvailable: warehouse health check failed:', (e as Error).message);
+      console.error(
+        'isWarehouseAvailable: warehouse health check failed:',
+        (e as Error).message,
+      );
       return false;
     }
   },
@@ -170,7 +176,9 @@ const Mutation: GQLMutationResolvers = {
     }
 
     if (!user.getPermissions().includes('MANAGE_ORG')) {
-      throw forbiddenError('User does not have permission to generate password reset tokens');
+      throw forbiddenError(
+        'User does not have permission to generate password reset tokens',
+      );
     }
 
     const token =
@@ -257,6 +265,7 @@ const Mutation: GQLMutationResolvers = {
 
 export default mergeResolvers([
   { Query, Mutation, SignUpResponse },
+  roomActionModule,
   actionResolvers,
   actionStatisticsResolvers,
   apiKeyResolvers,

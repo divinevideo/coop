@@ -49,7 +49,9 @@ export const response = (
     resultCode: null,
   })),
 });
-export const input = (action = 'concord_ban_member'): RoomDecisionInput => ({
+export const input = (
+  action = 'concord_ban_member',
+): RoomDecisionInput & { caseId: string } => ({
   orgId: config.orgId,
   actionId: action,
   actionName: action,

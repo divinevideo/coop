@@ -6,8 +6,18 @@ import { type JsonObject, type ReadonlyDeep } from 'type-fest';
 
 import { type Dependencies } from '../iocContainer/index.js';
 import { inject } from '../iocContainer/utils.js';
+import { accessVerifier } from '../routes/concord/access.js';
 import { roomAttemptNotRecorded } from '../routes/concord/attemptOutcome.js';
 import { roomActor } from '../routes/concord/authorization.js';
+import { deliverManualRoomOperation } from '../routes/concord/manualRoomDelivery.js';
+import {
+  beginManualRoomOperation,
+  getManualRoomOperation,
+  manualRoomRequest,
+  retirePreparedManualRoomOperation,
+  type ManualOperationAccess,
+} from '../routes/concord/manualRoomOperations.js';
+import { prepareReversalMemberIntent } from '../routes/concord/memberIntentIdentity.js';
 import {
   deliverMemberIntent,
   memberIntentFingerprint,
@@ -17,11 +27,21 @@ import {
   type MemberIntentPg,
 } from '../routes/concord/memberIntents.js';
 import {
-  isSourceOrderedRoomOperationId,
+  closeRoomExecution,
+  definitiveRoomRefusal,
+  getRoomExecutionDisposition,
+  listRoomNeedsAttention,
+  recordPermanentRefusal,
+  stopRoomAutomation,
+} from '../routes/concord/roomDispositions.js';
+import {
+  isServerRoomOperationId,
   loadConcordConfig,
   publishRoomDecision,
   roomAction,
   roomExecutionId,
+  validateRoomActionPermission,
+  validRoomReason,
   type RoomDecisionInput,
 } from '../routes/concord/service.js';
 import {
@@ -90,6 +110,7 @@ export type ActionResult<T extends ActionTargetItem> = {
   actionId: string;
   targetItem: T;
   success: boolean;
+  queueComplete?: boolean;
   roomOutcome?: MemberDeliveryOutcome;
 };
 
@@ -167,33 +188,160 @@ class ActionPublisher {
       if (
         prior.fingerprint !==
         memberIntentFingerprint(
-          { ...input, caseId: input.caseId || prior.case_id },
+          input.priorDecisionId
+            ? input
+            : { ...input, caseId: input.caseId || prior.case_id || undefined },
           prior.target_key,
         )
       )
         throw new Error('Membership execution intent conflict');
       return;
     }
-    if (
-      !isSourceOrderedRoomOperationId(
-        input.correlationId.slice('manual-action-run:'.length),
-        roomAction(input.actionName),
-      )
-    )
-      throw new Error(
-        'Unseen legacy manual operation requires reconciliation before a new staff decision',
-      );
-    const prepared = await prepareMemberIntent(
-      config,
+    if (!validRoomReason(input.note))
+      throw roomAttemptNotRecorded(new Error('Invalid room reason'));
+    validateRoomActionPermission(
+      await this.roomDependencies(config).getActor(
+        input.actorId ?? '',
+        input.orgId,
+      ),
+      input.actionName,
+      input.parameters ?? {},
+    );
+    const operationId = input.correlationId.slice('manual-action-run:'.length);
+    if (!isServerRoomOperationId(operationId, roomAction(input.actionName))) {
+      // Recovery of accepted legacy operations is lookup-only in the publisher.
+      return;
+    }
+    const request = await manualRoomRequest(
+      this.memberIntentPg,
       this.roomDependencies(config),
       input,
-    ).catch((error: unknown) => {
-      // No registration transaction has started for this attempt.
-      throw roomAttemptNotRecorded(error);
-    });
+    );
+    if (roomAction(input.actionName) === 'remove_message') return;
+    const prepared = await (
+      request.priorDecisionId
+        ? prepareReversalMemberIntent
+        : prepareMemberIntent
+    )(config, this.roomDependencies(config), request).catch(
+      (error: unknown) => {
+        // No registration transaction has started for this attempt.
+        throw roomAttemptNotRecorded(error);
+      },
+    );
     await this.memberIntentPg
       .transaction()
       .execute(async (tx) => registerMemberIntents(tx, [prepared]));
+  }
+
+  async beginRoomOperation(input: {
+    orgId: string;
+    actorId: string;
+    clientNonce: string;
+    request: Omit<RoomDecisionInput, 'correlationId'>;
+  }) {
+    if (!this.memberIntentPg)
+      throw new Error('Room receipt storage unavailable');
+    const config = loadConcordConfig(process.env);
+    return beginManualRoomOperation(
+      this.memberIntentPg,
+      config,
+      this.roomDependencies(config),
+      input,
+    );
+  }
+  async roomOperationStatus(access: ManualOperationAccess) {
+    if (!this.memberIntentPg)
+      throw new Error('Room receipt storage unavailable');
+    return getManualRoomOperation(
+      this.memberIntentPg,
+      this.roomDependencies(loadConcordConfig(process.env)),
+      access,
+    );
+  }
+  async retireRoomOperation(
+    access: ManualOperationAccess & { reason: string },
+  ) {
+    if (!this.memberIntentPg)
+      throw new Error('Room receipt storage unavailable');
+    return retirePreparedManualRoomOperation(
+      this.memberIntentPg,
+      this.roomDependencies(loadConcordConfig(process.env)),
+      access,
+    );
+  }
+
+  async authorizeRoomAccess(input: {
+    orgId: string;
+    actorId: string;
+    token?: string;
+    origin?: string;
+    mutation: boolean;
+  }) {
+    const config = loadConcordConfig(process.env);
+    const actor = await this.roomDependencies(config).getActor(
+      input.actorId,
+      input.orgId,
+    );
+    await accessVerifier(config, this.fetchHTTP)(input.token, actor.email);
+    if (input.mutation && input.origin !== config.coopOrigin)
+      throw new Error('Same-origin staff request required');
+  }
+  async roomNeedsAttention(input: {
+    orgId: string;
+    actorId: string;
+    cursor?: string;
+    limit: number;
+  }) {
+    if (!this.memberIntentPg) throw new Error('Room storage unavailable');
+    return listRoomNeedsAttention(
+      this.memberIntentPg,
+      this.roomDependencies(loadConcordConfig(process.env)),
+      input,
+    );
+  }
+  async roomDisposition(
+    input: {
+      orgId: string;
+      actorId: string;
+      executionId: string;
+      reason: string;
+    },
+    close: boolean,
+  ) {
+    if (!this.memberIntentPg) throw new Error('Room storage unavailable');
+    return (close ? closeRoomExecution : stopRoomAutomation)(
+      this.memberIntentPg,
+      this.roomDependencies(loadConcordConfig(process.env)),
+      input,
+    );
+  }
+  async reverseRoomDecision(input: {
+    orgId: string;
+    actorId: string;
+    clientNonce: string;
+    request: Omit<RoomDecisionInput, 'correlationId'>;
+  }) {
+    if (!this.memberIntentPg) throw new Error('Room storage unavailable');
+    const status = await this.beginRoomOperation(input);
+    const request = {
+      ...input.request,
+      correlationId: `manual-action-run:${status.operationId}`,
+    };
+    await this.recordManualRoomIntent(
+      request,
+      loadConcordConfig(process.env).origin + '/v1/decisions',
+    );
+    await deliverManualRoomOperation(
+      this.memberIntentPg,
+      loadConcordConfig(process.env),
+      this.roomDependencies(loadConcordConfig(process.env)),
+      request,
+    );
+    return this.roomOperationStatus({
+      orgId: input.orgId,
+      actorId: input.actorId,
+      operationId: status.operationId,
+    });
   }
 
   private roomDependencies(config: ReturnType<typeof loadConcordConfig>) {
@@ -338,7 +486,17 @@ class ActionPublisher {
             }
           })();
 
-          const success = typeof outcome === 'boolean' ? outcome : true;
+          const success =
+            typeof outcome === 'boolean'
+              ? outcome
+              : outcome.outcome === 'accepted';
+          const queueComplete =
+            typeof outcome === 'boolean'
+              ? outcome
+              : outcome.outcome === 'accepted' ||
+                outcome.outcome === 'refused' ||
+                outcome.outcome === 'stopped' ||
+                !outcome.acceptanceUnknown;
           await this.actionExecutionLogger.logActionExecutions({
             executions: [
               {
@@ -373,6 +531,7 @@ class ActionPublisher {
 
           return {
             success,
+            queueComplete,
             ...(typeof outcome === 'boolean' ? {} : { roomOutcome: outcome }),
             targetItem: executionContext.targetItem,
             actionId: action.id,
@@ -458,8 +617,28 @@ class ActionPublisher {
                         )
                         .executeTakeFirst()
                     : undefined;
-                const item = recorded ? undefined : await getFullItem();
-                const caseId = recorded?.case_id ?? item?.data.case_id;
+                const receipt =
+                  String(correlationId).startsWith('manual-action-run:') &&
+                  this.memberIntentPg
+                    ? await this.memberIntentPg
+                        .selectFrom(
+                          'concord_integration.room_manual_operations',
+                        )
+                        .selectAll()
+                        .where('org_id', '=', orgId)
+                        .where(
+                          'operation_id',
+                          '=',
+                          String(correlationId).slice(
+                            'manual-action-run:'.length,
+                          ),
+                        )
+                        .executeTakeFirst()
+                    : undefined;
+                const item =
+                  recorded || receipt ? undefined : await getFullItem();
+                const caseId =
+                  recorded?.case_id ?? receipt?.case_id ?? item?.data.case_id;
                 if (typeof caseId !== 'string') return false;
                 const input: RoomDecisionInput = {
                   orgId,
@@ -481,6 +660,16 @@ class ActionPublisher {
                             customMrtApiParamDecisionPayload.discordGuildConfirmed,
                         },
                 };
+                if (String(correlationId).startsWith('manual-action-run:')) {
+                  if (!this.memberIntentPg)
+                    throw new Error('Room receipt storage unavailable');
+                  return await deliverManualRoomOperation(
+                    this.memberIntentPg,
+                    config,
+                    this.roomDependencies(config),
+                    input,
+                  );
+                }
                 if (isMembership) {
                   if (!this.memberIntentPg)
                     throw new Error('Membership intent storage unavailable');
@@ -490,13 +679,48 @@ class ActionPublisher {
                     this.roomDependencies(config),
                     input,
                   );
-                } else
-                  await publishRoomDecision(
-                    config,
-                    this.roomDependencies(config),
-                    input,
+                } else {
+                  const executionId = roomExecutionId(input);
+                  if (!this.memberIntentPg)
+                    throw new Error('Room disposition storage unavailable');
+                  const disposition = await getRoomExecutionDisposition(
+                    this.memberIntentPg,
+                    orgId,
+                    executionId,
                   );
-                return true;
+                  if (disposition?.automationStopped)
+                    return {
+                      outcome: 'stopped',
+                      executionId,
+                      queueComplete: true,
+                      acceptanceUnknown: disposition.acceptanceUnknown,
+                    };
+                  try {
+                    return {
+                      outcome: 'accepted',
+                      status: await publishRoomDecision(
+                        config,
+                        this.roomDependencies(config),
+                        input,
+                      ),
+                    };
+                  } catch (error) {
+                    if (!definitiveRoomRefusal(error, executionId)) throw error;
+                    await recordPermanentRefusal(this.memberIntentPg, {
+                      orgId,
+                      executionId,
+                      refusalCode: 'decision_source_unavailable',
+                      sourceId: input.correlationId,
+                    });
+                    return {
+                      outcome: 'refused',
+                      executionId,
+                      refusalCode: 'decision_source_unavailable',
+                      queueComplete: true,
+                      acceptanceUnknown: false,
+                    };
+                  }
+                }
               }
               const customHeaders = action.callbackUrlHeaders;
               const customBody = action.callbackUrlBody;
