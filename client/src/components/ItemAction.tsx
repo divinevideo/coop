@@ -264,6 +264,20 @@ export default function ItemAction(props: {
             throw new Error('Room preparation response unavailable.');
           operationId = status.operationId;
           rememberRoomReceipt(itemIdentifier, pending.clientNonce, operationId);
+          if (
+            status.phase === 'retired' &&
+            status.recorded === false &&
+            status.acceptanceUnknown === false &&
+            !status.acceptedDecisionId &&
+            status.allowedNextActions.includes('replace')
+          ) {
+            completeRoomOperation(itemIdentifier, operationId);
+            setModalBody(
+              'This room request was retired without delivery. You can now choose a new action and reason. Retirement is not enforcement success.',
+            );
+            setShowModal(true);
+            return;
+          }
           if (status.acceptedDecisionId && !status.acceptanceUnknown) {
             completeRoomOperation(itemIdentifier, operationId);
             setModalBody(

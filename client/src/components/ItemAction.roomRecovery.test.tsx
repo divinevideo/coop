@@ -140,6 +140,7 @@ beforeEach(() => {
           phase: 'prepared',
           disposition: 'none',
           acceptanceUnknown: false,
+          recorded: false,
           allowedNextActions: ['send'],
         },
       },
@@ -363,6 +364,8 @@ test.each(['retired', 'refused', 'accepted'])(
             phase === 'refused' ? 'decision_source_unavailable' : null,
           acceptedDecisionId: phase === 'accepted' ? 'decision' : null,
           acceptanceUnknown: false,
+          recorded: false,
+          allowedNextActions: phase === 'retired' ? ['replace'] : [],
         },
       },
     });
@@ -370,12 +373,66 @@ test.each(['retired', 'refused', 'accepted'])(
     selectRoom();
     fireEvent.click(screen.getByText('Submit Actions'));
     await screen.findByText(
-      phase === 'accepted' ? /already recorded/ : /cannot be sent/,
+      phase === 'accepted'
+        ? /already recorded/
+        : phase === 'retired'
+          ? /retired without delivery/
+          : /cannot be sent/,
     );
     expect(hooks.submit).not.toHaveBeenCalled();
     expect(roomOperation({ id: 'item', typeId: 'room' })).toBe(
-      phase === 'accepted' ? undefined : operationId,
+      phase === 'refused' ? operationId : undefined,
     );
+    if (phase === 'retired') {
+      const oldNonce = hooks.begin.mock.calls[0][0].variables.input.clientNonce;
+      hooks.begin.mockResolvedValueOnce({
+        data: {
+          beginRoomOperation: {
+            operationId: 'replacement',
+            phase: 'prepared',
+            disposition: 'none',
+            acceptanceUnknown: false,
+          },
+        },
+      });
+      hooks.submit.mockResolvedValue({});
+      fireEvent.change(screen.getByLabelText('Action'), {
+        target: { value: 'concord_remove_message' },
+      });
+      fireEvent.click(screen.getByText('Submit Actions'));
+      await waitFor(() => expect(hooks.submit).toHaveBeenCalledTimes(1));
+      expect(hooks.begin.mock.calls[1][0].variables.input.clientNonce).not.toBe(
+        oldNonce,
+      );
+      expect(hooks.submit.mock.calls[0][0].variables.input.operationId).toBe(
+        'replacement',
+      );
+    }
+  },
+);
+test.each([
+  { recorded: true, acceptanceUnknown: false, allowedNextActions: ['replace'] },
+  { recorded: false, acceptanceUnknown: true, allowedNextActions: ['replace'] },
+  { recorded: false, acceptanceUnknown: false, allowedNextActions: [] },
+])(
+  'retirement without a complete replacement certificate retains identity: %j',
+  async (status) => {
+    hooks.begin.mockResolvedValue({
+      data: {
+        beginRoomOperation: {
+          operationId: 'retained',
+          phase: 'retired',
+          disposition: 'none',
+          ...status,
+        },
+      },
+    });
+    render(<ItemAction itemIdentifier={{ id: 'item', typeId: 'room' }} />);
+    selectRoom();
+    fireEvent.click(screen.getByText('Submit Actions'));
+    await screen.findByText(/cannot be sent/);
+    expect(hooks.submit).not.toHaveBeenCalled();
+    expect(roomOperation({ id: 'item', typeId: 'room' })).toBe('retained');
   },
 );
 test('existing legacy operation reaches lookup-only delivery without beginning a fresh receipt', async () => {
