@@ -2,6 +2,7 @@ import { sql, type Kysely, type Selectable } from 'kysely';
 
 import { jsonStringify } from '../../utils/encoding.js';
 import { reconcileLegacyMemberIntent } from './legacyMemberIntents.js';
+import { guardManualRoomRegistration } from './manualRoomOperations.js';
 import { claimMemberIntent } from './memberIntentClaim.js';
 import {
   assertMemberIntentStatus,
@@ -80,6 +81,7 @@ export async function registerMemberIntents(
         throw new Error('Membership execution intent conflict');
       continue;
     }
+    await guardManualRoomRegistration(pg, input);
     const quarantined = await pg
       .selectFrom('concord_integration.member_intent_quarantine')
       .select('execution_id')
