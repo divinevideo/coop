@@ -344,6 +344,14 @@ test('registration wins the same execution lock: retirement reports recorded con
   await pgQuery
     .transaction()
     .execute(async (tx) => registerMemberIntents(tx, [intent]));
+  expect(
+    await getManualRoomOperation(pgQuery, dependencies, access(receipt)),
+  ).toMatchObject({
+    recorded: true,
+    phase: 'registered',
+    acceptanceUnknown: false,
+    allowedNextActions: ['send'],
+  });
   await expect(
     retirePreparedManualRoomOperation(pgQuery, dependencies, {
       ...access(receipt),
