@@ -5149,6 +5149,37 @@ export type GQLRotateWebhookSigningKeyMutation = {
       };
 };
 
+export type GQLRoomOperationActorQueryVariables = Exact<{
+  [key: string]: never;
+}>;
+
+export type GQLRoomOperationActorQuery = {
+  readonly __typename: 'Query';
+  readonly me?: { readonly __typename: 'User'; readonly id: string } | null;
+  readonly myOrg?: { readonly __typename: 'Org'; readonly id: string } | null;
+};
+
+export type GQLBeginItemRoomOperationMutationVariables = Exact<{
+  input: GQLBeginRoomOperationInput;
+}>;
+
+export type GQLBeginItemRoomOperationMutation = {
+  readonly __typename: 'Mutation';
+  readonly beginRoomOperation: {
+    readonly __typename: 'RoomOperationStatus';
+    readonly operationId: string;
+    readonly executionId: string;
+    readonly phase: string;
+    readonly recorded: boolean;
+    readonly acceptanceUnknown: boolean;
+    readonly acceptedDecisionId?: string | null;
+    readonly refusalCode?: string | null;
+    readonly disposition: string;
+    readonly successorExecutionId?: string | null;
+    readonly allowedNextActions: ReadonlyArray<string>;
+  };
+};
+
 export type GQLHashBanksQueryVariables = Exact<{ [key: string]: never }>;
 
 export type GQLHashBanksQuery = {
@@ -25770,6 +25801,167 @@ export type GQLRotateWebhookSigningKeyMutationOptions =
     GQLRotateWebhookSigningKeyMutation,
     GQLRotateWebhookSigningKeyMutationVariables
   >;
+export const GQLRoomOperationActorDocument = gql`
+  query RoomOperationActor {
+    me {
+      id
+    }
+    myOrg {
+      id
+    }
+  }
+`;
+
+/**
+ * __useGQLRoomOperationActorQuery__
+ *
+ * To run a query within a React component, call `useGQLRoomOperationActorQuery` and pass it any options that fit your needs.
+ * When your component renders, `useGQLRoomOperationActorQuery` returns an object from Apollo Client that contains loading, error, and data properties
+ * you can use to render your UI.
+ *
+ * @param baseOptions options that will be passed into the query, supported options are listed on: https://www.apollographql.com/docs/react/api/react-hooks/#options;
+ *
+ * @example
+ * const { data, loading, error } = useGQLRoomOperationActorQuery({
+ *   variables: {
+ *   },
+ * });
+ */
+export function useGQLRoomOperationActorQuery(
+  baseOptions?: Apollo.QueryHookOptions<
+    GQLRoomOperationActorQuery,
+    GQLRoomOperationActorQueryVariables
+  >,
+) {
+  const options = { ...defaultOptions, ...baseOptions };
+  return Apollo.useQuery<
+    GQLRoomOperationActorQuery,
+    GQLRoomOperationActorQueryVariables
+  >(GQLRoomOperationActorDocument, options);
+}
+export function useGQLRoomOperationActorLazyQuery(
+  baseOptions?: Apollo.LazyQueryHookOptions<
+    GQLRoomOperationActorQuery,
+    GQLRoomOperationActorQueryVariables
+  >,
+) {
+  const options = { ...defaultOptions, ...baseOptions };
+  return Apollo.useLazyQuery<
+    GQLRoomOperationActorQuery,
+    GQLRoomOperationActorQueryVariables
+  >(GQLRoomOperationActorDocument, options);
+}
+// @ts-ignore
+export function useGQLRoomOperationActorSuspenseQuery(
+  baseOptions?: Apollo.SuspenseQueryHookOptions<
+    GQLRoomOperationActorQuery,
+    GQLRoomOperationActorQueryVariables
+  >,
+): Apollo.UseSuspenseQueryResult<
+  GQLRoomOperationActorQuery,
+  GQLRoomOperationActorQueryVariables
+>;
+export function useGQLRoomOperationActorSuspenseQuery(
+  baseOptions?:
+    | Apollo.SkipToken
+    | Apollo.SuspenseQueryHookOptions<
+        GQLRoomOperationActorQuery,
+        GQLRoomOperationActorQueryVariables
+      >,
+): Apollo.UseSuspenseQueryResult<
+  GQLRoomOperationActorQuery | undefined,
+  GQLRoomOperationActorQueryVariables
+>;
+export function useGQLRoomOperationActorSuspenseQuery(
+  baseOptions?:
+    | Apollo.SkipToken
+    | Apollo.SuspenseQueryHookOptions<
+        GQLRoomOperationActorQuery,
+        GQLRoomOperationActorQueryVariables
+      >,
+) {
+  const options =
+    baseOptions === Apollo.skipToken
+      ? baseOptions
+      : { ...defaultOptions, ...baseOptions };
+  return Apollo.useSuspenseQuery<
+    GQLRoomOperationActorQuery,
+    GQLRoomOperationActorQueryVariables
+  >(GQLRoomOperationActorDocument, options);
+}
+export type GQLRoomOperationActorQueryHookResult = ReturnType<
+  typeof useGQLRoomOperationActorQuery
+>;
+export type GQLRoomOperationActorLazyQueryHookResult = ReturnType<
+  typeof useGQLRoomOperationActorLazyQuery
+>;
+export type GQLRoomOperationActorSuspenseQueryHookResult = ReturnType<
+  typeof useGQLRoomOperationActorSuspenseQuery
+>;
+export type GQLRoomOperationActorQueryResult = Apollo.QueryResult<
+  GQLRoomOperationActorQuery,
+  GQLRoomOperationActorQueryVariables
+>;
+export const GQLBeginItemRoomOperationDocument = gql`
+  mutation BeginItemRoomOperation($input: BeginRoomOperationInput!) {
+    beginRoomOperation(input: $input) {
+      operationId
+      executionId
+      phase
+      recorded
+      acceptanceUnknown
+      acceptedDecisionId
+      refusalCode
+      disposition
+      successorExecutionId
+      allowedNextActions
+    }
+  }
+`;
+export type GQLBeginItemRoomOperationMutationFn = Apollo.MutationFunction<
+  GQLBeginItemRoomOperationMutation,
+  GQLBeginItemRoomOperationMutationVariables
+>;
+
+/**
+ * __useGQLBeginItemRoomOperationMutation__
+ *
+ * To run a mutation, you first call `useGQLBeginItemRoomOperationMutation` within a React component and pass it any options that fit your needs.
+ * When your component renders, `useGQLBeginItemRoomOperationMutation` returns a tuple that includes:
+ * - A mutate function that you can call at any time to execute the mutation
+ * - An object with fields that represent the current status of the mutation's execution
+ *
+ * @param baseOptions options that will be passed into the mutation, supported options are listed on: https://www.apollographql.com/docs/react/api/react-hooks/#options-2;
+ *
+ * @example
+ * const [gqlBeginItemRoomOperationMutation, { data, loading, error }] = useGQLBeginItemRoomOperationMutation({
+ *   variables: {
+ *      input: // value for 'input'
+ *   },
+ * });
+ */
+export function useGQLBeginItemRoomOperationMutation(
+  baseOptions?: Apollo.MutationHookOptions<
+    GQLBeginItemRoomOperationMutation,
+    GQLBeginItemRoomOperationMutationVariables
+  >,
+) {
+  const options = { ...defaultOptions, ...baseOptions };
+  return Apollo.useMutation<
+    GQLBeginItemRoomOperationMutation,
+    GQLBeginItemRoomOperationMutationVariables
+  >(GQLBeginItemRoomOperationDocument, options);
+}
+export type GQLBeginItemRoomOperationMutationHookResult = ReturnType<
+  typeof useGQLBeginItemRoomOperationMutation
+>;
+export type GQLBeginItemRoomOperationMutationResult =
+  Apollo.MutationResult<GQLBeginItemRoomOperationMutation>;
+export type GQLBeginItemRoomOperationMutationOptions =
+  Apollo.BaseMutationOptions<
+    GQLBeginItemRoomOperationMutation,
+    GQLBeginItemRoomOperationMutationVariables
+  >;
 export const GQLHashBanksDocument = gql`
   query HashBanks {
     hashBanks {
@@ -43429,6 +43621,7 @@ export const namedOperations = {
   Query: {
     RoomScopeStaff: 'RoomScopeStaff',
     ApiAuth: 'ApiAuth',
+    RoomOperationActor: 'RoomOperationActor',
     HashBanks: 'HashBanks',
     HashBankById: 'HashBankById',
     ExchangeApis: 'ExchangeApis',
@@ -43556,6 +43749,7 @@ export const namedOperations = {
   Mutation: {
     RotateApiKey: 'RotateApiKey',
     RotateWebhookSigningKey: 'RotateWebhookSigningKey',
+    BeginItemRoomOperation: 'BeginItemRoomOperation',
     CreateHashBank: 'CreateHashBank',
     UpdateHashBank: 'UpdateHashBank',
     DeleteHashBank: 'DeleteHashBank',
