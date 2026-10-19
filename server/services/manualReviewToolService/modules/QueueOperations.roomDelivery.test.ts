@@ -7,14 +7,24 @@ test.each(['default', 'appeal'])(
       const job = {
         data: { id: 'synthetic:10000000-0000-4000-8000-000000000001' },
       };
-      const row = { job_payload: { roomDeliveryRequired } };
+      const row = {
+        job_payload: { roomDeliveryRequired },
+        decision_components: [{ type: 'CUSTOM_ACTION', actions: ['room-action'] }],
+        related_actions: [],
+      };
       const query = {
         select: () => query,
         where: () => query,
         executeTakeFirst: async () => row,
       };
+      const primaryQuery = {
+        select: () => primaryQuery,
+        where: () => primaryQuery,
+        execute: jest.fn().mockResolvedValue([]),
+      };
+      const primarySelect = jest.fn().mockReturnValue(primaryQuery);
       const service = new QueueOperations(
-        {} as never,
+        { selectFrom: primarySelect } as never,
         { selectFrom: () => query } as never,
         {} as never,
         {} as never,
@@ -46,9 +56,14 @@ test.each(['default', 'appeal'])(
       if (roomDeliveryRequired) {
         expect(result).toEqual({ job: job.data, lockToken: 'lock' });
         expect(remove).not.toHaveBeenCalled();
+        expect(primarySelect.mock.calls).toEqual([
+          ['concord_integration.room_execution_state'],
+          ['concord_integration.member_intents'],
+        ]);
       } else {
         expect(result).toBeNull();
         expect(remove).toHaveBeenCalledTimes(1);
+        expect(primarySelect).not.toHaveBeenCalled();
       }
     }
   },
