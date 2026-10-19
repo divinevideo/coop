@@ -1,7 +1,9 @@
 import {
   namedOperations,
+  useGQLBeginItemRoomOperationMutation,
   useGQLBulkActionExecutionMutation,
   useGQLBulkActionsFormDataQuery,
+  useGQLRoomOperationActorQuery,
   type GQLActionParameter,
 } from '@/graphql/generated';
 import { stripTypename } from '@/graphql/inputHelpers';
@@ -25,7 +27,8 @@ import ConcordEnforcementStatus from './ConcordEnforcementStatus';
 import {
   beginRoomOperation,
   completeRoomOperation,
-  rejectUnrecordedRoomAttempt,
+  prepareRoomOperation,
+  rememberRoomReceipt,
 } from './roomOperation';
 
 const { Option } = Select;
@@ -47,6 +50,9 @@ export default function ItemAction(props: {
   const { itemIdentifier, title = 'Take action on this item' } = props;
 
   const { data: queryData } = useGQLBulkActionsFormDataQuery();
+  const { data: roomActor } = useGQLRoomOperationActorQuery();
+  const [prepareReceipt] = useGQLBeginItemRoomOperationMutation();
+  const [preparing, setPreparing] = useState(false);
   const [bulkAction, { loading }] = useGQLBulkActionExecutionMutation({
     refetchQueries: [
       namedOperations.Query.ItemActionHistory,
@@ -214,9 +220,84 @@ export default function ItemAction(props: {
         selectedActionIds.includes(action.id) &&
         action.name.startsWith('concord_'),
     );
-    const attempt = roomAction
-      ? beginRoomOperation(itemIdentifier, roomAction.name)
-      : undefined;
+    let attempt: ReturnType<typeof beginRoomOperation> | undefined;
+    if (roomAction) {
+      if (!moderatorNote.trim() || moderatorNote.trim().length > 2048) {
+        setModalBody('Enter a room reason between 1 and 2048 characters.');
+        setShowModal(true);
+        return;
+      }
+      setPreparing(true);
+      try {
+        if (!roomActor?.me?.id || !roomActor.myOrg?.id)
+          throw new Error('Room session unavailable.');
+        if (selectedActionIds.length !== 1)
+          throw new Error('Select one room action.');
+        const claim = {
+          actionId: roomAction.id,
+          itemId: itemIdentifier.id,
+          itemTypeId: itemIdentifier.typeId,
+          note: moderatorNote.trim(),
+          parameters: (parametersByActionId[roomAction.id] ?? {}) as JsonObject,
+        };
+        const pending = await prepareRoomOperation(
+          itemIdentifier,
+          {
+            actorId: roomActor.me.id,
+            orgId: roomActor.myOrg.id,
+          },
+          claim,
+        );
+        let operationId = pending.operationId;
+        if ('clientNonce' in pending) {
+          const response = await prepareReceipt({
+            context: { roomOperationAttempt: true },
+            variables: {
+              input: {
+                clientNonce: pending.clientNonce,
+                ...claim,
+              },
+            },
+          });
+          const status = response.data?.beginRoomOperation;
+          if (response.errors?.length || !status)
+            throw new Error('Room preparation response unavailable.');
+          operationId = status.operationId;
+          rememberRoomReceipt(itemIdentifier, pending.clientNonce, operationId);
+          if (status.acceptedDecisionId && !status.acceptanceUnknown) {
+            completeRoomOperation(itemIdentifier, operationId);
+            setModalBody(
+              'This room request was already recorded. Check Room enforcement for verified delivery.',
+            );
+            setShowModal(true);
+            return;
+          }
+          if (
+            status.phase === 'retired' ||
+            status.phase === 'refused' ||
+            status.refusalCode ||
+            status.successorExecutionId ||
+            status.disposition !== 'none'
+          ) {
+            setModalBody(
+              `This room request cannot be sent (state: ${status.phase}; disposition: ${status.disposition}). Check Room enforcement or ask your moderation lead to reconcile it.`,
+            );
+            setShowModal(true);
+            return;
+          }
+        }
+        if (!operationId) throw new Error('Room receipt unavailable.');
+        attempt = beginRoomOperation(itemIdentifier, operationId);
+      } catch {
+        setModalBody(
+          'Could not prepare this room request. No delivery was started by this attempt. Re-enter the original action, reason and parameters in the original session and retry; changed inputs cannot replace the saved request.',
+        );
+        setShowModal(true);
+        return;
+      } finally {
+        setPreparing(false);
+      }
+    }
     return bulkAction({
       // A hidden transport retry would invalidate first-attempt rejection certainty.
       context: { roomOperationAttempt: Boolean(attempt) },
@@ -225,15 +306,10 @@ export default function ItemAction(props: {
           attempt &&
           error.graphQLErrors.some(
             (entry) => entry.extensions?.roomAttemptOutcome === 'NOT_RECORDED',
-          ) &&
-          rejectUnrecordedRoomAttempt(
-            itemIdentifier,
-            attempt.operationId,
-            attempt.firstAttempt,
           )
         ) {
           setModalBody(
-            'This attempt was not recorded. You can change the action or reason and submit again.',
+            'This delivery attempt was not recorded. The original room request is still saved. Retry the original action and reason, or ask your moderation lead to reconcile it.',
           );
         } else if (attempt) {
           setModalBody(
@@ -278,6 +354,8 @@ export default function ItemAction(props: {
     });
   }, [
     bulkAction,
+    prepareReceipt,
+    roomActor,
     eligibleActions,
     itemIdentifier,
     selectedActionIds,
@@ -342,9 +420,10 @@ export default function ItemAction(props: {
           title="Submit Actions"
           size="small"
           onClick={buttonOnClick}
-          loading={loading}
+          loading={loading || preparing}
           disabled={
             loading ||
+            preparing ||
             selectedActionIds.length === 0 ||
             (selectedActionIds.some((id) =>
               eligibleActionsById.get(id)?.name.startsWith('concord_'),

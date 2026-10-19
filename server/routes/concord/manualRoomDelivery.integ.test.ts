@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 
+import { checkManualRoomClientReceipt } from '../../test/manualRoomClientReceipt.js';
 import {
   actor,
   config,
@@ -381,3 +382,34 @@ test('reversal after case deletion uses authenticated prior target and next same
     sourceOrder: { revision: next.revision },
   });
 });
+
+test.each([
+  'concord_remove_message',
+  'concord_ban_member',
+  'concord_unban_member',
+])(
+  'ItemAction begin/bulk contract delivers %s through actual API, publisher and PG',
+  async (action) => {
+    const environment = {
+      CONCORD_MODERATION_ORIGIN: config.origin,
+      CONCORD_ORG_ID: config.orgId,
+      CONCORD_MODERATION_HMAC_KEY: config.hmacKey,
+      CONCORD_COOP_ORIGIN: config.coopOrigin,
+      CONCORD_ACCESS_ISSUER: config.accessIssuer,
+      CONCORD_ACCESS_AUDIENCE: config.accessAudience,
+      CONCORD_QUEUE_ID: config.queueId,
+    };
+    const previous = Object.fromEntries(
+      Object.keys(environment).map((key) => [key, process.env[key]]),
+    );
+    Object.assign(process.env, environment);
+    try {
+      await checkManualRoomClientReceipt(pgQuery, action);
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) Reflect.deleteProperty(process.env, key);
+        else process.env[key] = value;
+      }
+    }
+  },
+);

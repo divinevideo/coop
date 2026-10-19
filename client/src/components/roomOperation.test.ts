@@ -1,93 +1,105 @@
 import {
   beginRoomOperation,
   completeRoomOperation,
-  rejectUnrecordedRoomAttempt,
+  prepareRoomOperation,
+  rememberRoomReceipt,
   roomOperation,
 } from './roomOperation';
 
-test('retries reuse the persisted opaque operation until acceptance', () => {
-  sessionStorage.clear();
-  const item = { id: 'synthetic-case', typeId: 'room-type' };
-  const first = roomOperation(item, 'concord_remove_message');
-  expect(first).toMatch(/^source-order-v1_remove_message_/);
-  expect(roomOperation(item, 'concord_remove_message')).toBe(first);
-  expect(roomOperation(item, 'concord_ban_member')).toBe(first);
-  expect(sessionStorage.length).toBe(1);
-  completeRoomOperation(item, first);
-  expect(roomOperation(item, 'concord_remove_message')).not.toBe(first);
+const item = { id: 'synthetic-case', typeId: 'room-type' };
+const identity = { actorId: 'actor', orgId: 'org' };
+const claim = {
+  actionId: 'ban',
+  note: 'Synthetic reason',
+  parameters: { days: 2 },
+};
+const id = 'source-order-v2_ban_member_10000000-0000-4000-8000-000000000001';
+beforeEach(() => sessionStorage.clear());
+
+async function receipt() {
+  const pending = await prepareRoomOperation(item, identity, claim);
+  if (!('clientNonce' in pending)) throw new Error('Expected nonce');
+  rememberRoomReceipt(item, pending.clientNonce, id);
+  return pending;
+}
+
+test('lost begin response retries the persisted nonce and immutable claims without storing the reason', async () => {
+  const first = await prepareRoomOperation(item, identity, claim);
+  expect(await prepareRoomOperation(item, identity, claim)).toEqual(first);
+  const stored = sessionStorage.getItem(sessionStorage.key(0)!)!;
+  expect(stored).not.toContain(claim.note);
+  expect(stored).toContain('claimFingerprint');
+  for (const change of [
+    { ...claim, note: 'Changed' },
+    { ...claim, actionId: 'remove' },
+    { ...claim, parameters: { days: 3 } },
+  ])
+    await expect(prepareRoomOperation(item, identity, change)).rejects.toThrow(
+      'different inputs',
+    );
+  expect(await prepareRoomOperation(item, identity, claim)).toEqual(first);
 });
 
-test('source-ordered clients never relabel a browser-held legacy operation', () => {
-  sessionStorage.clear();
-  const item = { id: 'synthetic-case', typeId: 'room-type' };
-  const oldKey = `concord-operation:${JSON.stringify([item.typeId, item.id])}`;
-  sessionStorage.setItem(oldKey, '10000000-0000-4000-8000-000000000001');
-  const current = roomOperation(item, 'concord_ban_member');
-  expect(current).toMatch(/^source-order-v1_ban_member_/);
-  expect(current).not.toBe(sessionStorage.getItem(oldKey));
-  completeRoomOperation(item, current);
-  expect(sessionStorage.getItem(oldKey)).toBe(
-    '10000000-0000-4000-8000-000000000001',
+test('receipt and attempt metadata survive rejection and reordered object keys', async () => {
+  await receipt();
+  expect(beginRoomOperation(item, id).firstAttempt).toBe(true);
+  expect(roomOperation(item)).toBe(id);
+  expect(
+    await prepareRoomOperation(item, identity, {
+      parameters: { days: 2 },
+      note: claim.note,
+      actionId: 'ban',
+    }),
+  ).toMatchObject({ operationId: id });
+  expect(beginRoomOperation(item, id).firstAttempt).toBe(false);
+});
+
+test.each(['actorId', 'orgId'])(
+  'a pending nonce cannot change %s',
+  async (field) => {
+    await receipt();
+    await expect(
+      prepareRoomOperation(item, { ...identity, [field]: 'other' }, claim),
+    ).rejects.toThrow('another session');
+    expect(roomOperation(item)).toBe(id);
+  },
+);
+
+test.each(['concord-operation:source-order-v1:', 'concord-operation:'])(
+  'legacy identity in %s stays lookup-only without a new nonce',
+  async (prefix) => {
+    const legacy =
+      'source-order-v1_ban_member_10000000-0000-4000-8000-000000000002';
+    sessionStorage.setItem(
+      `${prefix}${JSON.stringify([item.typeId, item.id])}`,
+      legacy,
+    );
+    expect(await prepareRoomOperation(item, identity, claim)).toEqual({
+      operationId: legacy,
+    });
+    expect(beginRoomOperation(item, legacy)).toEqual({
+      operationId: legacy,
+      firstAttempt: false,
+    });
+    expect(roomOperation(item)).toBe(legacy);
+  },
+);
+
+test('late success and late begin response cannot erase or replace a newer pending receipt', async () => {
+  const first = await receipt();
+  completeRoomOperation(item, id);
+  const next = await prepareRoomOperation(item, identity, {
+    ...claim,
+    actionId: 'remove',
+  });
+  if (!('clientNonce' in next)) throw new Error('Expected nonce');
+  const replacement = id.replace('ban_member', 'remove_message');
+  rememberRoomReceipt(item, next.clientNonce, replacement);
+  beginRoomOperation(item, replacement);
+  expect(completeRoomOperation(item, id)).toBe(false);
+  expect(() => rememberRoomReceipt(item, first.clientNonce, id)).toThrow(
+    'changed',
   );
-});
-
-test('definitively rejected first attempt permits a different action', () => {
-  sessionStorage.clear();
-  const item = { id: 'rejected', typeId: 'room' };
-  const attempt = beginRoomOperation(item, 'concord_ban_member');
-  expect(
-    rejectUnrecordedRoomAttempt(
-      item,
-      attempt.operationId,
-      attempt.firstAttempt,
-    ),
-  ).toBe(true);
-  expect(
-    beginRoomOperation(item, 'concord_remove_message').operationId,
-  ).toMatch(/^source-order-v1_remove_message_/);
-});
-
-test('a rejection after uncertain acceptance never releases the original identity', () => {
-  sessionStorage.clear();
-  const item = { id: 'uncertain', typeId: 'room' };
-  const original = beginRoomOperation(item, 'concord_ban_member');
-  const retry = beginRoomOperation(item, 'concord_ban_member');
-  expect(
-    rejectUnrecordedRoomAttempt(item, retry.operationId, retry.firstAttempt),
-  ).toBe(false);
-  // A delayed rejection from the first request also cannot release an overlapping retry.
-  expect(
-    rejectUnrecordedRoomAttempt(
-      item,
-      original.operationId,
-      original.firstAttempt,
-    ),
-  ).toBe(false);
-  expect(beginRoomOperation(item, 'concord_remove_message').operationId).toBe(
-    original.operationId,
-  );
-});
-
-test('browser-held operations without attempt metadata remain conservative', () => {
-  sessionStorage.clear();
-  const item = { id: 'old-tab', typeId: 'room' };
-  const original = roomOperation(item, 'concord_ban_member');
-  const retry = beginRoomOperation(item, 'concord_ban_member');
-  expect(
-    rejectUnrecordedRoomAttempt(item, retry.operationId, retry.firstAttempt),
-  ).toBe(false);
-  expect(retry.operationId).toBe(original);
-});
-
-test('a late success never releases a newer operation or its attempt history', () => {
-  sessionStorage.clear();
-  const item = { id: 'overlapping', typeId: 'room' };
-  const old = beginRoomOperation(item, 'concord_ban_member');
-  completeRoomOperation(item, old.operationId);
-  const next = beginRoomOperation(item, 'concord_remove_message');
-  completeRoomOperation(item, old.operationId);
-  expect(roomOperation(item, 'concord_remove_message')).toBe(next.operationId);
-  expect(
-    rejectUnrecordedRoomAttempt(item, next.operationId, next.firstAttempt),
-  ).toBe(true);
+  expect(roomOperation(item)).toBe(replacement);
+  expect(beginRoomOperation(item, replacement).firstAttempt).toBe(false);
 });
