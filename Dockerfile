@@ -9,7 +9,9 @@
 # native modules, and we don't really care about the larger image size.
 FROM node:24.14.1-bullseye-slim AS server_base
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+# Bullseye security packages have moved off the live mirror.
+RUN sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' /etc/apt/sources.list \
+    && apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
 COPY ["server/package.json", "server/package-lock.json", "./"]
 RUN npm ci
@@ -21,7 +23,8 @@ RUN npm run build
 # make a shared layer that can be the base for worker and api images.
 FROM node:24.14.1-bullseye-slim AS backend_base
 WORKDIR /app
-RUN apt-get update && apt-get install dumb-init
+RUN sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' /etc/apt/sources.list \
+    && apt-get update && apt-get install dumb-init
 COPY --from=build_backend ["/app/package.json", "/app/package-lock.json", "./"]
 RUN npm ci --omit=dev
 COPY --from=build_backend /app/transpiled ./
