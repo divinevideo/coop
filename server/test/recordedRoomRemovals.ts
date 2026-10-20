@@ -6,6 +6,7 @@ import { sql, type Kysely } from 'kysely';
 import { resolvers, typeDefs } from '../graphql/modules/roomAction.js';
 import { type MemberIntentPg } from '../routes/concord/memberIntentTypes.js';
 import { RecordedRoomLookupIncomplete } from '../routes/concord/recordedRoomExecution.js';
+import { recordedRoomStopInputs } from '../routes/concord/recordedRoomExecutionInputs.js';
 import {
   closeRoomExecution,
   listRoomNeedsAttention,
@@ -18,6 +19,7 @@ import {
   recordRoomRemovalAcceptance,
 } from '../routes/concord/roomRemovalDelivery.js';
 import { roomExecutionId } from '../routes/concord/service.js';
+import { ManualReviewToolService } from '../services/manualReviewToolService/index.js';
 import { jsonStringify } from '../utils/encoding.js';
 import { actor, config, input, response } from './memberIntentFixtures.js';
 
@@ -43,6 +45,7 @@ async function recordedRemoval(
       orgId: config.orgId,
       roomDeliveryRequired: true,
       payload: {
+        kind: 'DEFAULT',
         item: {
           itemId: related ? 'other-item' : request.itemId,
           itemTypeIdentifier: { id: request.itemTypeId },
@@ -54,6 +57,66 @@ async function recordedRemoval(
     pgQuery,
   );
   return request;
+}
+
+/** Use the existing authenticated read's actual primary decision projection. */
+export async function checkRecordedRoomOperatorInputs(
+  pgQuery: Kysely<MemberIntentPg>,
+  related: boolean,
+) {
+  const request = await recordedRemoval(pgQuery, related);
+  const jobId = request.correlationId.slice('mrt-decision:'.length);
+  // Only the public decision read is used; other injected dependencies stay inert.
+  const unused = undefined as never;
+  const service = new ManualReviewToolService(
+    unused,
+    unused,
+    unused,
+    pgQuery as never,
+    pgQuery as never,
+    unused,
+    unused,
+    unused,
+    unused,
+    unused,
+    unused,
+    unused,
+  );
+  const view = await service.getDecidedJobFromJobId({
+    orgId: config.orgId,
+    jobId,
+    userPermissions: [],
+  });
+  const targets = recordedRoomStopInputs({
+    data: {
+      myOrg: { id: config.orgId },
+      getDecidedJobFromJobId: view,
+    },
+  });
+  const target = targets.find(
+    (entry) => entry.executionId === roomExecutionId(request),
+  );
+  if (!target) throw new Error('Recorded operator target was not derived');
+  const operatorId = `operator-${actor.id}`;
+  const getActor = jest.fn(deps.getActor);
+  expect(
+    await stopRoomAutomation(
+      pgQuery,
+      { ...deps, getActor },
+      {
+        orgId: config.orgId,
+        actorId: operatorId,
+        executionId: target.executionId,
+        manualReviewDecisionId: target.manualReviewDecisionId,
+        reason: 'Audited operator stop from existing decision read',
+      },
+    ),
+  ).toMatchObject({ automationStopped: true, acceptanceUnknown: true });
+  expect(getActor).toHaveBeenCalledTimes(1);
+  expect(getActor).toHaveBeenCalledWith(operatorId, config.orgId);
+  expect(
+    await roomJobQueueComplete(pgQuery, config.orgId, request.correlationId, 1),
+  ).toBe(true);
 }
 
 export async function checkRecordedRoomRemoval(
