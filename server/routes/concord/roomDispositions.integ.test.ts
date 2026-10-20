@@ -15,6 +15,12 @@ import {
   prepared,
 } from '../../test/memberIntentFixtures.js';
 import { memberIntentTestDatabaseUrl } from '../../test/memberIntentTestDatabase.js';
+import {
+  checkRecordedRoomLookupBoundary,
+  checkRecordedRoomLookupBudget,
+  checkRecordedRoomRemoval,
+  checkRelatedRecordedRoomRemoval,
+} from '../../test/recordedRoomRemovals.js';
 import { checkRoomRemovalAcceptances } from '../../test/roomRemovalAcceptances.js';
 import { checkRoomRemovalPublisher } from '../../test/roomRemovalPublisher.js';
 import {
@@ -59,6 +65,9 @@ beforeAll(async () => {
     pgQuery,
   );
   await sql`INSERT INTO public.orgs VALUES (${config.orgId})`.execute(pgQuery);
+  await sql`CREATE SCHEMA manual_review_tool; CREATE TABLE manual_review_tool.manual_review_decisions (id uuid PRIMARY KEY, org_id text, job_payload jsonb, decision_components jsonb[], related_actions jsonb[])`.execute(
+    pgQuery,
+  );
   await sql
     .raw(
       await readFile(
@@ -99,6 +108,14 @@ async function record() {
     );
   return request;
 }
+test.each([false, true])(
+  'recorded MRT removal can stop with unknown acceptance before delivery or after a lost response: %s',
+  async (attempted) => checkRecordedRoomRemoval(pgQuery, attempted),
+);
+test('recorded related MRT removal binds the related action and item identity', async () =>
+  checkRelatedRecordedRoomRemoval(pgQuery));
+test('recorded source lookup rejects inconsistent primary organization, job identity and non-room decisions', async () =>
+  checkRecordedRoomLookupBoundary(pgQuery));
 test('verified matching refusal commits attention before cleanup and remains idempotent after transport disappears', async () => {
   const request = await record();
   const executionId = roomExecutionId(request);
@@ -447,3 +464,5 @@ test('actual publisher forwards trusted actor/reason, rejects unauthorized retri
 test('removal journal binds responses and requests, rejects malformed facts, and survives owner mutation attempts', async () => {
   await checkRoomRemovalAcceptances(pgQuery);
 });
+test('exhausting the primary lookup budget reports incomplete and records no disposition', async () =>
+  checkRecordedRoomLookupBudget(pgQuery));
