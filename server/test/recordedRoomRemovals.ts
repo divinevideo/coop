@@ -312,7 +312,7 @@ export async function checkDirectRecordedRoomLocator(
       dataSources: {
         actionAPI: {
           authorizeRoomRequest: async () => {},
-          roomDisposition: (input: typeof identity) =>
+          roomDisposition: async (input: typeof identity) =>
             stopRoomAutomation(pgQuery, deps, input),
         },
       },
