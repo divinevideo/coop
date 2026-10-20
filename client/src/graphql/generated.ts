@@ -2753,6 +2753,7 @@ export type GQLMutationSignUpArgs = {
 
 export type GQLMutationStopRoomAutomationArgs = {
   executionId: Scalars['ID']['input'];
+  manualReviewDecisionId?: InputMaybe<Scalars['ID']['input']>;
   reason: Scalars['String']['input'];
 };
 

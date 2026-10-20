@@ -16,6 +16,7 @@ import {
 } from '../../test/memberIntentFixtures.js';
 import { memberIntentTestDatabaseUrl } from '../../test/memberIntentTestDatabase.js';
 import {
+  checkDirectRecordedRoomLocator,
   checkRecordedRoomLookupBoundary,
   checkRecordedRoomLookupBudget,
   checkRecordedRoomRefusal,
@@ -472,3 +473,5 @@ test('exhausting candidate execution budget rolls back without a disposition', a
   checkRecordedRoomTargetBudget(pgQuery));
 test('exhausting the primary lookup budget reports incomplete and records no disposition', async () =>
   checkRecordedRoomLookupBudget(pgQuery));
+test('indexed MRT locator reaches a decision beyond legacy lookup budget and rejects mismatched identity', async () =>
+  checkDirectRecordedRoomLocator(pgQuery));

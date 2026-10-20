@@ -124,6 +124,7 @@ async function appendDisposition(
     actorId?: string;
     reason?: string;
     sourceId?: string;
+    manualReviewDecisionId?: string;
   },
 ): Promise<RoomExecutionDisposition> {
   if (!UUID.test(input.executionId)) throw new Error('Invalid room execution');
@@ -136,12 +137,20 @@ async function appendDisposition(
       input.executionId,
     );
     const recordedSource =
-      !facts.known &&
-      !current &&
-      !input.sourceId &&
-      input.kind === 'automation_stopped'
-        ? await recordedRoomExecutionSource(tx, input.orgId, input.executionId)
+      input.manualReviewDecisionId !== undefined ||
+      (!facts.known &&
+        !current &&
+        !input.sourceId &&
+        input.kind === 'automation_stopped')
+        ? await recordedRoomExecutionSource(
+            tx,
+            input.orgId,
+            input.executionId,
+            input.manualReviewDecisionId,
+          )
         : undefined;
+    if (input.manualReviewDecisionId !== undefined && !recordedSource)
+      throw new Error('Unknown room execution for primary MRT decision');
     if (!facts.known && !current && !input.sourceId && !recordedSource)
       throw new Error('Unknown room execution');
     if (
@@ -232,6 +241,7 @@ export async function stopRoomAutomation(
     orgId: string;
     actorId: string;
     executionId: string;
+    manualReviewDecisionId?: string;
     reason: string;
   },
 ) {
