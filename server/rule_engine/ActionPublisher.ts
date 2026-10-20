@@ -304,6 +304,7 @@ class ActionPublisher {
       orgId: string;
       actorId: string;
       executionId: string;
+      manualReviewDecisionId?: string;
       reason: string;
     },
     close: boolean,

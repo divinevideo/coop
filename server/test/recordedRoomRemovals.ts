@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { makeExecutableSchema } from '@graphql-tools/schema';
+import { graphql } from 'graphql';
 import { sql, type Kysely } from 'kysely';
 
+import { resolvers, typeDefs } from '../graphql/modules/roomAction.js';
 import { type MemberIntentPg } from '../routes/concord/memberIntentTypes.js';
 import { RecordedRoomLookupIncomplete } from '../routes/concord/recordedRoomExecution.js';
 import {
@@ -25,8 +28,8 @@ const deps = {
 async function recordedRemoval(
   pgQuery: Kysely<MemberIntentPg>,
   related = false,
+  id = randomUUID(),
 ) {
-  const id = randomUUID();
   const jobId = `aXRlbQ:${Buffer.from(id).toString('base64url')}`;
   const request = {
     ...input('concord_remove_message'),
@@ -278,4 +281,61 @@ export async function checkRecordedRoomTargetBudget(
       pgQuery,
     );
   }
+}
+
+export async function checkDirectRecordedRoomLocator(
+  pgQuery: Kysely<MemberIntentPg>,
+) {
+  const manualReviewDecisionId = 'ffffffff-ffff-4fff-bfff-ffffffffffff';
+  const request = await recordedRemoval(pgQuery, false, manualReviewDecisionId);
+  const identity = {
+    orgId: config.orgId,
+    actorId: actor.id,
+    executionId: roomExecutionId(request),
+    reason: 'Stop a recorded decision beyond legacy lookup history',
+    manualReviewDecisionId,
+  };
+  // Earlier tests left over 1,000 room decisions; this source sorts after all of them.
+  const result = await graphql({
+    schema: makeExecutableSchema({
+      typeDefs: ['scalar JSONObject', typeDefs],
+      resolvers,
+    }),
+    source: `mutation Stop($execution: ID!, $decision: ID!) { stopRoomAutomation(executionId: $execution, manualReviewDecisionId: $decision, reason: "Stop recorded recovery") { automationStopped acceptanceUnknown } }`,
+    variableValues: {
+      execution: identity.executionId,
+      decision: manualReviewDecisionId,
+    },
+    contextValue: {
+      getUser: () => actor,
+      req: { get: () => 'synthetic-access' },
+      dataSources: {
+        actionAPI: {
+          authorizeRoomRequest: async () => {},
+          roomDisposition: (input: typeof identity) =>
+            stopRoomAutomation(pgQuery, deps, input),
+        },
+      },
+    },
+  });
+  expect(result.errors).toBeUndefined();
+  expect(result.data?.stopRoomAutomation).toMatchObject({
+    automationStopped: true,
+    acceptanceUnknown: true,
+  });
+  for (const changed of [
+    { manualReviewDecisionId: randomUUID() },
+    { manualReviewDecisionId: 'invalid' },
+    { orgId: 'other-org' },
+    { executionId: randomUUID() },
+  ]) {
+    const mismatch = { ...identity, ...changed };
+    await expect(stopRoomAutomation(pgQuery, deps, mismatch)).rejects.toThrow();
+  }
+  expect(
+    await roomJobQueueComplete(pgQuery, config.orgId, request.correlationId, 1),
+  ).toBe(true);
+  await expect(closeRoomExecution(pgQuery, deps, identity)).rejects.toThrow(
+    'Unsettled',
+  );
 }

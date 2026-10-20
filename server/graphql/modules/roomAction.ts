@@ -63,6 +63,7 @@ export const typeDefs = /* GraphQL */ `
     ): RoomOperationStatus!
     stopRoomAutomation(
       executionId: ID!
+      manualReviewDecisionId: ID
       reason: String!
     ): RoomExecutionDisposition!
     closeRoomExecution(
@@ -116,7 +117,11 @@ const Mutation: GQLMutationResolvers = {
   },
   async stopRoomAutomation(_, input, context) {
     return context.dataSources.actionAPI.roomDisposition(
-      { ...input, ...(await roomSession(context, true)) },
+      {
+        ...input,
+        manualReviewDecisionId: input.manualReviewDecisionId ?? undefined,
+        ...(await roomSession(context, true)),
+      },
       false,
     );
   },
