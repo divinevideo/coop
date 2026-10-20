@@ -6,6 +6,7 @@ import { RecordedRoomLookupIncomplete } from '../routes/concord/recordedRoomExec
 import {
   closeRoomExecution,
   listRoomNeedsAttention,
+  recordPermanentRefusal,
   roomJobQueueComplete,
   stopRoomAutomation,
 } from '../routes/concord/roomDispositions.js';
@@ -219,4 +220,62 @@ export async function checkRecordedRoomLookupBudget(
       .where('execution_id', '=', executionId)
       .execute(),
   ).toEqual([]);
+}
+
+export async function checkRecordedRoomRefusal(
+  pgQuery: Kysely<MemberIntentPg>,
+) {
+  const request = await recordedRemoval(pgQuery);
+  const identity = {
+    orgId: config.orgId,
+    actorId: actor.id,
+    executionId: roomExecutionId(request),
+    reason: 'Stop until definitive settlement arrives',
+  };
+  await stopRoomAutomation(pgQuery, deps, identity);
+  await recordPermanentRefusal(pgQuery, {
+    orgId: config.orgId,
+    executionId: identity.executionId,
+    refusalCode: 'decision_source_unavailable',
+  });
+  expect(await closeRoomExecution(pgQuery, deps, identity)).toMatchObject({
+    attentionState: 'closed',
+    acceptanceUnknown: false,
+    refusalCode: 'decision_source_unavailable',
+  });
+}
+
+export async function checkRecordedRoomTargetBudget(
+  pgQuery: Kysely<MemberIntentPg>,
+) {
+  const request = await recordedRemoval(pgQuery);
+  const jobId = request.correlationId.slice('mrt-decision:'.length);
+  const actions = Array.from({ length: 10001 }, (_, index) => ({
+    id: `synthetic-action-${index}`,
+  }));
+  await sql`UPDATE manual_review_tool.manual_review_decisions SET decision_components = ARRAY[${jsonStringify({ type: 'CUSTOM_ACTION', actions })}::jsonb] WHERE job_payload->>'id' = ${jobId}`.execute(
+    pgQuery,
+  );
+  const executionId = randomUUID();
+  try {
+    await expect(
+      stopRoomAutomation(pgQuery, deps, {
+        orgId: config.orgId,
+        actorId: actor.id,
+        executionId,
+        reason: 'Do not write after target budget exhaustion',
+      }),
+    ).rejects.toBeInstanceOf(RecordedRoomLookupIncomplete);
+    expect(
+      await pgQuery
+        .selectFrom('concord_integration.room_execution_state')
+        .selectAll()
+        .where('execution_id', '=', executionId)
+        .execute(),
+    ).toEqual([]);
+  } finally {
+    await sql`DELETE FROM manual_review_tool.manual_review_decisions WHERE job_payload->>'id' = ${jobId}`.execute(
+      pgQuery,
+    );
+  }
 }

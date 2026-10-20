@@ -18,7 +18,9 @@ import { memberIntentTestDatabaseUrl } from '../../test/memberIntentTestDatabase
 import {
   checkRecordedRoomLookupBoundary,
   checkRecordedRoomLookupBudget,
+  checkRecordedRoomRefusal,
   checkRecordedRoomRemoval,
+  checkRecordedRoomTargetBudget,
   checkRelatedRecordedRoomRemoval,
 } from '../../test/recordedRoomRemovals.js';
 import { checkRoomRemovalAcceptances } from '../../test/roomRemovalAcceptances.js';
@@ -464,5 +466,9 @@ test('actual publisher forwards trusted actor/reason, rejects unauthorized retri
 test('removal journal binds responses and requests, rejects malformed facts, and survives owner mutation attempts', async () => {
   await checkRoomRemovalAcceptances(pgQuery);
 });
+test('definitive refusal settles a stopped recorded-only removal', async () =>
+  checkRecordedRoomRefusal(pgQuery));
+test('exhausting candidate execution budget rolls back without a disposition', async () =>
+  checkRecordedRoomTargetBudget(pgQuery));
 test('exhausting the primary lookup budget reports incomplete and records no disposition', async () =>
   checkRecordedRoomLookupBudget(pgQuery));
