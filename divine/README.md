@@ -150,6 +150,71 @@ records separate audit; archive is not enforcement success. A matching typed
 generic authentication, configuration, timeout and transport failures are not
 classified as permanent. Publisher `queueComplete` is separate from `success`.
 
+### Operator inputs for a recorded MRT removal
+
+An unaccepted MRT removal may not yet appear in `roomNeedsAttention`. Use the
+original MRT job ID from the review/recovery response, not a bridge decision ID.
+If it is not displayed, the existing authenticated `getRecentDecisions` query
+lists the recorded IDs for a queue; page until the original job is found:
+
+```graphql
+query RecentRecordedRoomJobs($queueId: ID!, $page: Int) {
+  getRecentDecisions(input: { filter: { queueIds: [$queueId] }, page: $page }) {
+    id jobId itemId itemTypeId
+  }
+}
+```
+
+Using that recorded `jobId`, read only these identifiers in the same staff client:
+
+```graphql
+query RecordedRoomStopInputs($jobId: String!) {
+  myOrg { id }
+  getDecidedJobFromJobId(id: $jobId) {
+    decision {
+      id jobId itemId itemTypeId
+      decisions {
+        ... on UserOrRelatedActionDecisionComponent { type actionIds }
+      }
+      relatedActions {
+        ... on UserOrRelatedActionDecisionComponent {
+          type actionIds itemIds itemTypeId
+        }
+      }
+    }
+  }
+}
+```
+
+Save that minimal JSON response as `recorded-room.json` in an approved local
+working directory. It needs no evidence, staff reason, token or cookie. From a
+matching source checkout with server dependencies installed, compile and derive
+the identifiers offline:
+
+```bash
+(cd server && npm run build)
+node server/transpiled/bin/room-mrt-stop-inputs.js < recorded-room.json
+```
+
+The helper makes no network requests, service changes or file writes. It prints each original action and
+target with `executionId` and `manualReviewDecisionId`; primary targets come from
+the recorded job, and related targets from the recorded related actions. If the
+read failed, is incomplete, returns no decision, or produces no target, stop and
+investigate rather than inventing an identifier. Do not use current action
+configuration, allocate another decision, or change the saved claim.
+
+For the intended target, submit `stopRoomAutomation(executionId: ..., manualReviewDecisionId: ..., reason: ...)`
+through the same approved staff session. This mutation still requires the
+current room ADMIN, Access assertion and same origin. Supplying the decision
+locator avoids the bounded legacy scan; the server verifies its organization,
+recorded room intent and exact execution identity. The helper grants no authority.
+An incomplete lookup or timeout is not proof that an execution is absent;
+escalate instead of dropping limits or changing the recorded identifiers.
+Check the returned disposition and durable attention entry. Unknown acceptance
+remains unknown: stop is not recall, cancellation, enforcement success or proof
+that in-flight delivery did not happen, and `closeRoomExecution` still refuses
+unsettled acceptance. Broader operator UI remains assigned to issue #24.
+
 `reverseRoomDecision(input)` takes `decisionId`, a new `clientNonce`, the configured
 unban `actionId`/room `itemTypeId`, `note` and parameters. The backend obtains the
 prior ban's authenticated target, issues a new receipt and source revision, and

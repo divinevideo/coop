@@ -19,6 +19,7 @@ import {
   checkDirectRecordedRoomLocator,
   checkRecordedRoomLookupBoundary,
   checkRecordedRoomLookupBudget,
+  checkRecordedRoomOperatorInputs,
   checkRecordedRoomRefusal,
   checkRecordedRoomRemoval,
   checkRecordedRoomTargetBudget,
@@ -68,7 +69,7 @@ beforeAll(async () => {
     pgQuery,
   );
   await sql`INSERT INTO public.orgs VALUES (${config.orgId})`.execute(pgQuery);
-  await sql`CREATE SCHEMA manual_review_tool; CREATE TABLE manual_review_tool.manual_review_decisions (id uuid PRIMARY KEY, org_id text, job_payload jsonb, decision_components jsonb[], related_actions jsonb[])`.execute(
+  await sql`CREATE SCHEMA manual_review_tool; CREATE TABLE manual_review_tool.manual_review_decisions (id uuid PRIMARY KEY, org_id text, job_payload jsonb, decision_components jsonb[], related_actions jsonb[], created_at timestamptz NOT NULL DEFAULT now(), queue_id text, reviewer_id text)`.execute(
     pgQuery,
   );
   await sql
@@ -475,3 +476,7 @@ test('exhausting the primary lookup budget reports incomplete and records no dis
   checkRecordedRoomLookupBudget(pgQuery));
 test('indexed MRT locator reaches a decision beyond legacy lookup budget and rejects mismatched identity', async () =>
   checkDirectRecordedRoomLocator(pgQuery));
+test.each([false, true])(
+  'existing decision read supplies usable offline operator inputs, related=%s',
+  async (related) => checkRecordedRoomOperatorInputs(pgQuery, related),
+);
