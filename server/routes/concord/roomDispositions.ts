@@ -7,6 +7,7 @@ import {
   type MemberIntentDependencies,
   type MemberIntentPg,
 } from './memberIntentTypes.js';
+import { recordedRoomExecutionSource } from './recordedRoomExecution.js';
 import { type RoomExecutionDisposition } from './roomDispositionTypes.js';
 import { RoomResponseError, UUID, validRoomReason } from './service.js';
 
@@ -105,7 +106,10 @@ export async function getRoomExecutionDisposition(
     executionId,
     attentionState: state.attention_state,
     automationStopped: state.automation_stopped,
-    acceptanceUnknown: !refusal && facts.uncertain,
+    acceptanceUnknown:
+      !refusal &&
+      (facts.uncertain ||
+        (!facts.known && state.source_id.startsWith('mrt-decision:'))),
     refusalCode: refusal?.refusal_code ?? null,
     latestEventId: state.latest_event_id,
   };
@@ -131,7 +135,14 @@ async function appendDisposition(
       input.orgId,
       input.executionId,
     );
-    if (!facts.known && !current && !input.sourceId)
+    const recordedSource =
+      !facts.known &&
+      !current &&
+      !input.sourceId &&
+      input.kind === 'automation_stopped'
+        ? await recordedRoomExecutionSource(tx, input.orgId, input.executionId)
+        : undefined;
+    if (!facts.known && !current && !input.sourceId && !recordedSource)
       throw new Error('Unknown room execution');
     if (
       input.kind === 'closed' &&
@@ -166,7 +177,7 @@ async function appendDisposition(
       .values({
         org_id: input.orgId,
         execution_id: input.executionId,
-        source_id: facts.sourceId ?? input.sourceId ?? '',
+        source_id: facts.sourceId ?? input.sourceId ?? recordedSource ?? '',
         attention_state: input.kind === 'closed' ? 'closed' : 'needs_attention',
         automation_stopped: true,
         latest_event_id: id,
