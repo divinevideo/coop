@@ -36,6 +36,7 @@ class Artifacts(unittest.TestCase):
         self.migrations = {p: hashlib.sha256(p.encode()).hexdigest() for p in a.REQUIRED_MIGRATIONS}
         if a.KIND == 'coop':
             self.migrations.setdefault('db/src/scripts/api-server-pg/2026.10.19T00.14.35.add_room_operation_lifecycle.sql', hashlib.sha256(b'lifecycle').hexdigest())
+        self.migrations['db/src/scripts/api-server-pg/2026.05.20T00.00.00.synthetic.cjs'] = hashlib.sha256(b'db/src/scripts/api-server-pg/2026.05.20T00.00.00.synthetic.cjs').hexdigest()
         self.contract = {'migrations': self.migrations, 'client_inputs': {'src/Room.tsx': '3' * 64} if a.KIND == 'coop' else {}}
         self.manifest = {'version': 1, 'kind': a.KIND, 'source_sha': SHA, 'harness_sha': HARNESS,
                          'platform': 'linux/amd64', 'source_contract': self.contract, 'images': []}
@@ -54,7 +55,7 @@ class Artifacts(unittest.TestCase):
         if entry['migrations']:
             for p in self.migrations:
                 if p != missing:
-                    files[entry['migration_prefix'] + p] = b'lifecycle' if 'lifecycle' in p and p not in a.REQUIRED_MIGRATIONS else p.encode()
+                    files[a.image_migration_path(entry, p)] = b'lifecycle' if 'lifecycle' in p and p not in a.REQUIRED_MIGRATIONS else p.encode()
         if entry['name'] == 'client' and client:
             files['usr/share/nginx/html/index.html'] = b'<html></html>'
             files['usr/share/nginx/html/assets/source.js'] = b'Room enforcement source client'
@@ -275,6 +276,12 @@ class Artifacts(unittest.TestCase):
             self.archive(entry, **options)
             with self.assertRaises(ValueError):
                 self.verify()
+
+    def test_migrator_rejects_development_startup_command(self):
+        entry = next(e for e in self.manifest['images'] if e['name'] == 'migrator')
+        self.archive(entry, command=['npm', 'run', 'db:update', '--', '--help'])
+        with self.assertRaisesRegex(ValueError, 'default command mismatch'):
+            self.verify()
 
     def test_missing_migration(self):
         for entry in self.manifest['images']:
