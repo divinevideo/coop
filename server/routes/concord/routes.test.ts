@@ -51,11 +51,13 @@ function fixture() {
     decisions: [decision],
   };
   const deps = {
-    fetchHTTP: jest.fn(async () => ({
-      ok: true,
-      status: 200,
-      body: data,
-    })),
+    fetchHTTP: jest.fn(
+      async (): Promise<{ ok: boolean; status: number; body: unknown }> => ({
+        ok: true,
+        status: 200,
+        body: data,
+      }),
+    ),
     getItemTypeEventuallyConsistent: jest.fn(async () => ({
       name: 'concord_message',
     })),

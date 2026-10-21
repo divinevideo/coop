@@ -89,11 +89,15 @@ function fixture(operation: string, role: UserRole = UserRole.ADMIN) {
     getPermissions: () => getPermissionsForRole(role),
   };
   const accepted = response(input(), '1');
-  const fetchHTTP = jest.fn(async (_wire: RoomRequest) => ({
-    ok: true,
-    status: 202,
-    body: accepted,
-  }));
+  const fetchHTTP = jest.fn(
+    async (
+      _wire: RoomRequest,
+    ): Promise<{ ok: boolean; status: number; body: unknown }> => ({
+      ok: true,
+      status: 202,
+      body: accepted,
+    }),
+  );
   const deps = {
     fetchHTTP,
     UserAPIDataSource: { getGraphQLUserFromId: async () => staff },
