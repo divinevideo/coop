@@ -1,5 +1,6 @@
 /* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
 import { UserRole } from '../../../services/userManagementService/index.js';
+import { roomDecisionQueueFixture } from '../../../test/roomDecisionQueueFixture.js';
 import { roomDecisionSettings } from '../../../test/roomDecisionSettings.js';
 import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
 import { getPermissionsForRole } from '../../userManagementService/index.js';
@@ -40,7 +41,9 @@ test.each([undefined, '', '   ', 'x'.repeat(2049)])(
     };
     const publish = jest.fn(async () => {});
     const service = new JobDecisioning(
-      queue as never,
+      roomDecisionQueueFixture(queue, {
+        insertInto: () => ({ values: () => ({ execute: record }) }),
+      } as never) as never,
       { insertInto: () => ({ values: () => ({ execute: record }) }) } as never,
       Object.assign(
         async () => [{ id: 'room-action', name: 'concord_remove_message' }],
@@ -142,7 +145,7 @@ test.each(['response_lost', 'type_disappeared'])(
       }
     });
     const service = new JobDecisioning(
-      queue as never,
+      roomDecisionQueueFixture(queue, pg as never) as never,
       pg as never,
       getActions as never,
       publish,
@@ -245,7 +248,7 @@ test('a room job stays reviewable when durable enforcement acceptance fails', as
     throw new Error('unavailable');
   });
   const service = new JobDecisioning(
-    queue as never,
+    roomDecisionQueueFixture(queue, pg as never) as never,
     pg as never,
     Object.assign(
       async () => [{ id: 'room-action', name: 'concord_remove_message' }],
@@ -328,7 +331,7 @@ test.each(['action', 'reason', 'parameters', 'related', 'reviewer', 'same'])(
       .mockRejectedValueOnce(new Error('response lost'))
       .mockResolvedValue(undefined);
     const service = new JobDecisioning(
-      queue as never,
+      roomDecisionQueueFixture(queue, pg as never) as never,
       pg as never,
       Object.assign(
         async () => [{ id: 'room-action', name: 'concord_remove_message' }],

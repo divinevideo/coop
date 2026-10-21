@@ -24,7 +24,6 @@ import {
   isCoopErrorOfType,
   type ErrorInstanceData,
 } from '../../../utils/errors.js';
-import { makeKyselyTransactionWithRetry } from '../../../utils/kyselyTransactionWithRetry.js';
 import { assertUnreachable } from '../../../utils/misc.js';
 import { isNonEmptyString } from '../../../utils/typescript-types.js';
 import { getFieldValueForRole } from '../../itemProcessingService/index.js';
@@ -493,6 +492,7 @@ export default class JobDecisioning {
         enqueueSourceInfo: job.enqueueSourceInfo,
         decisionReason,
         roomDeliveryRequired,
+        isAppealsQueue: opts.isAppealsQueue,
       });
 
     // When a job decision is submitted, we want to record the decision (in pg)
@@ -903,6 +903,7 @@ export default class JobDecisioning {
       | AppealEnqueueSourceInfo;
     decisionReason?: string;
     roomDeliveryRequired?: boolean;
+    isAppealsQueue?: boolean;
   }) {
     const {
       id,
@@ -948,43 +949,49 @@ export default class JobDecisioning {
       item_created_at: itemCreatedAt,
       decision_reason: decisionReason,
     };
-    if (!roomDeliveryRequired || !this.prepareRoomIntents)
+    if (!roomDeliveryRequired)
       return this.pgQuery
         .insertInto('manual_review_tool.manual_review_decisions')
         .values(values)
         .execute();
-    const prior = await this.pgQuery
-      .selectFrom('manual_review_tool.manual_review_decisions')
-      .select('id')
-      .where('org_id', '=', orgId)
-      .where('id', '=', id)
-      .executeTakeFirst();
-    if (prior)
-      throw new Error(
-        'duplicate key value violates unique constraint "manual_review_decisions_pkey"',
-      );
-    const intents = await this.prepareRoomIntents({
-      job,
-      queueId,
-      reviewerId: reviewerId!,
-      reviewerEmail: '',
-      decisionComponents,
-      relatedActions,
-      decisionReason,
-      roomDeliveryRequired: true,
-    });
-    return makeKyselyTransactionWithRetry(this.pgQuery)(async (tx) => {
-      await tx
-        .insertInto('manual_review_tool.manual_review_decisions')
-        .values(values)
-        .execute();
-      // Kysely is invariant in its database schema; this transaction includes the ledger tables.
-      await registerMemberIntents(
-        tx as unknown as Kysely<MemberIntentPg>,
-        intents,
-        id,
-      );
-    });
+    if (this.prepareRoomIntents) {
+      const prior = await this.pgQuery
+        .selectFrom('manual_review_tool.manual_review_decisions')
+        .select('id')
+        .where('org_id', '=', orgId)
+        .where('id', '=', id)
+        .executeTakeFirst();
+      if (prior)
+        throw new Error(
+          'duplicate key value violates unique constraint "manual_review_decisions_pkey"',
+        );
+    }
+    const intents = this.prepareRoomIntents
+      ? await this.prepareRoomIntents({
+          job,
+          queueId,
+          reviewerId: reviewerId!,
+          reviewerEmail: '',
+          decisionComponents,
+          relatedActions,
+          decisionReason,
+          roomDeliveryRequired: true,
+        })
+      : [];
+    return this.queueOps.withRoomDecisionRegistration(
+      { orgId, queueId, jobId: job.id, isAppealsQueue: opts.isAppealsQueue },
+      async (tx) => {
+        await tx
+          .insertInto('manual_review_tool.manual_review_decisions')
+          .values(values)
+          .execute();
+        await registerMemberIntents(
+          tx as unknown as Kysely<MemberIntentPg>,
+          intents,
+          id,
+        );
+      },
+    );
   }
 
   async getNcmecDecisions(opts: { startDate: Date; endDate: Date }) {

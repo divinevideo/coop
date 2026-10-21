@@ -1,4 +1,5 @@
 import { UserRole } from '../../../services/userManagementService/index.js';
+import { roomDecisionQueueFixture } from '../../../test/roomDecisionQueueFixture.js';
 import { roomDecisionSettings } from '../../../test/roomDecisionSettings.js';
 import { getPermissionsForRole } from '../../userManagementService/index.js';
 import JobDecisioning from './JobDecisioning.js';
@@ -58,20 +59,21 @@ test.each(['authorized', 'unauthorized', 'ordinary'])(
       approvedByAdmin: true,
       rejectedByAdmin: false,
     }));
-    const service = new JobDecisioning(
-      queue as never,
-      {
-        selectFrom: () => query,
-        insertInto: () => ({
-          values: () => ({
-            execute: async () => {
-              throw new Error(
-                'duplicate key value violates unique constraint "manual_review_decisions_pkey"',
-              );
-            },
-          }),
+    const pg = {
+      selectFrom: () => query,
+      insertInto: () => ({
+        values: () => ({
+          execute: async () => {
+            throw new Error(
+              'duplicate key value violates unique constraint "manual_review_decisions_pkey"',
+            );
+          },
         }),
-      } as never,
+      }),
+    };
+    const service = new JobDecisioning(
+      roomDecisionQueueFixture(queue, pg as never) as never,
+      pg as never,
       Object.assign(
         async () => [{ id: 'remove', name: 'concord_remove_message' }],
         { close: async () => {} },

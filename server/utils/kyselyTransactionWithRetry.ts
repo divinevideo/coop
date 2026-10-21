@@ -8,12 +8,15 @@ function isSerializationFailure(error: unknown): boolean {
 
 type TransactionWithRetryOptions = {
   isolationLevel?: IsolationLevel;
+  /** Disable replay when the callback performs an external mutation. */
+  retrySerializationFailures?: boolean;
 };
 
 /**
  * Wraps `kysely.transaction().execute(callback)` and retries (up to 3
  * attempts) on Postgres serialization failures (SQLSTATE `40001`). Other
- * errors propagate. Optionally accepts `{ isolationLevel }` as a first arg.
+ * errors propagate. Options can set `isolationLevel` or disable serialization
+ * retries when a callback performs external mutations that cannot be rolled back.
  *
  * Callbacks must be retry-safe: on a 40001 the whole callback is re-run,
  * including any non-database side effects (HTTP calls, queue publishes, etc.)
@@ -41,7 +44,7 @@ export function makeKyselyTransactionWithRetry<T>(kysely: Kysely<T>) {
         ? [{}, optionsOrCallback]
         : [optionsOrCallback, maybeCallback!];
 
-    let remainingTries = 3;
+    let remainingTries = options.retrySerializationFailures === false ? 1 : 3;
     let lastError: unknown;
     while (remainingTries > 0) {
       remainingTries -= 1;

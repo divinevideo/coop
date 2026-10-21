@@ -139,6 +139,22 @@ describe('makeKyselyTransactionWithRetry', () => {
     expect(callbackRuns).toBe(2);
   });
 
+  test('one-attempt boundary surfaces commit failure without replaying external mutation', async () => {
+    const error = makeSerializationFailure();
+    const { fakeKysely, getAttemptCount, getCallbackInvocationCount } =
+      makeFakeKysely([throwAfterCallback(error), success()]);
+    const transactionWithRetry = makeKyselyTransactionWithRetry(fakeKysely);
+    let externalMutations = 0;
+    await expect(
+      transactionWithRetry({ retrySerializationFailures: false }, async () => {
+        externalMutations += 1;
+      }),
+    ).rejects.toBe(error);
+    expect(externalMutations).toBe(1);
+    expect(getAttemptCount()).toBe(1);
+    expect(getCallbackInvocationCount()).toBe(1);
+  });
+
   test('gives up after 3 attempts of post-callback 40001 and rethrows the last failure', async () => {
     const finalFailure = makeSerializationFailure();
     const { fakeKysely, getAttemptCount, getCallbackInvocationCount } =
