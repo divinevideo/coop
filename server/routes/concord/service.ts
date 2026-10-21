@@ -302,8 +302,7 @@ export function parseRoomStatus(value: unknown): RoomStatus {
     ) ||
     !['communityId', 'channelId', 'rumorId'].every(
       (key) =>
-        typeof target[key] === 'string' &&
-        /^[0-9a-f]{64}$/.test(target[key]),
+        typeof target[key] === 'string' && /^[0-9a-f]{64}$/.test(target[key]),
     ) ||
     !Array.isArray(status.deliveries) ||
     status.deliveries.length !== 3
