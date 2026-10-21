@@ -85,7 +85,18 @@ try {
     .selectFrom('public.SequelizeMeta')
     .select('name')
     .execute();
-  assert.equal(migrations.length, 23); // staging seed deliberately excluded in prod
+  assert.equal(migrations.length, 24); // staging seed deliberately excluded in prod
+  assert.ok(
+    await db
+      .selectFrom('public.view_maintenance_metadata')
+      .select('table_name')
+      .where(
+        'table_name',
+        '=',
+        'manual_review_tool.dim_mrt_decisions_materialized',
+      )
+      .executeTakeFirst(),
+  );
   const user = await db
     .selectFrom('public.users')
     .selectAll()
