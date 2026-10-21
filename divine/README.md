@@ -11,12 +11,12 @@ does not travel between environments on its own. These scripts are that missing 
 
 ## Scripts
 
-| Script | Purpose |
-|--------|---------|
-| `coop-setup-org.sh` | Idempotently bootstrap an org's moderation config: the `nostr_event` content type and `nostr_user` user type, review queues mirroring relay-manager's category tiers, routing, and (when `WEBHOOK_SECRET` is set) the enforcement CUSTOM_ACTION webhooks pointing at the deployed adapter. Needs an **admin user session** (login email/password), not just the org API key. |
-| `test-coop-setup-guards.sh` | Guard tests for `coop-setup-org.sh`'s routing vocabulary, charset, route table, and priority checks. Runs in CI for `divine/` changes; run locally after editing the routing config: `bash divine/test-coop-setup-guards.sh`. No credentials or network needed. |
+| Script                          | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `coop-setup-org.sh`             | Idempotently bootstrap an org's moderation config: the `nostr_event` content type and `nostr_user` user type, review queues mirroring relay-manager's category tiers, routing, and (when `WEBHOOK_SECRET` is set) the enforcement CUSTOM_ACTION webhooks pointing at the deployed adapter. Needs an **admin user session** (login email/password), not just the org API key.                                                        |
+| `test-coop-setup-guards.sh`     | Guard tests for `coop-setup-org.sh`'s routing vocabulary, charset, route table, and priority checks. Runs in CI for `divine/` changes; run locally after editing the routing config: `bash divine/test-coop-setup-guards.sh`. No credentials or network needed.                                                                                                                                                                     |
 | `check-profile-field-parity.sh` | Cross-repo drift check: executes osprey's real `coop_profile.py` over every branch and compares the keys it emits to the profile fields `coop-setup-org.sh` declares, on BOTH the `nostr_event` content type and the `nostr_user` account type. Not in CI (no osprey checkout there); run it when either side's field list changes and before provisioning a new org: `divine/check-profile-field-parity.sh ../osprey origin/main`. |
-| `coop-bridge-import.sh` | Pull live kind-1984 reports from relay-manager and submit them to COOP for review (demo bridge). |
+| `coop-bridge-import.sh`         | Pull live kind-1984 reports from relay-manager and submit them to COOP for review (demo bridge).                                                                                                                                                                                                                                                                                                                                    |
 
 ## Usage
 
@@ -93,7 +93,6 @@ npm run lint
 
 CI runs both PostgreSQL ordering suites explicitly after the normal database suite, using the existing isolated compose test service with `NODE_ENV=test` and `MEMBER_INTENT_TEST_COMPOSE=1`. The shared test helper rejects any other remote host or an unguarded compose connection. Each suite creates and drops only its own uniquely named database; it never resets the existing CI database.
 
-
 ### Manual room operation recovery contract
 
 One operation identifies one immutable staff decision. The GraphQL error extension
@@ -160,7 +159,10 @@ lists the recorded IDs for a queue; page until the original job is found:
 ```graphql
 query RecentRecordedRoomJobs($queueId: ID!, $page: Int) {
   getRecentDecisions(input: { filter: { queueIds: [$queueId] }, page: $page }) {
-    id jobId itemId itemTypeId
+    id
+    jobId
+    itemId
+    itemTypeId
   }
 }
 ```
@@ -169,16 +171,27 @@ Using that recorded `jobId`, read only these identifiers in the same staff clien
 
 ```graphql
 query RecordedRoomStopInputs($jobId: String!) {
-  myOrg { id }
+  myOrg {
+    id
+  }
   getDecidedJobFromJobId(id: $jobId) {
     decision {
-      id jobId itemId itemTypeId
+      id
+      jobId
+      itemId
+      itemTypeId
       decisions {
-        ... on UserOrRelatedActionDecisionComponent { type actionIds }
+        ... on UserOrRelatedActionDecisionComponent {
+          type
+          actionIds
+        }
       }
       relatedActions {
         ... on UserOrRelatedActionDecisionComponent {
-          type actionIds itemIds itemTypeId
+          type
+          actionIds
+          itemIds
+          itemTypeId
         }
       }
     }

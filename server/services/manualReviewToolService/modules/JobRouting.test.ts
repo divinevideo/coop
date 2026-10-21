@@ -1,11 +1,11 @@
 /* eslint-disable max-lines */
-import { ScalarTypes } from '@roostorg/types';
+import { ScalarTypes } from '@roostorg/coop-types';
 import { uid } from 'uid';
 
 import getBottle from '../../../iocContainer/index.js';
-import { UserPermission } from '../../../models/types/permissioning.js';
 import createContentItemTypes from '../../../test/fixtureHelpers/createContentItemTypes.js';
 import createOrg from '../../../test/fixtureHelpers/createOrg.js';
+import createUser from '../../../test/fixtureHelpers/createUser.js';
 import { makeTestWithFixture } from '../../../test/utils.js';
 import { toCorrelationId } from '../../../utils/correlationIds.js';
 import { jsonStringify } from '../../../utils/encoding.js';
@@ -17,6 +17,7 @@ import {
 import { itemSubmissionToItemSubmissionWithTypeIdentifier } from '../../itemProcessingService/makeItemSubmissionWithTypeIdentifier.js';
 import { toNormalizedItemDataOrErrors } from '../../itemProcessingService/toNormalizedItemDataOrErrors.js';
 import { SignalType } from '../../signalsService/index.js';
+import { UserPermission } from '../../userManagementService/index.js';
 
 describe('JobRouting tests', () => {
   const jobRoutingTestWithFixtures = makeTestWithFixture(async () => {
@@ -30,7 +31,11 @@ describe('JobRouting tests', () => {
       },
       uid(),
     );
-    const userId = uid();
+    const { user, cleanup: userCleanup } = await createUser(
+      container.KyselyPg,
+      org.id,
+    );
+    const userId = user.id;
     const { itemTypes, cleanup: itemTypesCleanup } =
       await createContentItemTypes({
         moderationConfigService: container.ModerationConfigService,
@@ -216,13 +221,21 @@ describe('JobRouting tests', () => {
       policyQueue,
       noPolicyQueue,
       async cleanup() {
-        await manualReviewToolService.deleteRoutingRule({ id: rule.id });
-        await manualReviewToolService.deleteRoutingRule({ id: policyRule.id });
+        await manualReviewToolService.deleteRoutingRule({
+          id: rule.id,
+          orgId: org.id,
+        });
+        await manualReviewToolService.deleteRoutingRule({
+          id: policyRule.id,
+          orgId: org.id,
+        });
         await manualReviewToolService.deleteRoutingRule({
           id: policyNotProvidedRule.id,
+          orgId: org.id,
         });
         await manualReviewToolService.deleteRoutingRule({
           id: sourceTypeRule.id,
+          orgId: org.id,
         });
         await manualReviewToolService.deleteManualReviewQueueForTestsDO_NOT_USE(
           org.id,
@@ -241,6 +254,7 @@ describe('JobRouting tests', () => {
           noPolicyQueue.id,
         );
         await itemTypesCleanup();
+        await userCleanup();
         await orgCleanup();
         await container.closeSharedResourcesForShutdown();
       },
@@ -672,7 +686,10 @@ describe('JobRouting tests', () => {
         })
         .then(
           async (result) => {
-            await manualReviewToolService.deleteRoutingRule({ id: result.id });
+            await manualReviewToolService.deleteRoutingRule({
+              id: result.id,
+              orgId: org.id,
+            });
             throw new Error("Promise should've rejected!");
           },
           (_e) => {

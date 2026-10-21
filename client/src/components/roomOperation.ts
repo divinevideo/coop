@@ -1,4 +1,4 @@
-import { type ItemIdentifier } from '@roostorg/types';
+import { type ItemIdentifier } from '@roostorg/coop-types';
 
 const legacyKey = (item: ItemIdentifier) =>
   `concord-operation:source-order-v1:${JSON.stringify([item.typeId, item.id])}`;

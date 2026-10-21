@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { type Kysely } from 'kysely';
 
 import { jsonStringify } from '../../utils/encoding.js';
+import { makeKyselyTransactionWithRetry } from '../../utils/kyselyTransactionWithRetry.js';
 import { lockRoomExecution } from './manualRoomOperations.js';
 import {
   type MemberDeliveryOutcome,
@@ -71,7 +72,7 @@ export async function recordRoomRemovalAcceptance(
   value: RoomStatus,
 ) {
   const status = validatedAcceptance(input, value);
-  return pg.transaction().execute(async (tx) => {
+  return makeKyselyTransactionWithRetry(pg)(async (tx) => {
     await lockRoomExecution(tx, input.orgId, roomExecutionId(input));
     const existing = await storedRoomRemoval(
       tx,

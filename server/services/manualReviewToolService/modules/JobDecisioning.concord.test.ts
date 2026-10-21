@@ -1,6 +1,8 @@
 /* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
-import { UserRole } from '../../../models/types/permissioning.js';
+import { UserRole } from '../../../services/userManagementService/index.js';
+import { roomDecisionSettings } from '../../../test/roomDecisionSettings.js';
 import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
+import { getPermissionsForRole } from '../../userManagementService/index.js';
 import JobDecisioning, {
   assertRoomRelatedItemTypeAvailable,
 } from './JobDecisioning.js';
@@ -8,103 +10,13 @@ import JobDecisioning, {
 const getRoomActor = async (id: string, orgId: string) => ({
   id,
   orgId,
+  getPermissions() {
+    return getPermissionsForRole(this.role);
+  },
   role: UserRole.ADMIN,
   approvedByAdmin: true,
   rejectedByAdmin: false,
 });
-
-test.each(['global_deleted_action', 'room_ignore'])(
-  'non-enforcement retries remove an already-recorded job without action lookup: %s',
-  async (kind) => {
-    const job = {
-      id: 'synthetic:10000000-0000-4000-8000-000000000005',
-      orgId: 'synthetic',
-      payload: {
-        kind: 'DEFAULT',
-        item: {
-          itemId: 'global-item',
-          itemTypeIdentifier: {
-            id: kind === 'room_ignore' ? 'room-type' : 'global-type',
-          },
-          data: {},
-        },
-      },
-    };
-    const prior = {
-      job_payload: job,
-      queue_id: 'queue',
-      reviewer_id: 'staff',
-      related_actions: [],
-      decision_components:
-        kind === 'room_ignore'
-          ? [{ type: 'IGNORE' }]
-          : [{ type: 'CUSTOM_ACTION', actions: [{ id: 'deleted-action' }] }],
-    };
-    const select = {
-      where() {
-        return select;
-      },
-      selectAll() {
-        return select;
-      },
-      executeTakeFirst: async () => prior,
-    };
-    const pg = {
-      insertInto: () => ({
-        values: () => ({
-          execute: async () => {
-            throw new Error(
-              'duplicate key value violates unique constraint "manual_review_decisions_pkey"',
-            );
-          },
-        }),
-      }),
-      selectFrom: () => select,
-    };
-    const queue = {
-      getJobs: async () => [job],
-      removeJob: jest.fn(async () => {}),
-    };
-    const getActions = Object.assign(
-      jest.fn(async () => {
-        throw new Error('Action lookup unavailable');
-      }),
-      { close: async () => {} },
-    );
-    const publish = jest.fn(async () => {});
-    const service = new JobDecisioning(
-      queue as never,
-      pg as never,
-      getActions as never,
-      publish,
-      {
-        getItemType:
-          kind === 'room_ignore'
-            ? jest
-                .fn()
-                .mockResolvedValueOnce(undefined)
-                .mockResolvedValue({ name: 'concord_message' })
-            : async () => undefined,
-      } as never,
-      { addSpan: jest.fn() } as never,
-      getRoomActor,
-    );
-    const input = {
-      orgId: 'synthetic',
-      queueId: 'queue',
-      jobId: job.id,
-      lockToken: 'lock',
-      reviewerId: 'staff',
-      reviewerEmail: 'synthetic@example.invalid',
-      relatedActions: [],
-      decisionComponents: [{ type: 'IGNORE' }],
-    } as unknown as Parameters<JobDecisioning['submitDecision']>[0];
-    await service.submitDecision(input).catch(() => {});
-    expect(queue.removeJob).toHaveBeenCalledTimes(1);
-    expect(getActions).not.toHaveBeenCalled();
-    expect(publish).not.toHaveBeenCalled();
-  },
-);
 
 test.each([undefined, '', '   ', 'x'.repeat(2049)])(
   'invalid room reasons are rejected before recording immutable intent: %p',
@@ -137,6 +49,7 @@ test.each([undefined, '', '   ', 'x'.repeat(2049)])(
       publish,
       { getItemType: async () => undefined } as never,
       { addSpan: jest.fn() } as never,
+      roomDecisionSettings() as never,
       getRoomActor,
     );
     const input = {
@@ -241,6 +154,7 @@ test.each(['response_lost', 'type_disappeared'])(
         }) => (itemTypeSelector.id === 'member-type' ? {} : undefined),
       } as never,
       { addSpan: jest.fn() } as never,
+      roomDecisionSettings() as never,
       getRoomActor,
     );
     const input = {
@@ -260,7 +174,7 @@ test.each(['response_lost', 'type_disappeared'])(
           },
           itemIds: ['case'],
           itemTypeId: 'member-type',
-          policyIds: [],
+          policies: [],
         },
       ],
     } as unknown as Extract<
@@ -340,6 +254,7 @@ test('a room job stays reviewable when durable enforcement acceptance fails', as
     publish,
     { getItemType: async () => undefined } as never,
     { addSpan: jest.fn() } as never,
+    roomDecisionSettings() as never,
     getRoomActor,
   );
   const input = {
@@ -355,7 +270,7 @@ test('a room job stays reviewable when durable enforcement acceptance fails', as
       {
         type: 'CUSTOM_ACTION',
         actions: [{ id: 'room-action' }],
-        policyIds: [],
+        policies: [],
       },
     ],
   } as unknown as Parameters<JobDecisioning['submitDecision']>[0];
@@ -422,6 +337,7 @@ test.each(['action', 'reason', 'parameters', 'related', 'reviewer', 'same'])(
       publish,
       { getItemType: async () => undefined } as never,
       { addSpan: jest.fn() } as never,
+      roomDecisionSettings() as never,
       getRoomActor,
     );
     const input: any = {
@@ -472,7 +388,7 @@ test.each(['action', 'reason', 'parameters', 'related', 'reviewer', 'same'])(
                       actionIds: ['room-action'],
                       itemIds: ['other-case'],
                       itemTypeId: 'room-type',
-                      policyIds: [],
+                      policies: [],
                     },
                   ],
                 }

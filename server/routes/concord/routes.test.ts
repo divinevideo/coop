@@ -1,5 +1,7 @@
-/* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
-import { UserRole } from '../../models/types/permissioning.js';
+/* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */ import {
+  getPermissionsForRole,
+  UserRole,
+} from '../../services/userManagementService/index.js';
 import { roomHandler } from './index.js';
 
 const caseId = '10000000-0000-4000-8000-000000000001';
@@ -21,7 +23,9 @@ function fixture() {
     role: UserRole.MODERATOR,
     approvedByAdmin: true,
     rejectedByAdmin: false,
-    getPermissions: () => [],
+    getPermissions() {
+      return getPermissionsForRole(this.role);
+    },
   };
   const decision = {
     decisionId,
@@ -50,7 +54,7 @@ function fixture() {
     fetchHTTP: jest.fn(async () => ({
       ok: true,
       status: 200,
-      body: data as unknown,
+      body: data,
     })),
     getItemTypeEventuallyConsistent: jest.fn(async () => ({
       name: 'concord_message',

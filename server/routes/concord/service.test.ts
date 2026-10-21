@@ -1,13 +1,15 @@
-/* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
-import type { RoomRequest } from './service.js';
-
-import { UserRole } from '../../models/types/permissioning.js';
+import {
+  getPermissionsForRole,
+  UserRole,
+} from '../../services/userManagementService/index.js';
 import { tryJsonParse } from '../../utils/encoding.js';
+/* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
 import {
   loadConcordConfig,
   object,
   publishRoomDecision,
   roomPermissions,
+  type RoomRequest,
 } from './service.js';
 
 const config = {
@@ -22,6 +24,9 @@ const config = {
 const actor = {
   id: 'synthetic-staff',
   orgId: 'synthetic-org',
+  getPermissions() {
+    return getPermissionsForRole(this.role);
+  },
   role: UserRole.MODERATOR,
   approvedByAdmin: true,
   rejectedByAdmin: false,
@@ -134,27 +139,25 @@ test('internal enforcement origin is fixed, never an arbitrary cleartext endpoin
 });
 
 test('cross-cluster requests authenticate to Access without forwarding credentials on redirects', async () => {
-  const fetchHTTP = jest.fn(
-    async (_request: RoomRequest) => ({
-      ok: true,
-      status: 202,
-      body: {
-        decisionId: '10000000-0000-4000-8000-000000000002',
-        action: 'remove_message',
-        target: {
-          communityId: 'a'.repeat(64),
-          channelId: 'b'.repeat(64),
-          rumorId: 'c'.repeat(64),
-        },
-        deliveries: ['divine_relay', 'concord', 'discord'].map((target) => ({
-          target,
-          state: 'pending',
-          attempts: 0,
-          resultCode: null,
-        })),
+  const fetchHTTP = jest.fn(async (_request: RoomRequest) => ({
+    ok: true,
+    status: 202,
+    body: {
+      decisionId: '10000000-0000-4000-8000-000000000002',
+      action: 'remove_message',
+      target: {
+        communityId: 'a'.repeat(64),
+        channelId: 'b'.repeat(64),
+        rumorId: 'c'.repeat(64),
       },
-    }),
-  );
+      deliveries: ['divine_relay', 'concord', 'discord'].map((target) => ({
+        target,
+        state: 'pending',
+        attempts: 0,
+        resultCode: null,
+      })),
+    },
+  }));
   await publishRoomDecision(
     {
       ...config,

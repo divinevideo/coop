@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 
-import { UserRole } from '../../models/types/permissioning.js';
+import { UserRole } from '../../services/userManagementService/index.js';
 import {
   actor,
   config,
@@ -14,6 +14,7 @@ import {
 } from '../../test/memberIntentFixtures.js';
 import { memberIntentTestDatabaseUrl } from '../../test/memberIntentTestDatabase.js';
 import { jsonStringify } from '../../utils/encoding.js';
+import { makeKyselyTransactionWithRetry } from '../../utils/kyselyTransactionWithRetry.js';
 import {
   beginManualRoomOperation,
   claimManualRoomOperation,
@@ -122,11 +123,9 @@ test('unissued v2 execution cannot allocate a member revision', async () => {
     correlationId: `manual-action-run:source-order-v2_ban_member_${randomUUID()}`,
   };
   await expect(
-    pgQuery
-      .transaction()
-      .execute(async (tx) =>
-        registerMemberIntents(tx, [await prepared(value)]),
-      ),
+    makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+      registerMemberIntents(tx, [await prepared(value)]),
+    ),
   ).rejects.toThrow('receipt');
   expect(
     await pgQuery
@@ -311,9 +310,9 @@ test('retirement while authoritative preparation is delayed prevents any order o
   );
   resume();
   await expect(
-    pgQuery
-      .transaction()
-      .execute(async (tx) => registerMemberIntents(tx, [await intent])),
+    makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+      registerMemberIntents(tx, [await intent]),
+    ),
   ).rejects.toThrow('receipt');
   expect(retired).toMatchObject({
     phase: 'retired',
@@ -349,9 +348,9 @@ test('registration wins the same execution lock: retirement reports recorded con
     beginArgs(),
   );
   const intent = await prepared(await payload(receipt));
-  await pgQuery
-    .transaction()
-    .execute(async (tx) => registerMemberIntents(tx, [intent]));
+  await makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+    registerMemberIntents(tx, [intent]),
+  );
   expect(
     await getManualRoomOperation(pgQuery, dependencies, access(receipt)),
   ).toMatchObject({

@@ -1,6 +1,8 @@
-/* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */
-import { UserRole } from '../models/types/permissioning.js';
 import { memberIntentFingerprint } from '../routes/concord/memberIntents.js';
+/* eslint-disable functional/immutable-data -- Tests deliberately vary authorization fixtures and record side-effect order. */ import {
+  getPermissionsForRole,
+  UserRole,
+} from '../services/userManagementService/index.js';
 import { ActionPublisher } from './ActionPublisher.js';
 
 const config = {
@@ -82,6 +84,7 @@ test.each([
       {} as never,
       {} as never,
       {} as never,
+      (async () => undefined),
       {
         getGraphQLUserFromId: async () => ({
           id: 'staff',
@@ -89,7 +92,9 @@ test.each([
           role: UserRole.ADMIN,
           approvedByAdmin: kind !== 'denied',
           rejectedByAdmin: false,
-          getPermissions: () => [],
+          getPermissions() {
+            return getPermissionsForRole(this.role);
+          },
         }),
       } as never,
       {

@@ -130,12 +130,18 @@ export default function RuleTestModal(props: {
         return 'https://test.com/image.jpg';
       case 'VIDEO':
         return 'https://test.com/video.mp4';
+      case 'MEDIA':
+        return 'https://test.com/media.jpg';
       case 'STRING':
         return 'Some text...';
       case 'URL':
         return 'https://test.com';
       case 'USER_ID':
         return 'user-id';
+      case 'IP_ADDRESS':
+        return '192.0.2.1';
+      case 'EMAIL_ADDRESS':
+        return 'user@example.com';
       case 'ARRAY':
         return `${getPlaceholder(
           containerValueScalarType!,

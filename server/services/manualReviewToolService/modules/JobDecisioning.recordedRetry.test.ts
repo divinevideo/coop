@@ -1,4 +1,6 @@
-import { UserRole } from '../../../models/types/permissioning.js';
+import { UserRole } from '../../../services/userManagementService/index.js';
+import { roomDecisionSettings } from '../../../test/roomDecisionSettings.js';
+import { getPermissionsForRole } from '../../userManagementService/index.js';
 import JobDecisioning from './JobDecisioning.js';
 
 test.each(['authorized', 'unauthorized', 'ordinary'])(
@@ -45,6 +47,12 @@ test.each(['authorized', 'unauthorized', 'ordinary'])(
     const actor = jest.fn(async (id: string, orgId: string) => ({
       id,
       orgId,
+      getPermissions: () =>
+        getPermissionsForRole(
+          kind === 'unauthorized'
+            ? UserRole.EXTERNAL_MODERATOR
+            : UserRole.ADMIN,
+        ),
       role:
         kind === 'unauthorized' ? UserRole.EXTERNAL_MODERATOR : UserRole.ADMIN,
       approvedByAdmin: true,
@@ -71,6 +79,7 @@ test.each(['authorized', 'unauthorized', 'ordinary'])(
       publish,
       { getItemType: async () => undefined } as never,
       { addSpan: jest.fn() } as never,
+      roomDecisionSettings() as never,
       actor,
     );
     const retry = service.retryRecordedRoomDecision({

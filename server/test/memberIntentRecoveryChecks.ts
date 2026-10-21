@@ -10,6 +10,7 @@ import {
   type RoomDecisionInput,
   type RoomRequest,
 } from '../routes/concord/service.js';
+import { makeKyselyTransactionWithRetry } from '../utils/kyselyTransactionWithRetry.js';
 import {
   config,
   getActor,
@@ -20,9 +21,9 @@ import {
 
 async function record(pg: Kysely<MemberIntentPg>, value: RoomDecisionInput) {
   const intent = await prepared(value);
-  await pg
-    .transaction()
-    .execute(async (tx) => registerMemberIntents(tx, [intent]));
+  await makeKyselyTransactionWithRetry(pg)(async (tx) =>
+    registerMemberIntents(tx, [intent]),
+  );
 }
 function barrier() {
   let resolve!: () => void;

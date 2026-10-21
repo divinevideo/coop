@@ -25,8 +25,11 @@ test('room publication accepts complete room action configuration', () => {
   ).not.toThrow();
 });
 
-test.each([null, undefined])('missing related type fails closed: %s', (itemType) => {
-  expect(() => assertRoomRelatedItemTypeAvailable(itemType)).toThrow(
-    'Room related item type configuration unavailable',
-  );
-});
+test.each([null, undefined])(
+  'missing related type fails closed: %s',
+  (itemType) => {
+    expect(() => assertRoomRelatedItemTypeAvailable(itemType)).toThrow(
+      'Room related item type configuration unavailable',
+    );
+  },
+);

@@ -13,6 +13,7 @@ import {
   response,
 } from '../../test/memberIntentFixtures.js';
 import { memberIntentTestDatabaseUrl } from '../../test/memberIntentTestDatabase.js';
+import { makeKyselyTransactionWithRetry } from '../../utils/kyselyTransactionWithRetry.js';
 import { deliverManualRoomOperation } from './manualRoomDelivery.js';
 import {
   beginManualRoomOperation,
@@ -114,11 +115,9 @@ test.each([
     );
     const request = await payload(receipt);
     if (action !== 'concord_remove_message')
-      await pgQuery
-        .transaction()
-        .execute(async (tx) =>
-          registerMemberIntents(tx, [await prepared(request)]),
-        );
+      await makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+        registerMemberIntents(tx, [await prepared(request)]),
+      );
     const intent = await pgQuery
       .selectFrom('concord_integration.member_intents')
       .select('revision')
@@ -242,11 +241,9 @@ test('new B during lookup404 prevents every retry POST for old A', async () => {
     beginArgs(),
   );
   const request = await payload(receipt);
-  await pgQuery
-    .transaction()
-    .execute(async (tx) =>
-      registerMemberIntents(tx, [await prepared(request)]),
-    );
+  await makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+    registerMemberIntents(tx, [await prepared(request)]),
+  );
   await expect(
     deliverManualRoomOperation(
       pgQuery,
@@ -263,11 +260,9 @@ test('new B during lookup404 prevents every retry POST for old A', async () => {
   const replacement = input('concord_unban_member');
   const fetchHTTP = jest.fn(async (wire: RoomRequest) => {
     expect(wire.method).toBe('get');
-    await pgQuery
-      .transaction()
-      .execute(async (tx) =>
-        registerMemberIntents(tx, [await prepared(replacement)]),
-      );
+    await makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+      registerMemberIntents(tx, [await prepared(replacement)]),
+    );
     return { ok: false, status: 404, body: { error: 'not_found' } };
   });
   expect(
@@ -288,9 +283,9 @@ test('runtime table owner cannot truncate receipt safety records', async () => {
 
 test('reversal after case deletion uses authenticated prior target and next same-member revision', async () => {
   const ban = input();
-  await pgQuery
-    .transaction()
-    .execute(async (tx) => registerMemberIntents(tx, [await prepared(ban)]));
+  await makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+    registerMemberIntents(tx, [await prepared(ban)]),
+  );
   const priorDecisionId = randomUUID();
   const {
     caseId: _,
@@ -347,9 +342,9 @@ test('reversal after case deletion uses authenticated prior target and next same
     { ...dependencies, fetchHTTP },
     request,
   );
-  await pgQuery
-    .transaction()
-    .execute(async (tx) => registerMemberIntents(tx, [preparedReversal]));
+  await makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+    registerMemberIntents(tx, [preparedReversal]),
+  );
   const previous = await pgQuery
     .selectFrom('concord_integration.member_intents')
     .selectAll()

@@ -27,6 +27,7 @@ import {
 } from '../../test/recordedRoomRemovals.js';
 import { checkRoomRemovalAcceptances } from '../../test/roomRemovalAcceptances.js';
 import { checkRoomRemovalPublisher } from '../../test/roomRemovalPublisher.js';
+import { makeKyselyTransactionWithRetry } from '../../utils/kyselyTransactionWithRetry.js';
 import {
   beginManualRoomOperation,
   claimManualRoomOperation,
@@ -69,7 +70,7 @@ beforeAll(async () => {
     pgQuery,
   );
   await sql`INSERT INTO public.orgs VALUES (${config.orgId})`.execute(pgQuery);
-  await sql`CREATE SCHEMA manual_review_tool; CREATE TABLE manual_review_tool.manual_review_decisions (id uuid PRIMARY KEY, org_id text, job_payload jsonb, decision_components jsonb[], related_actions jsonb[], created_at timestamptz NOT NULL DEFAULT now(), queue_id text, reviewer_id text)`.execute(
+  await sql`CREATE SCHEMA manual_review_tool; CREATE TABLE manual_review_tool.manual_review_decisions (id uuid PRIMARY KEY, org_id text, job_payload jsonb, decision_components jsonb[], related_actions jsonb[], decision_reason text, created_at timestamptz NOT NULL DEFAULT now(), queue_id text, reviewer_id text)`.execute(
     pgQuery,
   );
   await sql
@@ -105,11 +106,9 @@ const deps = {
 };
 async function record() {
   const request = input();
-  await pgQuery
-    .transaction()
-    .execute(async (tx) =>
-      registerMemberIntents(tx, [await prepared(request)]),
-    );
+  await makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+    registerMemberIntents(tx, [await prepared(request)]),
+  );
   return request;
 }
 test.each([false, true])(
@@ -387,7 +386,7 @@ test('closing a retired receipt fences an already prepared late registration', a
   const ready = new Promise<void>((resolve) => {
     entered = resolve;
   });
-  const late = pgQuery.transaction().execute(async (tx) => {
+  const late = makeKyselyTransactionWithRetry(pgQuery)(async (tx) => {
     entered();
     await pause;
     return registerMemberIntents(tx, [captured]);

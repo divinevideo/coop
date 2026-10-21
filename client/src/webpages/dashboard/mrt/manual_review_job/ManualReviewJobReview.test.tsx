@@ -160,7 +160,7 @@ test('room selection exposes a required reason and caps its length with the org 
   review();
   expect(
     screen.queryByPlaceholderText('Reason for decision'),
-  ).not.toBeInTheDocument();
+  ).toBeInTheDocument();
   fireEvent.click(screen.getByText('concord_remove_message'));
   const reason = screen.getByPlaceholderText('Reason for decision');
   fireEvent.click(screen.getByText('Submit'));
@@ -228,7 +228,7 @@ test('ordinary actions keep the optional reason behavior when the org setting is
   fireEvent.click(screen.getByText('ordinary_action'));
   expect(
     screen.queryByPlaceholderText('Reason for decision'),
-  ).not.toBeInTheDocument();
+  ).toBeInTheDocument();
   fireEvent.click(screen.getByText('Submit'));
   expect(hooks.submit).toHaveBeenCalledOnce();
 });

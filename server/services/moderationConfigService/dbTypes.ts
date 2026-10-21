@@ -1,4 +1,4 @@
-import { type ItemTypeKind } from '@roostorg/types';
+import { type ItemTypeKind } from '@roostorg/coop-types';
 import { type Generated, type GeneratedAlways } from 'kysely';
 import { type JsonObject, type JsonValue } from 'type-fest';
 
@@ -32,6 +32,8 @@ export type ModerationConfigServicePg = {
     profile_icon_field: string | null;
     background_image_field: string | null;
     is_deleted_field: string | null;
+    ip_address_field: string | null;
+    email_field: string | null;
   };
   // TODO: redefine as a union to capture the correlation of the nulls,
   // then leverage FixKyselyRowCorrelation in the ItemTypesDbResult type.
@@ -41,7 +43,6 @@ export type ModerationConfigServicePg = {
     name: GeneratedAlways<string>;
     description: GeneratedAlways<string | null>;
     org_id: GeneratedAlways<string>;
-    created_at: GeneratedAlways<Date>;
     kind: GeneratedAlways<ItemTypeKind>;
     fields: GeneratedAlways<ItemSchema>;
     is_default_user: GeneratedAlways<boolean>;
@@ -53,6 +54,8 @@ export type ModerationConfigServicePg = {
     profile_icon_field: GeneratedAlways<string | null>;
     background_image_field: GeneratedAlways<string | null>;
     is_deleted_field: GeneratedAlways<string | null>;
+    ip_address_field: GeneratedAlways<string | null>;
+    email_field: GeneratedAlways<string | null>;
     version: GeneratedAlways<string>;
     is_current: GeneratedAlways<boolean>;
   };
@@ -65,6 +68,8 @@ export type ModerationConfigServicePg = {
   'public.rules_and_actions': {
     action_id: string;
     rule_id: string;
+    // Configured `name -> value` parameters sent when this rule fires the action.
+    action_parameters: Generated<JsonObject>;
     created_at: GeneratedAlways<Date>;
     updated_at: GeneratedAlways<Date>;
     sys_period: GeneratedAlways<unknown>;
@@ -98,7 +103,7 @@ export type ModerationConfigServicePg = {
     // whether to set `updated_at` on update or whether to just drop the column,
     // given the challenge of inerpreting the `updated_at` column on an entity
     // that has part of its data in other tables (e.g., should we update the
-    // action's updated_at when we update its set of item types?) 
+    // action's updated_at when we update its set of item types?)
     created_at: GeneratedAlways<Date>;
     updated_at: Generated<Date>;
     applies_to_all_items_of_kind: Generated<ItemTypeKind[]>;
@@ -160,6 +165,8 @@ export type ModerationConfigServicePg = {
     org_id: string;
     threshold: number;
     actions: string[];
+    // Per-action configured parameters: `action_id -> { name -> value }`.
+    action_parameters: Generated<JsonObject>;
   };
   'public.text_banks': {
     id: string;

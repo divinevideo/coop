@@ -1,6 +1,6 @@
 /* eslint-disable max-lines */
 import { type Exception } from '@opentelemetry/api';
-import { type ItemIdentifier } from '@roostorg/types';
+import { type ItemIdentifier } from '@roostorg/coop-types';
 import { type Kysely } from 'kysely';
 import { type JsonObject, type ReadonlyDeep } from 'type-fest';
 
@@ -50,6 +50,7 @@ import {
   type MatchingRule,
   type Policy,
 } from '../services/analyticsLoggers/index.js';
+import { makeSyntheticUserSubmission } from '../services/itemInvestigationService/index.js';
 import {
   getFieldValueForRole,
   itemSubmissionToItemSubmissionWithTypeIdentifier,
@@ -63,6 +64,7 @@ import {
 import { asyncIterableToArray } from '../utils/collections.js';
 import { getSourceType, type CorrelationId } from '../utils/correlationIds.js';
 import { jsonStringify } from '../utils/encoding.js';
+import { makeKyselyTransactionWithRetry } from '../utils/kyselyTransactionWithRetry.js';
 import { assertUnreachable, safePick, withRetries } from '../utils/misc.js';
 import { type RuleEnvironment } from './RuleEngine.js';
 
@@ -162,6 +164,7 @@ class ActionPublisher {
     private ncmecService: Dependencies['NcmecService'],
     private itemInvestigationService: Dependencies['ItemInvestigationService'],
     private userStrikeService: Dependencies['UserStrikeService'],
+    private getItemTypeEventuallyConsistent: Dependencies['getItemTypeEventuallyConsistent'],
     private userAPIDataSource?: Dependencies['UserAPIDataSource'],
     private readonly memberIntentPg?: Kysely<MemberIntentPg>,
   ) {}
@@ -228,9 +231,9 @@ class ActionPublisher {
         throw roomAttemptNotRecorded(error);
       },
     );
-    await this.memberIntentPg
-      .transaction()
-      .execute(async (tx) => registerMemberIntents(tx, [prepared]));
+    await makeKyselyTransactionWithRetry(this.memberIntentPg)(async (tx) =>
+      registerMemberIntents(tx, [prepared]),
+    );
   }
 
   async beginRoomOperation(input: {
@@ -407,7 +410,23 @@ class ActionPublisher {
       actorId,
       actorEmail,
       actorNote,
+      decisionReason,
     } = executionContext;
+
+    // Resolve the action user once and reuse it for both `creator` and the
+    // strike total. Only needed when a CUSTOM_ACTION webhook will carry them.
+    const hasWebhook = triggeredActions.some(
+      (it) => it.action.actionType === ActionType.CUSTOM_ACTION,
+    );
+    const { user: actionUser, isDirect: isDirectUser } = hasWebhook
+      ? await this.resolveActionUser(orgId, targetItem)
+      : { user: undefined, isDirect: false };
+    const userStrikeCount = await this.getUserStrikeCountForWebhook(
+      orgId,
+      actionUser,
+      isDirectUser,
+      triggeredActions,
+    );
 
     // Apply user strikes from the actions that were triggered.
     // we do this without awaiting to not block the action publishing
@@ -475,6 +494,9 @@ class ActionPublisher {
                   (action.name.startsWith('concord_')
                     ? executionContext.decisionReason
                     : undefined),
+                decisionReason,
+                userStrikeCount,
+                actionUser,
                 actorId,
               );
             },
@@ -520,9 +542,7 @@ class ActionPublisher {
                 // Audit-trail context: persist what the moderator supplied
                 // alongside the action itself so reviewers can see why and
                 // with what values it ran (PR 3 for #377).
-                parameterValues: customMrtApiParamDecisionPayload as
-                  | Record<string, unknown>
-                  | undefined,
+                parameterValues: customMrtApiParamDecisionPayload,
                 actorNote,
               },
             ],
@@ -542,6 +562,80 @@ class ActionPublisher {
     ]);
   }
 
+  /**
+   * Resolves the user a webhook action concerns, once per batch. `isDirect` is
+   * true when the target resolves the way the strike service resolves it (USER
+   * target or a full submission's creator); for identifier-only CONTENT we fall
+   * back to fetching the latest submission's creator (`isDirect` false).
+   * Best-effort: a failed fetch yields no user rather than throwing.
+   */
+  private async resolveActionUser(
+    orgId: string,
+    targetItem: ActionTargetItem,
+  ): Promise<{ user: ItemIdentifier | undefined; isDirect: boolean }> {
+    const directUser = getUserFromActionTargetItem(targetItem);
+    if (directUser) {
+      return { user: directUser, isDirect: true };
+    }
+    if (targetItem.itemType.kind !== 'CONTENT') {
+      return { user: undefined, isDirect: false };
+    }
+    if (isFullSubmission(targetItem)) {
+      return { user: targetItem.creator, isDirect: false };
+    }
+    try {
+      const submission = (
+        await this.itemInvestigationService.getItemByIdentifier({
+          orgId,
+          itemIdentifier: {
+            id: targetItem.itemId,
+            typeId: targetItem.itemType.id,
+          },
+          latestSubmissionOnly: true,
+        })
+      )?.latestSubmission;
+      return { user: submission?.creator, isDirect: false };
+    } catch {
+      return { user: undefined, isDirect: false };
+    }
+  }
+
+  /**
+   * The user's cumulative strike total after this event (current total + strikes
+   * this event applies), for CUSTOM_ACTION webhooks. The applied delta is only
+   * added when the user resolved directly (`isDirect`) — i.e. when the strike
+   * service actually applies a strike. Best-effort; undefined when unresolvable.
+   */
+  private async getUserStrikeCountForWebhook<
+    T extends ActionExecutionCorrelationId,
+  >(
+    orgId: string,
+    user: ItemIdentifier | undefined,
+    isDirect: boolean,
+    triggeredActions: Omit<
+      Omit<ActionExecutionData<T>, 'action'> & { action: Action },
+      'orgId' | 'correlationId' | 'targetItem'
+    >[],
+  ): Promise<number | undefined> {
+    if (!user) {
+      return undefined;
+    }
+    try {
+      const currentTotal = await this.userStrikeService.getUserStrikeValue(
+        orgId,
+        user,
+      );
+      const appliedStrikes = isDirect
+        ? (this.userStrikeService.findMostSeverePolicyViolationFromActions(
+            triggeredActions,
+          )?.userStrikeCount ?? 0)
+        : 0;
+      return currentTotal + appliedStrikes;
+    } catch {
+      return undefined;
+    }
+  }
+
   async publishAction(
     orgId: string,
     action: Action,
@@ -558,6 +652,9 @@ class ActionPublisher {
       string | boolean | unknown
     >,
     actorNote?: string,
+    decisionReason?: string,
+    userStrikeCount?: number,
+    creator?: ItemIdentifier,
     actorId?: string,
   ): Promise<boolean | MemberDeliveryOutcome> {
     return this.tracer.addActiveSpan(
@@ -582,6 +679,50 @@ class ActionPublisher {
               latestSubmissionOnly: true,
             })
           )?.latestSubmission;
+        };
+
+        // USER target with no record: synthesize a minimal submission from
+        // the id. Returns undefined for non-USER targets — MRT needs the
+        // real content submission, so it must fail loudly for CONTENT.
+        const getFullItemOrSyntheticUserForUserTarget = async () => {
+          const fullItem = await getFullItem();
+          if (fullItem) {
+            return fullItem;
+          }
+          if (targetItem.itemType.kind !== 'USER') {
+            return undefined;
+          }
+          const userItemType = await this.getItemTypeEventuallyConsistent({
+            orgId,
+            typeSelector: { id: targetItem.itemType.id },
+          });
+          if (!userItemType || userItemType.kind !== 'USER') {
+            return undefined;
+          }
+          return makeSyntheticUserSubmission(targetItem.itemId, userItemType);
+        };
+
+        // NCMEC fallback: USER target → synthetic user (as above); CONTENT
+        // target → resolve the creator via ACTION_EXECUTIONS and synthesize a
+        // user submission keyed on the creator id. THREAD has no single
+        // owner, so we refuse.
+        const getFullItemOrSyntheticUserForNcmec = async () => {
+          const userTarget = await getFullItemOrSyntheticUserForUserTarget();
+          if (userTarget) {
+            return userTarget;
+          }
+          if (targetItem.itemType.kind !== 'CONTENT') {
+            return undefined;
+          }
+          const inferred =
+            await this.itemInvestigationService.synthesizeUserItemFromContentTarget(
+              {
+                orgId,
+                itemId: targetItem.itemId,
+                itemTypeId: targetItem.itemType.id,
+              },
+            );
+          return inferred?.latestSubmission;
         };
         const actionSource = getSourceType(
           correlationId,
@@ -735,6 +876,13 @@ class ActionPublisher {
                 // can't collide with a user-defined parameter named
                 // `actorNote`. Omitted from the body entirely when absent.
                 ...(actorNote !== undefined ? { actorNote } : {}),
+                ...(creator !== undefined ? { creator } : {}),
+                // The moderator's decision reason, top-level for the same
+                // collision-safety reason as `actorNote`. Omitted when absent.
+                ...(decisionReason !== undefined ? { decisionReason } : {}),
+                // The user's cumulative strike total after this event. Omitted
+                // when there's no resolvable user.
+                ...(userStrikeCount !== undefined ? { userStrikeCount } : {}),
               };
 
               const response = await this.fetchHTTP({
@@ -770,11 +918,14 @@ class ActionPublisher {
               }
 
               return true;
-            case ActionType.ENQUEUE_TO_MRT:
-              const fullItemForMrt = await getFullItem();
+            case ActionType.ENQUEUE_TO_MRT: {
+              const fullItemForMrt =
+                await getFullItemOrSyntheticUserForUserTarget();
               if (!fullItemForMrt) {
                 throw new Error(
-                  "Actions without full item submissions can't be enqueued to MRT yet",
+                  `Cannot enqueue to MRT: no submission record for ${targetItem.itemType.kind} ` +
+                    `item ${targetItem.itemId} (type ${targetItem.itemType.id}). ` +
+                    `POST the item to the items endpoint first.`,
                 );
               }
 
@@ -811,11 +962,15 @@ class ActionPublisher {
               });
 
               return true;
-            case ActionType.ENQUEUE_TO_NCMEC:
-              const fullItemForNcmec = await getFullItem();
+            }
+            case ActionType.ENQUEUE_TO_NCMEC: {
+              const fullItemForNcmec =
+                await getFullItemOrSyntheticUserForNcmec();
               if (!fullItemForNcmec) {
                 throw new Error(
-                  "Actions without full item submissions can't be enqueued to NCMEC yet",
+                  `Cannot enqueue to NCMEC: no submission record for ${targetItem.itemType.kind} ` +
+                    `item ${targetItem.itemId} (type ${targetItem.itemType.id}). ` +
+                    `POST the item to the items endpoint first.`,
                 );
               }
 
@@ -844,6 +999,7 @@ class ActionPublisher {
               });
 
               return true;
+            }
             case ActionType.ENQUEUE_AUTHOR_TO_MRT:
               const fullItemForAuthor = await getFullItem();
               if (
@@ -954,6 +1110,23 @@ class ActionPublisher {
           }
         } catch (e) {
           span.recordException(e as Exception);
+          // Log to stderr so operators see action failures without having
+          // to pull traces. Identifiers only, no item `data`.
+          // eslint-disable-next-line no-console
+          console.error(
+            jsonStringify({
+              event: 'actionPublisher.publishAction.failed',
+              orgId,
+              actionId: action.id,
+              actionName: action.name,
+              actionType: action.actionType,
+              itemId: targetItem.itemId,
+              itemTypeId: targetItem.itemType.id,
+              itemTypeKind: targetItem.itemType.kind,
+              correlationId,
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          );
           return false;
         }
       },
@@ -971,6 +1144,7 @@ export default inject(
     'NcmecService',
     'ItemInvestigationService',
     'UserStrikeService',
+    'getItemTypeEventuallyConsistent',
     'UserAPIDataSource',
     'KyselyPg',
   ],

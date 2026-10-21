@@ -1,5 +1,6 @@
 import { type Kysely } from 'kysely';
 
+import { makeKyselyTransactionWithRetry } from '../../utils/kyselyTransactionWithRetry.js';
 import {
   claimManualRoomOperation,
   lockRoomExecution,
@@ -104,7 +105,7 @@ async function deliverRemoval(
         throw error;
       // A 404 is not cancellation. The sole permitted resend retains the exact
       // receipt identity and fingerprint, and never resets bridge delivery state.
-      await pg.transaction().execute(async (tx) => {
+      await makeKyselyTransactionWithRetry(pg)(async (tx) => {
         await lockRoomExecution(tx, input.orgId, executionId);
         const current = await tx
           .selectFrom('concord_integration.room_manual_operations')

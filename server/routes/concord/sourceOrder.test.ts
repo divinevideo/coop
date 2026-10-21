@@ -1,4 +1,7 @@
-import { UserRole } from '../../models/types/permissioning.js';
+import {
+  getPermissionsForRole,
+  UserRole,
+} from '../../services/userManagementService/index.js';
 import {
   isSourceOrderedRoomOperationId,
   object,
@@ -35,6 +38,9 @@ const config = {
 const actor = {
   id: 'staff',
   orgId: 'org',
+  getPermissions() {
+    return getPermissionsForRole(this.role);
+  },
   role: UserRole.ADMIN,
   approvedByAdmin: true,
   rejectedByAdmin: false,
