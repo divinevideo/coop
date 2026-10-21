@@ -8,11 +8,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write  # Required for OIDC i.e. publish package
+  id-token: write # Required for OIDC i.e. publish package
   contents: read
 
 jobs:
   publish:
+    if: ${{ github.repository == 'roostorg/coop' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -30,7 +31,7 @@ jobs:
           cd types
           VERSION=$(node -p "require('./package.json').version")
           echo "Checking @roostorg/types@$VERSION..."
-          
+
           if npm view "@roostorg/types@$VERSION" version >/dev/null 2>&1; then
             echo "⚠️  Version $VERSION of @roostorg/types already exists on npm - skipping"
           else

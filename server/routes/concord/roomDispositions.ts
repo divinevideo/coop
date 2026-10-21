@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { type Kysely } from 'kysely';
 
-import { UserRole } from '../../models/types/permissioning.js';
+import { UserRole } from '../../services/userManagementService/index.js';
+import { makeKyselyTransactionWithRetry } from '../../utils/kyselyTransactionWithRetry.js';
 import { lockRoomExecution } from './manualRoomOperations.js';
 import {
   type MemberIntentDependencies,
@@ -128,7 +129,7 @@ async function appendDisposition(
   },
 ): Promise<RoomExecutionDisposition> {
   if (!UUID.test(input.executionId)) throw new Error('Invalid room execution');
-  return pg.transaction().execute(async (tx) => {
+  return makeKyselyTransactionWithRetry(pg)(async (tx) => {
     await lockRoomExecution(tx, input.orgId, input.executionId);
     const facts = await executionFacts(tx, input.orgId, input.executionId);
     const current = await getRoomExecutionDisposition(

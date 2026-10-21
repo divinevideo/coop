@@ -1,7 +1,10 @@
 import ActionAPI from './ActionApi.js';
 
 type ActionAPICtor = new (
-  actionPublisher: { publishActions: jest.Mock; recordManualRoomIntent: jest.Mock },
+  actionPublisher: {
+    publishActions: jest.Mock;
+    recordManualRoomIntent: jest.Mock;
+  },
   moderationConfigService: {
     getActions: jest.Mock;
     getPoliciesByIds: jest.Mock;

@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 
-import { UserRole } from '../models/types/permissioning.js';
 import {
   prepareMemberIntent,
   type PreparedMemberIntent,
@@ -10,6 +9,10 @@ import {
   type RoomDecisionInput,
   type RoomStatus,
 } from '../routes/concord/service.js';
+import {
+  getPermissionsForRole,
+  UserRole,
+} from '../services/userManagementService/index.js';
 
 export const config = {
   origin: 'https://moderation.example',
@@ -23,6 +26,9 @@ export const config = {
 export const actor = {
   id: 'synthetic-staff',
   orgId: config.orgId,
+  getPermissions() {
+    return getPermissionsForRole(this.role);
+  },
   role: UserRole.ADMIN,
   approvedByAdmin: true,
   rejectedByAdmin: false,

@@ -88,10 +88,10 @@ export function roomActionFixture(
     {} as never,
     investigation as never,
     { applyUserStrikeFromPublishedActions: async () => {} } as never,
+    (async () => undefined),
     {
       getGraphQLUserFromId: async () => ({
         ...actor,
-        getPermissions: () => [],
       }),
     } as never,
     pgQuery,
@@ -218,7 +218,7 @@ export async function withRoomTestEnvironment(run: () => Promise<void>) {
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) Reflect.deleteProperty(process.env, key);
-      // eslint-disable-next-line functional/immutable-data -- Restore scoped test configuration.
+       
       else process.env[key] = value;
     }
   }

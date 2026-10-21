@@ -1,19 +1,15 @@
 /* eslint-disable max-lines */
 
-import { type ItemIdentifier } from '@roostorg/types';
+import { type ItemIdentifier } from '@roostorg/coop-types';
 import { Queue, Worker, type Job } from 'bullmq';
 import { type Cluster } from 'ioredis';
 import type IORedis from 'ioredis';
-import { type Kysely, type Transaction } from 'kysely';
+import { sql, type Kysely, type Transaction } from 'kysely';
 import pLimit from 'p-limit';
 import { type Opaque, type ReadonlyDeep } from 'type-fest';
 import { v1 as uuidv1 } from 'uuid';
 
 import { type Dependencies } from '../../../iocContainer/index.js';
-import {
-  UserPermission,
-  type Invoker,
-} from '../../../models/types/permissioning.js';
 import { type MemberIntentPg } from '../../../routes/concord/memberIntentTypes.js';
 import { roomJobQueueComplete } from '../../../routes/concord/roomDispositions.js';
 import { cached, type Cached } from '../../../utils/caching.js';
@@ -30,6 +26,10 @@ import {
   type ErrorInstanceData,
 } from '../../../utils/errors.js';
 import { isUniqueViolationError } from '../../../utils/kysely.js';
+import {
+  makeKyselyTransactionWithRetry,
+  type KyselyTransactionWithRetry,
+} from '../../../utils/kyselyTransactionWithRetry.js';
 import { removeUndefinedKeys, safePick } from '../../../utils/misc.js';
 import { replaceEmptyStringWithNull } from '../../../utils/string.js';
 import { WEEK_MS } from '../../../utils/time.js';
@@ -42,7 +42,15 @@ import {
   makeSubmissionId,
 } from '../../itemProcessingService/index.js';
 import { type ItemSubmissionWithTypeIdentifier } from '../../itemProcessingService/makeItemSubmissionWithTypeIdentifier.js';
-import { type ManualReviewToolServicePg } from '../dbTypes.js';
+import {
+  UserPermission,
+  type Invoker,
+} from '../../userManagementService/index.js';
+import {
+  type ClearReportsDisposition,
+  type ClearReportsScope,
+  type ManualReviewToolServicePg,
+} from '../dbTypes.js';
 import {
   type AppealEnqueueSourceInfo,
   type JobId,
@@ -65,6 +73,9 @@ export type ManualReviewQueue = {
   isDefaultQueue: boolean;
   isAppealsQueue: boolean;
   autoCloseJobs: boolean;
+  // Null disposition disables "clear other reports for this user" (issue #650).
+  clearReportsDisposition: ClearReportsDisposition | null;
+  clearReportsScope: ClearReportsScope;
 };
 
 const PgQueueSelection = [
@@ -76,6 +87,8 @@ const PgQueueSelection = [
   'created_at as createdAt',
   'is_appeals_queue as isAppealsQueue',
   'auto_close_jobs as autoCloseJobs',
+  'clear_reports_disposition as clearReportsDisposition',
+  'clear_reports_scope as clearReportsScope',
 ] as const;
 
 // BullJobId represents the ID we give a job within Bull. It's only unique among
@@ -93,7 +106,8 @@ export type ManualReviewQueueErrorType = 'ManualReviewQueueNameExistsError';
 export type QueueOperationsErrorType =
   | 'DeleteAllJobsUnauthorizedError'
   | 'QueueDoesNotExistError'
-  | 'UnableToDeleteDefaultQueueError';
+  | 'UnableToDeleteDefaultQueueError'
+  | 'AccessibleQueueNotInOrgError';
 
 // Compound identifier for a queue. orgId is needed for security, but also
 // because queues are/will be actually sharded across redis instances for
@@ -143,6 +157,7 @@ export default class QueueOperations {
   private readonly getBullAppealWorker: Cached<
     Bind1<typeof getBullWorker<ManualReviewAppealJob>>
   >;
+  private readonly transactionWithRetry: KyselyTransactionWithRetry<ManualReviewToolServicePg>;
 
   constructor(
     private readonly pgQuery: Kysely<ManualReviewToolServicePg>,
@@ -150,6 +165,7 @@ export default class QueueOperations {
     private readonly moderationConfigService: Dependencies['ModerationConfigService'],
     redis: RedisConnection,
   ) {
+    this.transactionWithRetry = makeKyselyTransactionWithRetry(this.pgQuery);
     // Reassingment here is a hack to work around TS syntax limitations
     // with generic instantiation expressions.
     const getOrCreateBullQueue_ = getOrCreateBullQueue<StoredManualReviewJob>;
@@ -228,6 +244,9 @@ export default class QueueOperations {
     invokedBy: Invoker;
     isAppealsQueue?: boolean;
     autoCloseJobs?: boolean;
+    clearReportsDisposition?: ClearReportsDisposition | null;
+    clearReportsScope?: ClearReportsScope;
+    clearReportsTriggerActionIds?: readonly string[];
   }) {
     const {
       name,
@@ -237,6 +256,9 @@ export default class QueueOperations {
       invokedBy,
       isAppealsQueue,
       autoCloseJobs,
+      clearReportsDisposition,
+      clearReportsScope,
+      clearReportsTriggerActionIds,
     } = input;
     const { orgId } = invokedBy;
 
@@ -247,8 +269,13 @@ export default class QueueOperations {
       );
     }
 
+    // Defense-in-depth org-scoping: every user granted access to the new
+    // queue must belong to the caller's org. The queue itself is always
+    // created in the caller's org (orgId from the invoker).
+    await assertUsersInOrg(this.pgQuery, { orgId, userIds });
+
     try {
-      return await this.pgQuery.transaction().execute(async (transaction) => {
+      return await this.transactionWithRetry(async (transaction) => {
         // In newer versions of kysely, this is greatly simplified with
         // `transaction.selectNoFrom(eb => eb.exists(...))`, but we're blocked on
         // updating by https://github.com/kysely-org/kysely/issues/577#issuecomment-1804900006
@@ -272,6 +299,8 @@ export default class QueueOperations {
               description: replaceEmptyStringWithNull(description),
               is_appeals_queue: isAppealsQueue ?? false,
               auto_close_jobs: autoCloseJobs ?? false,
+              clear_reports_disposition: clearReportsDisposition ?? null,
+              clear_reports_scope: clearReportsScope ?? 'CURRENT_QUEUE',
             },
           ])
           .executeTakeFirstOrThrow();
@@ -293,6 +322,12 @@ export default class QueueOperations {
           actionIdsToUnhide: [],
           orgId,
         });
+        await this.setClearReportsTriggerActionsForQueue({
+          transaction,
+          queueId: queue.id,
+          orgId,
+          actionIds: clearReportsTriggerActionIds ?? [],
+        });
         return queue;
       });
     } catch (e) {
@@ -312,6 +347,10 @@ export default class QueueOperations {
     actionIdsToHide: readonly string[];
     actionIdsToUnhide: readonly string[];
     autoCloseJobs?: boolean;
+    clearReportsDisposition?: ClearReportsDisposition | null;
+    clearReportsScope?: ClearReportsScope;
+    // When provided, replaces the queue's full set of trigger actions.
+    clearReportsTriggerActionIds?: readonly string[];
   }) {
     const {
       queueId,
@@ -322,9 +361,22 @@ export default class QueueOperations {
       actionIdsToHide,
       actionIdsToUnhide,
       autoCloseJobs,
+      clearReportsDisposition,
+      clearReportsScope,
+      clearReportsTriggerActionIds,
     } = input;
 
-    return this.pgQuery.transaction().execute(async (transaction) => {
+    // Defense-in-depth org-scoping: the target queue and every user granted
+    // access must belong to the caller's org. Reject before any write so a
+    // cross-org queueId or userId can't mutate users_and_accessible_queues
+    // rows belonging to another org.
+    await assertUsersAndQueuesInOrg(this.pgQuery, {
+      orgId,
+      userIds,
+      queueIds: [queueId],
+    });
+
+    return this.transactionWithRetry(async (transaction) => {
       const [updatedQueue, _, __] = await Promise.all([
         transaction
           .updateTable('manual_review_tool.manual_review_queues')
@@ -333,6 +385,9 @@ export default class QueueOperations {
               name,
               description: replaceEmptyStringWithNull(description),
               auto_close_jobs: autoCloseJobs,
+              // null disables the feature and must survive removeUndefinedKeys.
+              clear_reports_disposition: clearReportsDisposition,
+              clear_reports_scope: clearReportsScope,
             }),
           )
           .where('id', '=', queueId)
@@ -363,6 +418,14 @@ export default class QueueOperations {
         actionIdsToHide,
         actionIdsToUnhide,
       });
+      if (clearReportsTriggerActionIds !== undefined) {
+        await this.setClearReportsTriggerActionsForQueue({
+          transaction,
+          queueId,
+          orgId,
+          actionIds: clearReportsTriggerActionIds,
+        });
+      }
       return updatedQueue;
     });
   }
@@ -381,21 +444,31 @@ export default class QueueOperations {
 
     await queue.obliterate({ force: true });
 
-    const [{ numDeletedRows }, _] = await this.pgQuery
-      .transaction()
-      .execute(async (transaction) => {
-        return Promise.all([
-          transaction
-            .deleteFrom('manual_review_tool.manual_review_queues')
-            .where('id', '=', queueId)
-            .where('org_id', '=', orgId)
-            .executeTakeFirstOrThrow(),
-          transaction
-            .deleteFrom('manual_review_tool.users_and_accessible_queues')
-            .where('queue_id', '=', queueId)
-            .execute(),
-        ]);
-      });
+    const numDeletedRows = await this.transactionWithRetry(
+      async (transaction) => {
+        // Delete the queue scoped by org first. If it doesn't belong to the
+        // caller's org, no rows are touched and we bail before deleting any
+        // join rows. `users_and_accessible_queues` has no `org_id` column,
+        // so an unscoped delete would otherwise wipe another org's access
+        // rows when the parent delete matches 0 rows.
+        const queueDelete = await transaction
+          .deleteFrom('manual_review_tool.manual_review_queues')
+          .where('id', '=', queueId)
+          .where('org_id', '=', orgId)
+          .executeTakeFirst();
+
+        if (queueDelete.numDeletedRows === 0n) {
+          return 0n;
+        }
+
+        await transaction
+          .deleteFrom('manual_review_tool.users_and_accessible_queues')
+          .where('queue_id', '=', queueId)
+          .execute();
+
+        return queueDelete.numDeletedRows;
+      },
+    );
 
     return numDeletedRows === 1n;
   }
@@ -408,21 +481,28 @@ export default class QueueOperations {
 
     await queue.obliterate({ force: true });
 
-    const [{ numDeletedRows }, _] = await this.pgQuery
-      .transaction()
-      .execute(async (transaction) => {
-        return Promise.all([
-          transaction
-            .deleteFrom('manual_review_tool.manual_review_queues')
-            .where('id', '=', queueId)
-            .where('org_id', '=', orgId)
-            .executeTakeFirstOrThrow(),
-          transaction
-            .deleteFrom('manual_review_tool.users_and_accessible_queues')
-            .where('queue_id', '=', queueId)
-            .execute(),
-        ]);
-      });
+    // See `deleteManualReviewQueue` for why this is serialized + ownership-
+    // checked. Same pattern, just without the default-queue guard.
+    const numDeletedRows = await this.transactionWithRetry(
+      async (transaction) => {
+        const queueDelete = await transaction
+          .deleteFrom('manual_review_tool.manual_review_queues')
+          .where('id', '=', queueId)
+          .where('org_id', '=', orgId)
+          .executeTakeFirst();
+
+        if (queueDelete.numDeletedRows === 0n) {
+          return 0n;
+        }
+
+        await transaction
+          .deleteFrom('manual_review_tool.users_and_accessible_queues')
+          .where('queue_id', '=', queueId)
+          .execute();
+
+        return queueDelete.numDeletedRows;
+      },
+    );
 
     return numDeletedRows === 1n;
   }
@@ -521,6 +601,8 @@ export default class QueueOperations {
         'queues.created_at as createdAt',
         'queues.is_appeals_queue as isAppealsQueue',
         'queues.auto_close_jobs as autoCloseJobs',
+        'queues.clear_reports_disposition as clearReportsDisposition',
+        'queues.clear_reports_scope as clearReportsScope',
       ])
       .where('favorite_queues.user_id', '=', userId)
       .where('favorite_queues.org_id', '=', orgId)
@@ -591,10 +673,18 @@ export default class QueueOperations {
       .execute();
   }
 
-  async addAccessibleQueuesForUser(
-    userIds: string[],
-    queueIds: readonly string[],
-  ) {
+  async addAccessibleQueuesForUser(opts: {
+    orgId: string;
+    userIds: readonly string[];
+    queueIds: readonly string[];
+  }) {
+    const { orgId, userIds, queueIds } = opts;
+    await assertUsersAndQueuesInOrg(this.pgQuery, {
+      orgId,
+      userIds,
+      queueIds,
+    });
+
     return this.pgQuery
       .insertInto('manual_review_tool.users_and_accessible_queues')
       .values(
@@ -606,10 +696,18 @@ export default class QueueOperations {
       .execute();
   }
 
-  async removeAccessibleQueuesForUser(
-    userId: string,
-    queueIds: readonly string[],
-  ) {
+  async removeAccessibleQueuesForUser(opts: {
+    orgId: string;
+    userId: string;
+    queueIds: readonly string[];
+  }) {
+    const { orgId, userId, queueIds } = opts;
+    await assertUsersAndQueuesInOrg(this.pgQuery, {
+      orgId,
+      userIds: [userId],
+      queueIds,
+    });
+
     return this.pgQuery
       .deleteFrom('manual_review_tool.users_and_accessible_queues')
       .where('user_id', '=', userId)
@@ -824,13 +922,251 @@ export default class QueueOperations {
     const queue = await this.#getBullQueue(orgId, queueId);
     const { bullId } = parseExternalId(jobId);
     const job = await queue.getJob(bullId);
-    await job?.updateData(data);
+    // updateData is unlocked; abort if the slot was already taken over by
+    // a new job for the same item (different external id) so we don't
+    // clobber a reviewer's in-flight decision payload.
+    if (!job || job.data.id !== jobId) {
+      return undefined;
+    }
+    await job.updateData(data);
 
     // Because the `data` arg above is a ManualReviewJob, we know the stored
     // data for this particular job won't be in the legacy format.
-    return job?.data satisfies StoredManualReviewJob | undefined as
-      | ManualReviewJob
-      | undefined;
+    return job.data satisfies StoredManualReviewJob as ManualReviewJob;
+  }
+
+  /**
+   * Yields every undecided job on a queue (waiting, delayed, or active) for
+   * bounded admin sweeps such as reporter invalidation. Includes `active`
+   * jobs so sweeps can update what a reviewer currently has dequeued;
+   * excludes terminal states (completed/failed). `maxJobs` caps a single
+   * sweep so it can't pin Redis indefinitely.
+   *
+   * Iterates in two phases: first snapshots all external JobIds (bounded
+   * by `maxJobs`), then fetches each by id and yields it. This keeps the
+   * iterator safe when callers delete or update jobs mid-traversal, which
+   * index-based pagination over a mutating list would not.
+   */
+  async *iteratePendingJobsForQueue(opts: {
+    orgId: string;
+    queueId: string;
+    batchSize?: number;
+    maxJobs?: number;
+    // Set `truncated` when the queue exceeded `maxJobs`.
+    progress?: { truncated: boolean };
+  }): AsyncIterable<ManualReviewJob> {
+    const { orgId, queueId } = opts;
+    const batchSize = Math.max(1, Math.min(opts.batchSize ?? 200, 500));
+    const maxJobs = Math.max(0, opts.maxJobs ?? 10_000);
+
+    const queue = await this.#getBullQueue(orgId, queueId);
+
+    const snapshotIds: JobId[] = [];
+    let start = 0;
+    while (snapshotIds.length < maxJobs) {
+      const end = start + batchSize - 1;
+      const legacyJobs = await queue.getJobs(
+        ['waiting', 'delayed', 'active'],
+        start,
+        end,
+      );
+      if (legacyJobs.length === 0) {
+        break;
+      }
+      for (const legacy of legacyJobs) {
+        if (snapshotIds.length >= maxJobs) {
+          break;
+        }
+        const id = legacy?.data?.id;
+        if (id != null) {
+          snapshotIds.push(id);
+        }
+      }
+      if (legacyJobs.length < batchSize) {
+        break;
+      }
+      start += batchSize;
+    }
+
+    if (opts.progress != null) {
+      opts.progress.truncated = snapshotIds.length >= maxJobs;
+    }
+
+    for (const jobId of snapshotIds) {
+      // `getJobs` re-reads each job and converts to the current format. If
+      // the job was decided / removed between snapshot and now, the result
+      // is empty and we silently skip it.
+      const jobs = await this.getJobs({ orgId, queueId, jobIds: [jobId] });
+      if (jobs.length > 0) {
+        yield jobs[0];
+      }
+    }
+  }
+
+  /**
+   * Looks up a pending job by its external JobId without requiring a
+   * queueId. Fast path via `job_creations`; falls back to a per-queue
+   * Bull lookup (keyed on the derived BullJobId) for jobs whose
+   * `job_creations` row never landed.
+   *
+   * NB: the fallback path is O(non-appeal queues) Redis round-trips per
+   * call. Acceptable for admin-triggered actions (button click) but do
+   * not call from hot paths.
+   *
+   * Returns undefined when the job is no longer pending, or when the
+   * external id is malformed (admin pasted a stale / wrong id).
+   */
+  async findPendingJobByJobId(opts: {
+    orgId: string;
+    jobId: JobId;
+  }): Promise<{ job: ManualReviewJob; queueId: string } | undefined> {
+    const { orgId, jobId } = opts;
+    // External JobIds are `<b64url(bullId)>:<b64url(guid)>`. Reject
+    // anything that doesn't parse so we don't blow up the per-queue
+    // fallback below for stale / typo'd ids.
+    if (!isParsableExternalId(jobId)) {
+      return undefined;
+    }
+    const row = await this.pgQuery
+      .selectFrom('manual_review_tool.job_creations')
+      .select(['queue_id'])
+      .where('org_id', '=', orgId)
+      .where('id', '=', jobId)
+      .executeTakeFirst();
+    if (row) {
+      const jobs = await this.getJobs({
+        orgId,
+        queueId: row.queue_id,
+        jobIds: [jobId],
+      });
+      if (jobs.length > 0) {
+        return { job: jobs[0], queueId: row.queue_id };
+      }
+    }
+    const queues =
+      await this.getAllQueuesForOrgAndDangerouslyBypassPermissioning(orgId);
+    for (const queue of queues) {
+      if (queue.isAppealsQueue) {
+        continue;
+      }
+      const jobs = await this.getJobs({
+        orgId,
+        queueId: queue.id,
+        jobIds: [jobId],
+      });
+      if (jobs.length > 0) {
+        return { job: jobs[0], queueId: queue.id };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Removes a pending job from a queue by its external JobId without
+   * requiring a lock token. Used by admin-triggered bulk maintenance
+   * (e.g. invalidating reports from a reporter).
+   *
+   * Returns true if the job was removed, false if it was already gone.
+   * The Bull-internal `BullJobId` is derived from the external JobId, and
+   * we verify `job.data.id === externalId` before removal so a stale
+   * lookup that finds a *different* job for the same item is a no-op.
+   */
+  async removeJobByJobIdUnsafe(opts: {
+    orgId: string;
+    queueId: string;
+    jobId: JobId;
+  }): Promise<boolean> {
+    const { orgId, queueId, jobId } = opts;
+    const queue = await this.getOrCreateBullQueue({ orgId, queueId });
+    const bullJobId = parseExternalId(jobId).bullId;
+
+    const job = await queue.getJob(bullJobId);
+    if (!job || job.data.id !== jobId) {
+      return false;
+    }
+    // Bull's `remove` throws when the job is currently locked by a worker;
+    // we want callers to fall back to scrub-in-place in that case. Other
+    // errors (e.g. Redis transient failures) must propagate so the caller
+    // doesn't conflate them with "already gone".
+    try {
+      const status = await queue.remove(bullJobId);
+      return status === 1;
+    } catch (err: unknown) {
+      if (isJobLockedError(err)) {
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Removes a pending job. Tries an unlocked `remove`; if the job is
+   * locked, atomically completes it with `invokerUserId` as the lock
+   * token (per the `lockToken === userId` convention) so a reviewer
+   * deleting a job they themselves dequeued succeeds without stealing
+   * another reviewer's lock. Returns `false` on token mismatch so
+   * callers can fall back to scrubbing.
+   */
+  async #recordedRoomJobCanBeRemoved(orgId: string, jobId: JobId) {
+    const decision = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .select(['job_payload', 'decision_components', 'related_actions'])
+      .where('org_id', '=', orgId)
+      .where('id', '=', jobIdToGuid(jobId))
+      .executeTakeFirst();
+    if (decision?.job_payload.roomDeliveryRequired !== true) return true;
+    return roomJobQueueComplete(
+      this.pgQuery as unknown as Kysely<MemberIntentPg>,
+      orgId,
+      `mrt-decision:${jobId}`,
+      decision.decision_components.reduce(
+        (count, part) =>
+          count + (part.type === 'CUSTOM_ACTION' ? part.actions.length : 0),
+        0,
+      ) +
+        decision.related_actions.reduce(
+          (count, part) => count + part.actionIds.length * part.itemIds.length,
+          0,
+        ),
+    );
+  }
+
+  async removeJobAllowingInvokerLock(opts: {
+    orgId: string;
+    queueId: string;
+    jobId: JobId;
+    invokerUserId: string;
+  }): Promise<boolean> {
+    const { orgId, queueId, jobId, invokerUserId } = opts;
+    if (!(await this.#recordedRoomJobCanBeRemoved(orgId, jobId))) return false;
+    const queue = await this.getOrCreateBullQueue({ orgId, queueId });
+    const { bullId: bullJobId } = parseExternalId(jobId);
+    const job = await queue.getJob(bullJobId);
+    if (!job || job.data.id !== jobId) {
+      return false;
+    }
+
+    try {
+      const status = await queue.remove(bullJobId);
+      if (status === 1) {
+        return true;
+      }
+    } catch (err: unknown) {
+      if (!isJobLockedError(err)) {
+        throw err;
+      }
+      // Locked: fall through to the token-validated path.
+    }
+
+    try {
+      await job.moveToCompleted(null, invokerUserId, false);
+      return true;
+    } catch {
+      // Lock token mismatch (different user) or the job's state moved
+      // between getJob and moveToCompleted. Either way, caller should
+      // scrub.
+      return false;
+    }
   }
 
   async deleteAllJobsFromQueue(opts: {
@@ -839,11 +1175,28 @@ export default class QueueOperations {
     userPermissions: readonly UserPermission[];
   }) {
     const { orgId, queueId, userPermissions } = opts;
-    if (!userPermissions.includes(UserPermission.EDIT_MRT_QUEUES)) {
+    // Admin-only (MANAGE_ORG). `obliterate` wipes pending payloads from
+    // Redis irreversibly; recovery is via `server/bin/recover-mrt-queue.ts`.
+    if (!userPermissions.includes(UserPermission.MANAGE_ORG)) {
       throw makeDeleteAllJobsInsufficientPermissionsError({
         shouldErrorSpan: true,
       });
     }
+
+    // Bulk removal has no per-execution settlement/stop consent. Refuse queues
+    // with recorded room delivery; supported recovery completes jobs individually.
+    const roomDecision = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .select('id')
+      .where('org_id', '=', orgId)
+      .where('queue_id', '=', queueId)
+      .where(sql<boolean>`job_payload->>'roomDeliveryRequired' = 'true'`)
+      .limit(1)
+      .executeTakeFirst();
+    if (roomDecision)
+      throw new Error(
+        'Room queue requires per-execution settlement or audited stop',
+      );
 
     const queue = await this.#getBullQueue(orgId, queueId);
     await queue.obliterate({ force: true });
@@ -1215,6 +1568,10 @@ export default class QueueOperations {
     jobId: JobId;
     lockToken: string;
   }) {
+    if (!(await this.#recordedRoomJobCanBeRemoved(opts.orgId, opts.jobId)))
+      throw new Error(
+        'Room execution requires durable settlement or audited stop',
+      );
     try {
       await this.#markLockedJobCompleted(opts);
     } catch (error: unknown) {
@@ -1442,6 +1799,57 @@ export default class QueueOperations {
         .execute();
     }
   }
+
+  // Action IDs whose use triggers the clear-other-reports sweep (issue #650).
+  async getClearReportsTriggerActionsForQueue(opts: {
+    queueId: string;
+    orgId: string;
+  }): Promise<string[]> {
+    const { queueId, orgId } = opts;
+    return (
+      await this.pgQuery
+        .selectFrom(
+          'manual_review_tool.queues_and_clear_reports_trigger_actions',
+        )
+        .select(['action_id'])
+        .where('queue_id', '=', queueId)
+        .where('org_id', '=', orgId)
+        .execute()
+    ).map((it) => it.action_id);
+  }
+
+  // Replaces the queue's trigger actions with `actionIds` (pass [] to clear).
+  async setClearReportsTriggerActionsForQueue(opts: {
+    queueId: string;
+    orgId: string;
+    actionIds: readonly string[];
+    transaction?: Transaction<ManualReviewToolServicePg>;
+  }) {
+    const { queueId, orgId, actionIds, transaction } = opts;
+    const queryInterface = transaction ?? this.pgQuery;
+
+    await queryInterface
+      .deleteFrom('manual_review_tool.queues_and_clear_reports_trigger_actions')
+      .where('queue_id', '=', queueId)
+      .where('org_id', '=', orgId)
+      .execute();
+
+    const uniqueActionIds = [...new Set(actionIds)];
+    if (uniqueActionIds.length > 0) {
+      await queryInterface
+        .insertInto(
+          'manual_review_tool.queues_and_clear_reports_trigger_actions',
+        )
+        .values(
+          uniqueActionIds.map((actionId) => ({
+            queue_id: queueId,
+            action_id: actionId,
+            org_id: orgId,
+          })),
+        )
+        .execute();
+    }
+  }
 }
 
 /**
@@ -1594,6 +2002,80 @@ const makeQueueDoesNotExistError = (data: ErrorInstanceData) => {
   });
 };
 
+/**
+ * Thrown when a target queue or user does not belong to the caller's org.
+ */
+const makeAccessibleQueueNotInOrgError = (data: ErrorInstanceData) =>
+  new CoopError({
+    status: 403,
+    type: [ErrorType.Unauthorized],
+    title: "Queue or user does not belong to the caller's organization",
+    name: 'AccessibleQueueNotInOrgError',
+    ...data,
+  });
+
+/**
+ * Rejects before any write if a target queue does not belong to the caller's
+ * org. Defense-in-depth org-scoping for accessible-queue mutations.
+ */
+async function assertQueuesInOrg(
+  db: Kysely<ManualReviewToolServicePg>,
+  opts: { orgId: string; queueIds: readonly string[] },
+) {
+  const { orgId, queueIds } = opts;
+  const inOrgQueues = await db
+    .selectFrom('manual_review_tool.manual_review_queues')
+    .select('id')
+    .where('org_id', '=', orgId)
+    .where('id', 'in', queueIds)
+    .execute();
+  if (inOrgQueues.length !== new Set(queueIds).size) {
+    throw makeAccessibleQueueNotInOrgError({ shouldErrorSpan: true });
+  }
+}
+
+/**
+ * Rejects before any write if a target user does not belong to the caller's
+ * org. Defense-in-depth org-scoping for accessible-queue mutations.
+ */
+async function assertUsersInOrg(
+  db: Kysely<ManualReviewToolServicePg>,
+  opts: { orgId: string; userIds: readonly string[] },
+) {
+  const { orgId, userIds } = opts;
+  const inOrgUsers = await db
+    .selectFrom('public.users')
+    .select('id')
+    .where('org_id', '=', orgId)
+    .where('id', 'in', userIds)
+    .execute();
+  if (inOrgUsers.length !== new Set(userIds).size) {
+    throw makeAccessibleQueueNotInOrgError({ shouldErrorSpan: true });
+  }
+}
+
+/**
+ * Rejects before any write if a target queue or user does not belong to the
+ * caller's org.
+ */
+async function assertUsersAndQueuesInOrg(
+  db: Kysely<ManualReviewToolServicePg>,
+  opts: {
+    orgId: string;
+    userIds: readonly string[];
+    queueIds: readonly string[];
+  },
+) {
+  await assertQueuesInOrg(db, {
+    orgId: opts.orgId,
+    queueIds: opts.queueIds,
+  });
+  await assertUsersInOrg(db, {
+    orgId: opts.orgId,
+    userIds: opts.userIds,
+  });
+}
+
 export const makeUnableToDeleteDefaultQueueError = (
   data: ErrorInstanceData,
 ) => {
@@ -1605,6 +2087,41 @@ export const makeUnableToDeleteDefaultQueueError = (
     ...data,
   });
 };
+
+/**
+ * Cheap, non-throwing parse check for external JobIds. Used by callers
+ * that accept the id as user input (e.g. admin button) so a malformed id
+ * becomes a "not found" instead of a 500.
+ */
+// Both halves are base64url tokens (optionally `=`-padded), so reject input
+// that can't be one before paying for the per-queue fallback scan.
+const B64URL_TOKEN = /^[A-Za-z0-9_\-+/=]+$/;
+function isParsableExternalId(externalId: JobId): boolean {
+  const parts = (externalId as string).split(':');
+  return (
+    parts.length === 2 &&
+    B64URL_TOKEN.test(parts[0]) &&
+    B64URL_TOKEN.test(parts[1])
+  );
+}
+
+/**
+ * BullMQ surfaces "job is locked" as an Error whose message starts with
+ * "Could not remove job"; there is no exported error class to instanceof
+ * against. Match defensively on the message and on a likely future
+ * canonicalisation of the same condition.
+ */
+function isJobLockedError(err: unknown): boolean {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes('could not remove job') ||
+    msg.includes('locked by another worker') ||
+    msg.includes('lock mismatch')
+  );
+}
 
 export const makeManualReviewQueueNameExistsError = (data: ErrorInstanceData) =>
   new CoopError({

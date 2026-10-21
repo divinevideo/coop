@@ -1,10 +1,10 @@
 /* eslint-disable max-lines */
 import type { Exception } from '@opentelemetry/api';
-import { makeEnumLike, type ItemIdentifier } from '@roostorg/types';
+import { makeEnumLike, type ItemIdentifier } from '@roostorg/coop-types';
 import _Ajv from 'ajv';
-import { type Kysely } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import _ from 'lodash';
-import { type FormData as FormDataType } from 'undici';
+import { FormData } from 'undici';
 import { js2xml } from 'xml-js';
 
 import { type Dependencies } from '../../iocContainer/index.js';
@@ -32,6 +32,12 @@ import {
   type FormDataLikeWithStreams,
 } from '../networkingService/index.js';
 import { type NcmecReportingServicePg } from './dbTypes.js';
+import {
+  ncmecDebugDump,
+  ncmecDebugEnabled,
+  ncmecDebugLog,
+} from './ncmecDebug.js';
+import { summarizeNcmecErrorForReviewer } from './ncmecReviewerErrors.js';
 
 export const NCMECEvent = makeEnumLike([
   'Login',
@@ -113,6 +119,8 @@ type NCMECPerson = {
   deviceId?: DeviceNCMECEvent[];
 };
 
+// Key insertion order must match the NCMEC XSD `<fileDetails>` sequence
+// (Appendix C); see the `Report` type comment for why this matters.
 type FileDetails = {
   fileDetails: {
     reportId: number;
@@ -124,11 +132,19 @@ type FileDetails = {
     publiclyAvailable?: boolean;
     fileRelevance?: 'Reported' | 'Supplemental Reported';
     fileAnnotations?: FileAnnotations;
-    industryClassification?: NCMECIndustryClassificationType;
     ipCaptureEvent?: IPNCMECEvent[];
+    industryClassification?: NCMECIndustryClassificationType;
+    originalFileHash?: OriginalFileHash[];
     deviceId?: DeviceId[];
     details?: Detail[];
     additionalInfo?: string[];
+  };
+};
+
+type OriginalFileHash = {
+  _text: string;
+  _attributes: {
+    hashType: string;
   };
 };
 
@@ -160,8 +176,18 @@ type Media = {
   createdAt: string;
   industryClassification: NCMECIndustryClassificationType;
   fileAnnotations?: readonly NCMECFileAnnotationType[];
-  ipCaptureEvent?: IPNCMECEvent;
+  /** Pre-built IP event(s); accepts a single event or an array. */
+  ipCaptureEvent?: IPNCMECEvent | readonly IPNCMECEvent[];
+  /** Bare IP from the `ipAddress` field role; appended as a synthesised
+   * `Upload` event. */
+  ipAddress?: string;
   deviceId?: DeviceNCMECEvent[];
+  /** Hashes computed for this URL (typically by HMA at item submission
+   * time). Keyed by hash algorithm name (e.g. `md5`, `pdq`); the value is
+   * the hex-encoded hash. Forwarded to NCMEC as `originalFileHash`
+   * entries with the algorithm name uppercased into the `hashType`
+   * attribute. */
+  hashes?: Record<string, string>;
 };
 
 type NCMECUserParams = {
@@ -169,6 +195,15 @@ type NCMECUserParams = {
   typeId: string;
   profilePicture?: string;
   displayName?: string;
+  /** Pre-built IP event(s); accepts a single event or an array. */
+  ipCaptureEvent?: IPNCMECEvent | readonly IPNCMECEvent[];
+  /** Bare IP from the `ipAddress` field role; appended as a synthesised
+   * `Unknown` event. */
+  ipAddress?: string;
+  /** Bare email from the `email` field role. Used as the
+   * `personOrUserReportedPerson.email` when no external additional-info
+   * endpoint provided one. */
+  email?: string;
 };
 
 export type NCMECReportParams = {
@@ -180,8 +215,15 @@ export type NCMECReportParams = {
   incidentType: string;
   /** Optional reason for higher urgency; if present must be non-blank and max 3000 chars. */
   escalateToHighPriority?: string;
+  /** Optional free-text notes; if present must be non-blank and max 3000 chars. */
+  additionalInfo?: string;
+  /** MRT decision id; when set, failures are recorded to `ncmec_reports_errors`. */
+  jobId?: string;
 };
 
+// Key insertion order in these object literals must match the NCMEC XSD
+// sequence (Appendix B): js2xml emits children in insertion order, and NCMEC
+// rejects out-of-order submissions with responseCode=4100.
 type Report = {
   report: {
     incidentSummary: {
@@ -193,7 +235,7 @@ type Report = {
     internetDetails?: (
       | {
           webPageIncident: {
-            url: string;
+            url?: string;
             additionalInfo?: string;
             thirdPartyHostedContent?: boolean;
           };
@@ -383,6 +425,516 @@ const NCMEC_INTERNET_DETAIL_TYPES = [
 type NcmecInternetDetailTypeSetting =
   (typeof NCMEC_INTERNET_DETAIL_TYPES)[number];
 
+/** Extract NCMEC's `responseCode`/`responseDescription` from any wrapper
+ * element (`reportResponse`, `uploadResponse`, ...). Either field may be
+ * `undefined` when not present. */
+function extractNcmecResponseStatus(body: unknown): {
+  responseCode?: string;
+  responseDescription?: string;
+} {
+  if (!body || typeof body !== 'object') {
+    return {};
+  }
+  const readText = (value: unknown): string | undefined => {
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (
+      value &&
+      typeof value === 'object' &&
+      '_text' in (value as Record<string, unknown>)
+    ) {
+      const inner = (value as { _text: unknown })._text;
+      return typeof inner === 'string' ? inner : undefined;
+    }
+    return undefined;
+  };
+  const truncate = (value: string | undefined): string | undefined =>
+    value && value.length > 200 ? `${value.slice(0, 200)}…` : value;
+
+  for (const wrapper of Object.values(body as Record<string, unknown>)) {
+    if (!wrapper || typeof wrapper !== 'object') {
+      continue;
+    }
+    const obj = wrapper as Record<string, unknown>;
+    const responseCode = readText(obj.responseCode);
+    const responseDescription = readText(obj.responseDescription);
+    if (responseCode != null || responseDescription != null) {
+      return {
+        responseCode,
+        responseDescription: truncate(responseDescription),
+      };
+    }
+  }
+  return {};
+}
+
+/** Error message for a failed CyberTip response. In production only NCMEC's
+ * documented codes are surfaced (the body may echo reportable content); the
+ * full truncated body is appended only with `NCMEC_DEBUG=1`. */
+export function summarizeCyberTipFailure(
+  route: string,
+  status: number,
+  body: unknown,
+): string {
+  const { responseCode, responseDescription } =
+    extractNcmecResponseStatus(body);
+  const parts: string[] = [
+    `CyberTip request to ${route} failed: status=${status}`,
+  ];
+  if (responseCode != null) {
+    parts.push(`responseCode=${responseCode}`);
+  }
+  if (responseDescription != null) {
+    parts.push(`responseDescription=${responseDescription}`);
+  }
+  if (ncmecDebugEnabled()) {
+    let snippet: string;
+    try {
+      const serialized = jsonStringify(body ?? null);
+      snippet =
+        serialized.length > 500 ? `${serialized.slice(0, 500)}…` : serialized;
+    } catch {
+      snippet = '<unserializable>';
+    }
+    parts.push(`body=${snippet}`);
+  }
+  return parts.join(', ');
+}
+
+/** Clamp a `createdAt` ISO to "now - 1s" if it's ahead of our clock — NCMEC
+ * rejects `<incidentDateTime>` in the future. `value` is always canonicalized
+ * to UTC ISO; `wasClamped` reflects the numeric (not string) comparison so
+ * callers don't misreport plain UTC normalization as a clamp. */
+export function clampIncidentDateTimeToPast(
+  maxCreatedAt: string,
+  nowMs: number = Date.now(),
+): { value: string; wasClamped: boolean } {
+  const maxCreatedAtMs = new Date(maxCreatedAt).getTime();
+  if (Number.isNaN(maxCreatedAtMs)) {
+    throw new Error(
+      `Invalid media createdAt timestamp for incidentDateTime: ${maxCreatedAt}`,
+    );
+  }
+  const ceilingMs = nowMs - 1000;
+  const wasClamped = maxCreatedAtMs > ceilingMs;
+  const finalMs = wasClamped ? ceilingMs : maxCreatedAtMs;
+  return {
+    value: new Date(finalMs).toISOString(),
+    wasClamped,
+  };
+}
+
+/** Build the `ipCaptureEvent` array for an NCMEC person or media block:
+ * webhook events + caller-supplied events + role-IP-synthesised event, in
+ * that order. Returns `undefined` when all sources are empty. */
+export function mergeFieldRoleIpIntoEvents(
+  webhookEvents: readonly IPNCMECEvent[] | undefined,
+  paramEvents: IPNCMECEvent | readonly IPNCMECEvent[] | undefined,
+  roleIpAddress: string | undefined | null,
+  synthesisedEvent: { eventName: NCMECEventType; dateTime: string },
+): IPNCMECEvent[] | undefined {
+  const isEventArray = (
+    v: IPNCMECEvent | readonly IPNCMECEvent[],
+  ): v is readonly IPNCMECEvent[] => Array.isArray(v);
+  const paramEventsArray: readonly IPNCMECEvent[] =
+    paramEvents == null
+      ? []
+      : isEventArray(paramEvents)
+        ? paramEvents
+        : [paramEvents];
+  const trimmedRoleIp =
+    typeof roleIpAddress === 'string' ? roleIpAddress.trim() : '';
+  const events: IPNCMECEvent[] = [
+    ...(webhookEvents ?? []),
+    ...paramEventsArray,
+    ...(trimmedRoleIp !== ''
+      ? [
+          {
+            ipAddress: trimmedRoleIp,
+            eventName: synthesisedEvent.eventName,
+            dateTime: synthesisedEvent.dateTime,
+          },
+        ]
+      : []),
+  ];
+  return events.length > 0 ? events : undefined;
+}
+
+/** Build the NCMEC `originalFileHash[]` shape from both hash sources Coop
+ * has: HMA-computed hashes stored on the item data (keyed by algorithm),
+ * and any single `{ hash, hashType }` returned by the additional-info
+ * webhook for this media. Trims blanks, uppercases the algorithm name into
+ * the `hashType` attribute, drops empty entries, and dedupes on
+ * (`hashType`, hash value) so a webhook that returns the same algorithm as
+ * HMA doesn't produce duplicate entries. Returns undefined when no usable
+ * hashes survive filtering; callers should branch on that to omit the key
+ * entirely rather than serialise an empty array. */
+export function toOriginalFileHashes(opts: {
+  hmaHashes?: Record<string, string>;
+  webhookFileDetails?: { hash: string; hashType: string };
+}): OriginalFileHash[] | undefined {
+  const result: OriginalFileHash[] = [];
+  const seen = new Set<string>();
+  const push = (algorithm: string, hash: string) => {
+    const trimmedHash = typeof hash === 'string' ? hash.trim() : '';
+    const trimmedAlgorithm = algorithm.trim();
+    if (trimmedHash === '' || trimmedAlgorithm === '') return;
+    const hashType = trimmedAlgorithm.toUpperCase();
+    const key = `${hashType} ${trimmedHash}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    result.push({ _text: trimmedHash, _attributes: { hashType } });
+  };
+  if (opts.hmaHashes) {
+    for (const [algorithm, hash] of Object.entries(opts.hmaHashes)) {
+      push(algorithm, hash);
+    }
+  }
+  if (opts.webhookFileDetails) {
+    push(opts.webhookFileDetails.hashType, opts.webhookFileDetails.hash);
+  }
+  return result.length > 0 ? result : undefined;
+}
+
+/** Resolve the email(s) for `personOrUserReportedPerson`. Prefers the
+ * webhook's enriched response (carries NCMEC `type` / `verified` attributes);
+ * falls back to a bare field-role email otherwise. Returns undefined when
+ * neither source has data. */
+export function resolveReportedPersonEmail(
+  webhookEmails: Email[] | undefined,
+  fieldRoleEmail: string | undefined,
+): Email[] | undefined {
+  if (webhookEmails && webhookEmails.length > 0) return webhookEmails;
+  const trimmed = fieldRoleEmail?.trim();
+  if (trimmed) return [{ _text: trimmed }];
+  return undefined;
+}
+
+/** Maps a list of `NCMECFileAnnotationType` enum values to the
+ * `FileAnnotations` element shape expected by the NCMEC `<fileDetails>` XSD
+ * (each annotation becomes an empty self-closing child element).
+ *
+ * Lives at module scope so the `buildFileDetailsObject` helper and the
+ * dry-run dump script can both build file-details XML without instantiating
+ * `NcmecReportingService`. */
+export function fileAnnotationArrayToNCMECFileAnnotation(
+  fileAnnotations?: readonly NCMECFileAnnotationType[],
+): FileAnnotations | undefined {
+  if (!fileAnnotations || fileAnnotations.length === 0) {
+    return undefined;
+  }
+  // Iterating through a table avoids one branch per annotation, which
+  // previously pushed cyclomatic complexity over the configured ESLint limit
+  // and made the function hard to extend when new annotation types are added.
+  const annotationFieldByType: Record<
+    NCMECFileAnnotationType,
+    keyof FileAnnotations
+  > = {
+    [NCMECFileAnnotation.ANIME_DRAWING_VIRTUAL_HENTAI]:
+      'animeDrawingVirtualHentai',
+    [NCMECFileAnnotation.POTENTIAL_MEME]: 'potentialMeme',
+    [NCMECFileAnnotation.VIRAL]: 'viral',
+    [NCMECFileAnnotation.POSSIBLE_SELF_PRODUCTION]: 'possibleSelfProduction',
+    [NCMECFileAnnotation.PHYSICAL_HARM]: 'physicalHarm',
+    [NCMECFileAnnotation.VIOLENCE_GORE]: 'violenceGore',
+    [NCMECFileAnnotation.BESTIALITY]: 'bestiality',
+    [NCMECFileAnnotation.LIVE_STREAMING]: 'liveStreaming',
+    [NCMECFileAnnotation.INFANT]: 'infant',
+    [NCMECFileAnnotation.GENERATIVE_AI]: 'generativeAi',
+  };
+  const result: FileAnnotations = {};
+  for (const annotation of fileAnnotations) {
+    const field = annotationFieldByType[annotation];
+    result[field] = undefined;
+  }
+  return result;
+}
+
+export type BuildSubmitReportObjectInput = {
+  reportParams: NCMECReportParams;
+  /** Reported user's webhook-derived additional info, from the
+   * `ncmec_additional_info_endpoint` webhook (or defaulted to empty when no
+   * endpoint is configured). */
+  userAdditionalInfo: {
+    email?: Email[];
+    screenName?: string;
+    ipCaptureEvent?: IPNCMECEvent[];
+  };
+  /** Slice of `ncmec_reporting.ncmec_org_settings` needed to build the
+   * report envelope. `companyTemplate`, `legalURL` and `reportingPersonEmail`
+   * are required (the caller validated them). */
+  orgSettings: {
+    companyTemplate: string;
+    legalURL: string;
+    defaultInternetDetailType?: string | null;
+    termsOfService?: string | null;
+    contactPersonEmail?: string | null;
+    contactPersonFirstName?: string | null;
+    contactPersonLastName?: string | null;
+    contactPersonPhone?: string | null;
+    /** From `ncmec_org_settings.contact_email`. */
+    reportingPersonEmail: string;
+    /** Optional URL used to populate `webPageIncident.url` when the org's
+     * `defaultInternetDetailType` is WEB_PAGE. */
+    moreInfoUrl?: string | null;
+  };
+  /** Latest media `createdAt`, already clamped to the past. */
+  clampedIncidentDateTime: string;
+  /** Prior accepted NCMEC report IDs for the reported user; renders as `<priorCTReports>`. */
+  priorCTReports?: readonly number[];
+};
+
+/** Build the `Report` envelope NCMEC's `/submit` endpoint expects. Pure: no
+ * DB or HTTP. The caller is responsible for resolving org settings and
+ * webhook-sourced additional info; this function only assembles them in the
+ * XSD-mandated order. Used by `submitReport` and by audit/dump tooling. */
+
+// further decomposition would obscure the XSD-mandated insertion order (see
+// the `Report` type comment) that NCMEC validates against.
+export function buildSubmitReportObject(
+  input: BuildSubmitReportObjectInput,
+): Report {
+  const {
+    reportParams,
+    userAdditionalInfo,
+    orgSettings,
+    clampedIncidentDateTime,
+    priorCTReports,
+  } = input;
+  const emailStringToNCMECEmail = (email: string) => ({ _text: email });
+
+  const incidentType =
+    NCMECIncidentType[reportParams.incidentType as NCMECIncidentType];
+
+  const escalateToHighPriority =
+    reportParams.escalateToHighPriority != null
+      ? reportParams.escalateToHighPriority.trim()
+      : undefined;
+  if (
+    escalateToHighPriority !== undefined &&
+    (escalateToHighPriority === '' || escalateToHighPriority.length > 3000)
+  ) {
+    throw new Error(
+      'escalateToHighPriority must be non-blank when supplied and at most 3000 characters',
+    );
+  }
+
+  const reportAdditionalInfo =
+    reportParams.additionalInfo != null
+      ? reportParams.additionalInfo.trim()
+      : undefined;
+  if (
+    reportAdditionalInfo !== undefined &&
+    (reportAdditionalInfo === '' || reportAdditionalInfo.length > 3000)
+  ) {
+    throw new Error(
+      'additionalInfo must be non-blank when supplied and at most 3000 characters',
+    );
+  }
+
+  const internetDetails = buildInternetDetailsFromOrgSetting(
+    orgSettings.defaultInternetDetailType,
+    orgSettings.moreInfoUrl,
+  );
+
+  const contactPersonEmail = orgSettings.contactPersonEmail?.trim();
+  const contactPersonFirstName = orgSettings.contactPersonFirstName?.trim();
+  const contactPersonLastName = orgSettings.contactPersonLastName?.trim();
+  const contactPersonPhone = orgSettings.contactPersonPhone?.trim();
+  const contactPerson =
+    contactPersonEmail ||
+    contactPersonFirstName ||
+    contactPersonLastName ||
+    contactPersonPhone
+      ? {
+          ...(contactPersonFirstName
+            ? { firstName: contactPersonFirstName }
+            : {}),
+          ...(contactPersonLastName ? { lastName: contactPersonLastName } : {}),
+          ...(contactPersonPhone
+            ? { phone: { _text: contactPersonPhone } }
+            : {}),
+          ...(contactPersonEmail
+            ? { email: [emailStringToNCMECEmail(contactPersonEmail)] }
+            : {}),
+        }
+      : undefined;
+
+  const termsOfService =
+    orgSettings.termsOfService != null &&
+    orgSettings.termsOfService.trim() !== '' &&
+    orgSettings.termsOfService.length <= 3000
+      ? orgSettings.termsOfService.trim()
+      : undefined;
+
+  const reportedPersonEmail = resolveReportedPersonEmail(
+    userAdditionalInfo.email,
+    reportParams.reportedUser.email,
+  );
+  const personOrUserReportedPerson = reportedPersonEmail
+    ? { email: reportedPersonEmail }
+    : undefined;
+
+  // The role IP is a bare string, not a login/upload signal, so `Unknown` is
+  // the safest event-name claim.
+  const reportedUserIpCaptureEvents = mergeFieldRoleIpIntoEvents(
+    userAdditionalInfo.ipCaptureEvent,
+    reportParams.reportedUser.ipCaptureEvent,
+    reportParams.reportedUser.ipAddress,
+    {
+      eventName: NCMECEvent.Unknown,
+      dateTime: clampedIncidentDateTime,
+    },
+  );
+
+  return {
+    report: {
+      incidentSummary: {
+        incidentType,
+        ...(escalateToHighPriority ? { escalateToHighPriority } : {}),
+        incidentDateTime: clampedIncidentDateTime,
+      },
+      ...(internetDetails ? { internetDetails } : {}),
+      reporter: {
+        reportingPerson: {
+          email: [emailStringToNCMECEmail(orgSettings.reportingPersonEmail)],
+        },
+        ...(contactPerson ? { contactPerson } : {}),
+        companyTemplate: orgSettings.companyTemplate,
+        ...(termsOfService ? { termsOfService } : {}),
+        legalURL: orgSettings.legalURL,
+      },
+      personOrUserReported: {
+        ...(personOrUserReportedPerson ? { personOrUserReportedPerson } : {}),
+        espIdentifier: reportParams.reportedUser.id,
+        espService: orgSettings.companyTemplate,
+        screenName: userAdditionalInfo.screenName,
+        ...(reportParams.reportedUser.displayName
+          ? { displayName: [reportParams.reportedUser.displayName] }
+          : {}),
+        ...(reportedUserIpCaptureEvents &&
+        reportedUserIpCaptureEvents.length > 0
+          ? { ipCaptureEvent: reportedUserIpCaptureEvents }
+          : {}),
+        ...(priorCTReports && priorCTReports.length > 0
+          ? { priorCTReports: [...priorCTReports] }
+          : {}),
+      },
+      ...(reportAdditionalInfo !== undefined
+        ? { additionalInfo: reportAdditionalInfo }
+        : {}),
+    },
+  };
+}
+
+export type BuildFileDetailsObjectInput = {
+  reportId: number;
+  fileId: string;
+  /** Optional `<originalFileName>`. Usually derived via `deriveOriginalFileNameFromUrl`. */
+  originalFileName?: string;
+  /** `<fileRelevance>`. Defaults to `'Reported'`. */
+  fileRelevance?: 'Reported' | 'Supplemental Reported';
+  media: Pick<Media, 'industryClassification'> & {
+    fileAnnotations?: readonly NCMECFileAnnotationType[];
+  };
+  additionalInfo: Pick<
+    MediaAdditionalInfo,
+    'publiclyAvailable' | 'ipCaptureEvent' | 'additionalInfo'
+  >;
+  /** Combined HMA + webhook hashes as built by `toOriginalFileHashes`.
+   * Rendered in the `<originalFileHash>` element(s) after
+   * `industryClassification` per the XSD. */
+  originalFileHash?: readonly OriginalFileHash[];
+};
+
+/** Decoded last path segment of `url`, or `undefined` if unavailable.
+ * Logs each fallback path via `ncmecDebugLog` so operators can triage
+ * unexpected URL shapes when `NCMEC_DEBUG=1` is enabled. */
+export function deriveOriginalFileNameFromUrl(url: string): string | undefined {
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    ncmecDebugLog('deriveOriginalFileName.urlParseFailed', { url });
+    return undefined;
+  }
+  const last = pathname
+    .split('/')
+    .filter((s) => s !== '')
+    .pop();
+  if (!last) {
+    ncmecDebugLog('deriveOriginalFileName.emptyPath', { url });
+    return undefined;
+  }
+  try {
+    const decoded = decodeURIComponent(last);
+    if (decoded.length === 0) {
+      ncmecDebugLog('deriveOriginalFileName.emptySegment', { url });
+      return undefined;
+    }
+    return decoded;
+  } catch {
+    // Malformed percent-encoding: keep the raw segment.
+    ncmecDebugLog('deriveOriginalFileName.decodeFailed', { url, raw: last });
+    return last;
+  }
+}
+
+/** Pure builder for the `FileDetails` envelope NCMEC's `/fileinfo`
+ * endpoint expects. Used by `submitReport`'s `#upload` step and by
+ * dry-run tooling that needs to serialize per-media XML without
+ * performing the upload. No DB or HTTP calls. */
+export function buildFileDetailsObject(
+  input: BuildFileDetailsObjectInput,
+): FileDetails {
+  const {
+    reportId,
+    fileId,
+    media,
+    additionalInfo,
+    originalFileHash,
+    originalFileName,
+  } = input;
+  const fileRelevance = input.fileRelevance ?? 'Reported';
+  const fileAnnotations = fileAnnotationArrayToNCMECFileAnnotation(
+    media.fileAnnotations,
+  );
+  return {
+    fileDetails: {
+      reportId,
+      fileId,
+      ...(originalFileName ? { originalFileName } : {}),
+      fileViewedByEsp: true,
+      exifViewedByEsp: true,
+      ...(additionalInfo.publiclyAvailable !== undefined
+        ? { publiclyAvailable: additionalInfo.publiclyAvailable }
+        : {}),
+      fileRelevance,
+      ...(fileAnnotations ? { fileAnnotations } : {}),
+      ...(additionalInfo.ipCaptureEvent &&
+      additionalInfo.ipCaptureEvent.length > 0
+        ? {
+            ipCaptureEvent: additionalInfo.ipCaptureEvent.map((it) => ({
+              ipAddress: it.ipAddress,
+              eventName: it.eventName,
+              dateTime: it.dateTime,
+              ...(it.possibleProxy ? { possibleProxy: it.possibleProxy } : {}),
+              ...(it.port ? { port: it.port } : {}),
+            })),
+          }
+        : {}),
+      industryClassification: media.industryClassification,
+      ...(originalFileHash && originalFileHash.length > 0
+        ? { originalFileHash: [...originalFileHash] }
+        : {}),
+      ...(additionalInfo.additionalInfo
+        ? { additionalInfo: additionalInfo.additionalInfo }
+        : {}),
+    },
+  };
+}
+
 export function buildInternetDetailsFromOrgSetting(
   defaultInternetDetailType: string | null | undefined,
   moreInfoUrl: string | null | undefined,
@@ -395,12 +947,20 @@ export function buildInternetDetailsFromOrgSetting(
   if (!NCMEC_INTERNET_DETAIL_TYPES.includes(type)) {
     return undefined;
   }
-  // Use || so blank/empty URL becomes 'Not specified' (?? would keep '')
-  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- intentional: empty string should fallback
-  const webPageUrl = moreInfoUrl?.trim() || 'Not specified';
+  // NCMEC returns 4100 if `<url>` contains whitespace or control chars; since
+  // the element is optional per the XSD, omit it unless we have a clean value.
+  // eslint-disable-next-line no-control-regex
+  const URL_INVALID_CHARS = /[\s\u0000-\u001f\u007f]/;
+  const trimmedUrl = moreInfoUrl?.trim();
+  const webPageUrl =
+    trimmedUrl && !URL_INVALID_CHARS.test(trimmedUrl) ? trimmedUrl : undefined;
   switch (type) {
     case 'WEB_PAGE':
-      return [{ webPageIncident: { url: webPageUrl } }];
+      return [
+        {
+          webPageIncident: webPageUrl ? { url: webPageUrl } : {},
+        },
+      ];
     case 'EMAIL':
       return [{ emailIncident: {} }];
     case 'NEWSGROUP':
@@ -527,6 +1087,15 @@ type MediaAdditionalInfo = {
   fileName?: string;
   /** When set, sent to NCMEC in file details (whether the content was publicly viewable). */
   publiclyAvailable?: boolean;
+  /** Optional single hash from the additional-info webhook response.
+   * Merged with HMA-sourced hashes (see `toOriginalFileHashes`); deduped
+   * on (`hashType` uppercase, trimmed hash value) so a webhook that
+   * returns the same algorithm as HMA doesn't produce duplicate entries
+   * in the outgoing `originalFileHash[]` list. */
+  fileDetails?: {
+    hash: string;
+    hashType: string;
+  };
 };
 
 type FileAdditionalInfo = {
@@ -802,13 +1371,12 @@ export default class NcmecReporting {
   > {
     const row = await this.pgQuery
       .selectFrom('ncmec_reporting.ncmec_org_settings')
+      .selectAll()
       .where('org_id', '=', orgId)
       .executeTakeFirst();
-    if (!row) {
-      return undefined;
-    }
-
-    return row as NcmecReportingServicePg['ncmec_reporting.ncmec_org_settings'];
+    return row as
+      | NcmecReportingServicePg['ncmec_reporting.ncmec_org_settings']
+      | undefined;
   }
 
   async getNCMECActionsToRunAndPolicies(
@@ -901,9 +1469,8 @@ export default class NcmecReporting {
     reportedUsers: ItemIdentifier[],
     reportedMedia: readonly ItemIdentifier[],
   ): Promise<NcmecAdditionalInfo | 'ALL_MEDIA_MISSING'> {
-    const additionalInfoEndpoint = await this.ncmecAdditionalInfoEndpoint(
-      orgId,
-    );
+    const additionalInfoEndpoint =
+      await this.ncmecAdditionalInfoEndpoint(orgId);
 
     // If no additional info endpoint is configured, return minimal default data
     if (!additionalInfoEndpoint) {
@@ -918,9 +1485,6 @@ export default class NcmecReporting {
         media: reportedMedia.map((media) => ({
           id: media.id,
           typeId: media.typeId,
-          fileDetails: {
-            ipCaptureEvent: [],
-          },
         })),
       };
     }
@@ -1081,9 +1645,8 @@ export default class NcmecReporting {
     reportId: number;
   }) {
     const { orgId, user, reportedMedia, reportId } = input;
-    const ncmecPreservationEndpoint = await this.ncmecPreservationEndpoint(
-      orgId,
-    );
+    const ncmecPreservationEndpoint =
+      await this.ncmecPreservationEndpoint(orgId);
 
     if (ncmecPreservationEndpoint == null) {
       throw new Error(
@@ -1159,6 +1722,28 @@ export default class NcmecReporting {
     return firstReport != null;
   }
 
+  /** Prior accepted NCMEC report IDs for the user, most recent first.
+   * Non-numeric `report_id`s are skipped (XSD requires `xs:integer`). */
+  async getPriorCTReportIds(params: {
+    orgId: string;
+    userId: string;
+    userItemTypeId: string;
+  }): Promise<number[]> {
+    const { orgId, userId, userItemTypeId } = params;
+    const rows = await this.pgQuery
+      .selectFrom('ncmec_reporting.ncmec_reports')
+      .select(['report_id'])
+      .where('org_id', '=', orgId)
+      .where('user_id', '=', userId)
+      .where('user_item_type_id', '=', userItemTypeId)
+      .where('is_test', '=', false)
+      .orderBy('created_at', 'desc')
+      .execute();
+    return rows
+      .map((r) => parseInt(r.report_id, 10))
+      .filter((n) => Number.isFinite(n));
+  }
+
   async submitReport(
     reportParams: NCMECReportParams,
     isTest: boolean,
@@ -1170,7 +1755,26 @@ export default class NcmecReporting {
       },
       // eslint-disable-next-line complexity
       async (span) => {
-        span.setAttribute(`ncmecReportParams`, jsonStringify(reportParams));
+        const logSafeReportParams = {
+          orgId: reportParams.orgId,
+          reviewerId: reportParams.reviewerId,
+          reportedUserId: reportParams.reportedUser.id,
+          reportedUserTypeId: reportParams.reportedUser.typeId,
+          mediaCount: reportParams.media.length,
+          threadsCount: reportParams.threads.length,
+          incidentType: reportParams.incidentType,
+          hasEscalation: Boolean(reportParams.escalateToHighPriority?.trim()),
+          hasAdditionalInfo: Boolean(reportParams.additionalInfo?.trim()),
+          jobId: reportParams.jobId,
+        };
+        span.setAttribute(
+          `ncmecReportParams`,
+          jsonStringify(logSafeReportParams),
+        );
+        ncmecDebugLog('submitReport.start', {
+          isTest,
+          ...logSafeReportParams,
+        });
 
         // We try/catch this whole process in order to do custom logging on
         // failure, since we can't guarantee all traces with exceptions are
@@ -1188,14 +1792,43 @@ export default class NcmecReporting {
           }
 
           if (testOrgs.includes(reportParams.orgId)) {
+            if (reportParams.jobId !== undefined) {
+              await this.#recordSubmissionError({
+                jobId: reportParams.jobId,
+                userId: reportParams.reportedUser.id,
+                userTypeId: reportParams.reportedUser.typeId,
+                status: 'PERMANENT_ERROR',
+                error:
+                  'Org is on the NCMEC test allowlist; reports are suppressed.',
+              });
+            }
             return 'UNSUPPORTED_ORG';
           }
 
-          const maxCreatedAt = _.maxBy(reportParams.media, 'createdAt')
-            ?.createdAt;
-
-          if (!maxCreatedAt) {
+          if (reportParams.media.length === 0) {
             throw new Error('No media in report');
+          }
+          const latestMedia = _.maxBy(reportParams.media, (m) => {
+            const ms = Date.parse(m.createdAt);
+            if (Number.isNaN(ms)) {
+              throw new Error(
+                `Invalid media createdAt timestamp for incidentDateTime: ${m.createdAt}`,
+              );
+            }
+            return ms;
+          });
+          if (latestMedia === undefined) {
+            throw new Error('No media in report');
+          }
+          const maxCreatedAt = latestMedia.createdAt;
+
+          const { value: clampedIncidentDateTime, wasClamped } =
+            clampIncidentDateTimeToPast(maxCreatedAt);
+          if (wasClamped) {
+            ncmecDebugLog('incidentDateTime.clamped', {
+              originalCreatedAt: maxCreatedAt,
+              clampedTo: clampedIncidentDateTime,
+            });
           }
 
           const cybertipAuthenticationCredentials =
@@ -1265,6 +1898,16 @@ export default class NcmecReporting {
               ),
           );
           if (additionalInfo === 'ALL_MEDIA_MISSING') {
+            if (reportParams.jobId !== undefined) {
+              await this.#recordSubmissionError({
+                jobId: reportParams.jobId,
+                userId: reportParams.reportedUser.id,
+                userTypeId: reportParams.reportedUser.typeId,
+                status: 'PERMANENT_ERROR',
+                error:
+                  'All reportable media is missing from storage; nothing to submit.',
+              });
+            }
             return 'ALL_MEDIA_MISSING';
           }
           // This should be validated in getNCMECAdditionalInfo so the ! is safe
@@ -1273,112 +1916,44 @@ export default class NcmecReporting {
               it.id === reportParams.reportedUser.id &&
               it.typeId === reportParams.reportedUser.typeId,
           )!;
-          const emailStringToNCMECEmail = (email: string) => ({ _text: email });
           const ncmecConfig = await this.getNCMECConfig(reportParams.orgId);
 
-          // Use the incident type from the report params
-          const incidentType =
-            NCMECIncidentType[reportParams.incidentType as NCMECIncidentType];
-
-          const escalateToHighPriority =
-            reportParams.escalateToHighPriority != null
-              ? reportParams.escalateToHighPriority.trim()
-              : undefined;
-          if (
-            escalateToHighPriority !== undefined &&
-            (escalateToHighPriority === '' ||
-              escalateToHighPriority.length > 3000)
-          ) {
+          const reportingPersonEmail = ncmecConfig?.contact_email?.trim();
+          if (!reportingPersonEmail) {
             throw new Error(
-              'escalateToHighPriority must be non-blank when supplied and at most 3000 characters',
+              'NCMEC report requires a non-empty reporter contact email; configure it in Settings → NCMEC.',
             );
           }
 
-          const internetDetails = buildInternetDetailsFromOrgSetting(
-            queryResponse.defaultInternetDetailType,
-            ncmecConfig?.more_info_url,
-          );
+          // Skip for test submissions: prod and exttest report IDs don't
+          // cross-reference.
+          const priorCTReports = isTest
+            ? []
+            : await this.getPriorCTReportIds({
+                orgId: reportParams.orgId,
+                userId: reportParams.reportedUser.id,
+                userItemTypeId: reportParams.reportedUser.typeId,
+              });
 
-          const report: Report = {
-            report: {
-              incidentSummary: {
-                incidentType,
-                incidentDateTime: maxCreatedAt,
-                ...(escalateToHighPriority ? { escalateToHighPriority } : {}),
-              },
-              ...(internetDetails ? { internetDetails } : {}),
-              reporter: {
-                reportingPerson: {
-                  email: [
-                    emailStringToNCMECEmail(ncmecConfig?.contact_email ?? ''),
-                  ],
-                },
-                companyTemplate: queryResponse.companyTemplate,
-                legalURL: queryResponse.legalURL,
-                ...(queryResponse.termsOfService != null &&
-                queryResponse.termsOfService.trim() !== '' &&
-                queryResponse.termsOfService.length <= 3000
-                  ? { termsOfService: queryResponse.termsOfService.trim() }
-                  : {}),
-                // Use || so we only add contactPerson when at least one field is non-empty (?? would use first non-null even if empty)
-
-                ...(queryResponse.contactPersonEmail?.trim() ||
-                queryResponse.contactPersonFirstName?.trim() ||
-                queryResponse.contactPersonLastName?.trim() ||
-                queryResponse.contactPersonPhone?.trim()
-                  ? {
-                      contactPerson: {
-                        ...(queryResponse.contactPersonEmail?.trim()
-                          ? {
-                              email: [
-                                emailStringToNCMECEmail(
-                                  queryResponse.contactPersonEmail.trim(),
-                                ),
-                              ],
-                            }
-                          : {}),
-                        ...(queryResponse.contactPersonFirstName?.trim()
-                          ? {
-                              firstName:
-                                queryResponse.contactPersonFirstName.trim(),
-                            }
-                          : {}),
-                        ...(queryResponse.contactPersonLastName?.trim()
-                          ? {
-                              lastName:
-                                queryResponse.contactPersonLastName.trim(),
-                            }
-                          : {}),
-                        ...(queryResponse.contactPersonPhone?.trim()
-                          ? {
-                              phone: {
-                                _text: queryResponse.contactPersonPhone.trim(),
-                              },
-                            }
-                          : {}),
-                      },
-                    }
-                  : {}),
-              },
-              personOrUserReported: {
-                personOrUserReportedPerson: {
-                  email: userAdditionalInfo.email,
-                },
-                espIdentifier: reportParams.reportedUser.id,
-                espService: queryResponse.companyTemplate,
-                screenName: userAdditionalInfo.screenName,
-                ...(reportParams.reportedUser.displayName
-                  ? {
-                      displayName: [reportParams.reportedUser.displayName],
-                    }
-                  : {}),
-                ...(userAdditionalInfo.ipCaptureEvent &&
-                userAdditionalInfo.ipCaptureEvent.length > 0
-                  ? { ipCaptureEvent: userAdditionalInfo.ipCaptureEvent }
-                  : {}),
-              },
+          const report = buildSubmitReportObject({
+            reportParams,
+            userAdditionalInfo,
+            orgSettings: {
+              companyTemplate: queryResponse.companyTemplate,
+              legalURL: queryResponse.legalURL,
+              defaultInternetDetailType:
+                queryResponse.defaultInternetDetailType,
+              termsOfService: queryResponse.termsOfService,
+              contactPersonEmail: queryResponse.contactPersonEmail,
+              contactPersonFirstName: queryResponse.contactPersonFirstName,
+              contactPersonLastName: queryResponse.contactPersonLastName,
+              contactPersonPhone: queryResponse.contactPersonPhone,
+              reportingPersonEmail,
+              moreInfoUrl: ncmecConfig?.more_info_url,
             },
-          };
+            clampedIncidentDateTime,
+            priorCTReports,
+          });
 
           // For the five actions here
           // 1. #submit
@@ -1409,11 +1984,23 @@ export default class NcmecReporting {
                 additionalInfo: [],
                 ipCaptureEvent: [],
               };
+              const mergedMediaInfo = {
+                ...mediaAdditionalInfo,
+                ipCaptureEvent: mergeFieldRoleIpIntoEvents(
+                  mediaAdditionalInfo.ipCaptureEvent,
+                  media.ipCaptureEvent,
+                  media.ipAddress,
+                  {
+                    eventName: NCMECEvent.Upload,
+                    dateTime: media.createdAt,
+                  },
+                ),
+              };
               return this.#upload(
                 reportId,
                 media,
                 cybertipAuthenticationCredentials,
-                mediaAdditionalInfo,
+                mergedMediaInfo,
                 isTest,
               );
             }),
@@ -1485,22 +2072,24 @@ export default class NcmecReporting {
           // We are intentionally using logErrorJson instead of relying on
           // safeTracer's logging because those logs are sampled in DD. For
           // NCMEC submission errors we need to record all failures and be
-          // able to see the logs
-
-          // eslint-disable-next-line no-console
-          console.error('[NCMEC] ❌ Error during report submission:', e);
-          // eslint-disable-next-line no-console
-          console.error('[NCMEC] Error details:', {
-            message: e instanceof Error ? e.message : String(e),
-            stack: e instanceof Error ? e.stack : undefined,
-          });
-
+          // able to see the logs.
           // eslint-disable-next-line no-restricted-syntax
           logErrorJson({
             error: e,
-            message: jsonStringify({ reportParams, isTest }),
+            message: jsonStringify({
+              reportParams: logSafeReportParams,
+              isTest,
+            }),
           });
           span.recordException(e as Exception);
+          if (reportParams.jobId !== undefined) {
+            await this.#recordSubmissionError({
+              jobId: reportParams.jobId,
+              userId: reportParams.reportedUser.id,
+              userTypeId: reportParams.reportedUser.typeId,
+              error: summarizeNcmecErrorForReviewer(e),
+            });
+          }
           return 'FAILURE';
         }
       },
@@ -1589,28 +2178,13 @@ export default class NcmecReporting {
   ) {
     const reportXML = js2xml(report, { compact: true });
 
-    // Save XML to file for review (development only)
-    if (process.env.NODE_ENV === 'development') {
-      try {
-        const fs = await import('fs/promises');
-        const path = await import('path');
-
-        // Create ncmec-reports directory if it doesn't exist
-        const reportsDir = path.join(process.cwd(), 'ncmec-reports');
-        await fs.mkdir(reportsDir, { recursive: true });
-
-        // Generate filename with timestamp and test indicator
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const testPrefix = isTest ? 'TEST-' : 'PROD-';
-        const filename = `${testPrefix}${timestamp}.xml`;
-        const filepath = path.join(reportsDir, filename);
-
-        // Write XML to file
-        await fs.writeFile(filepath, reportXML, 'utf-8');
-      } catch (e) {
-        // Silent fail - don't let file saving break the submission
-      }
-    }
+    ncmecDebugLog('submit.xml', { isTest, length: reportXML.length });
+    await ncmecDebugDump(
+      `${isTest ? 'TEST-' : 'PROD-'}${new Date()
+        .toISOString()
+        .replace(/[:.]/g, '-')}-submit.xml`,
+      reportXML,
+    );
 
     const response = await this.#sendCyberTipRequest({
       cybertipAuthenticationCredentials,
@@ -1621,14 +2195,10 @@ export default class NcmecReporting {
 
     const responseJson = response.body as CyberTipSubmitResponse;
     if (responseJson.reportResponse.responseCode._text !== '0') {
-      throw new Error('NCMEC report submission failed.');
+      throw new Error(
+        `NCMEC report submission failed: responseCode=${responseJson.reportResponse.responseCode._text}`,
+      );
     }
-
-    // eslint-disable-next-line no-console
-    console.log(
-      '[NCMEC] ✅ Report submitted successfully! Report ID:',
-      responseJson.reportResponse.reportId._text,
-    );
 
     return {
       reportId: responseJson.reportResponse.reportId._text,
@@ -1686,42 +2256,22 @@ export default class NcmecReporting {
       throw new Error('NCMEC file upload failed.');
     }
     const fileId = responseJson.reportResponse.fileId._text;
+    const originalFileHash = toOriginalFileHashes({
+      hmaHashes: media.hashes,
+      webhookFileDetails: additionalInfo.fileDetails,
+    });
+    const originalFileName =
+      additionalInfo.fileName ?? deriveOriginalFileNameFromUrl(media.url);
+    const fileDetailsObject = buildFileDetailsObject({
+      reportId: parseInt(reportId),
+      fileId,
+      ...(originalFileName ? { originalFileName } : {}),
+      media,
+      additionalInfo,
+      ...(originalFileHash ? { originalFileHash } : {}),
+    });
     const xml = await this.#uploadFileDetails(
-      {
-        fileDetails: {
-          reportId: parseInt(reportId),
-          fileId,
-          // All reported content is reviewed by the ESP before submission.
-          fileViewedByEsp: true,
-          exifViewedByEsp: true,
-          fileAnnotations: this.#fileAnnotationArrayToNCMECFileAnnotation(
-            media.fileAnnotations,
-          ),
-          industryClassification: media.industryClassification,
-          ...(additionalInfo.publiclyAvailable !== undefined
-            ? { publiclyAvailable: additionalInfo.publiclyAvailable }
-            : {}),
-          // Annoyingly, NCMEC only accepts IP Address XML in order so unwrap it
-          // in the correct order in case it was passed in incorrectly
-          ...(additionalInfo.ipCaptureEvent &&
-          additionalInfo.ipCaptureEvent.length > 0
-            ? {
-                ipCaptureEvent: additionalInfo.ipCaptureEvent.map((it) => ({
-                  ipAddress: it.ipAddress,
-                  eventName: it.eventName,
-                  dateTime: it.dateTime,
-                  ...(it.possibleProxy
-                    ? { possibleProxy: it.possibleProxy }
-                    : {}),
-                  ...(it.port ? { port: it.port } : {}),
-                })),
-              }
-            : {}),
-          ...(additionalInfo.additionalInfo
-            ? { additionalInfo: additionalInfo.additionalInfo }
-            : {}),
-        },
-      },
+      fileDetailsObject,
       cybertipAuthenticationCredentials,
       isTest,
     );
@@ -1733,73 +2283,24 @@ export default class NcmecReporting {
     };
   }
 
-  #fileAnnotationArrayToNCMECFileAnnotation(
-    fileAnnotations?: readonly NCMECFileAnnotationType[],
-  ): FileAnnotations {
-    return {
-      ...(fileAnnotations?.includes(
-        NCMECFileAnnotation.ANIME_DRAWING_VIRTUAL_HENTAI,
-      )
-        ? {
-            animeDrawingVirtualHentai: undefined,
-          }
-        : {}),
-      ...(fileAnnotations?.includes(NCMECFileAnnotation.POTENTIAL_MEME)
-        ? {
-            potentialMeme: undefined,
-          }
-        : {}),
-      ...(fileAnnotations?.includes(NCMECFileAnnotation.VIRAL)
-        ? {
-            viral: undefined,
-          }
-        : {}),
-      ...(fileAnnotations?.includes(
-        NCMECFileAnnotation.POSSIBLE_SELF_PRODUCTION,
-      )
-        ? {
-            possibleSelfProduction: undefined,
-          }
-        : {}),
-      ...(fileAnnotations?.includes(NCMECFileAnnotation.PHYSICAL_HARM)
-        ? {
-            physicalHarm: undefined,
-          }
-        : {}),
-      ...(fileAnnotations?.includes(NCMECFileAnnotation.VIOLENCE_GORE)
-        ? {
-            violenceGore: undefined,
-          }
-        : {}),
-      ...(fileAnnotations?.includes(NCMECFileAnnotation.BESTIALITY)
-        ? {
-            bestiality: undefined,
-          }
-        : {}),
-      ...(fileAnnotations?.includes(NCMECFileAnnotation.LIVE_STREAMING)
-        ? {
-            liveStreaming: undefined,
-          }
-        : {}),
-      ...(fileAnnotations?.includes(NCMECFileAnnotation.INFANT)
-        ? {
-            infant: undefined,
-          }
-        : {}),
-      ...(fileAnnotations?.includes(NCMECFileAnnotation.GENERATIVE_AI)
-        ? {
-            generativeAi: undefined,
-          }
-        : {}),
-    };
-  }
-
   async #uploadFileDetails(
     fileDetails: FileDetails,
     cybertipAuthenticationCredentials: CyberTipAuth,
     isTest: boolean,
   ) {
     const fileDetailsXML = js2xml(fileDetails, { compact: true });
+    ncmecDebugLog('fileinfo.xml', {
+      isTest,
+      reportId: fileDetails.fileDetails.reportId,
+      fileId: fileDetails.fileDetails.fileId,
+      length: fileDetailsXML.length,
+    });
+    await ncmecDebugDump(
+      `${isTest ? 'TEST-' : 'PROD-'}${new Date()
+        .toISOString()
+        .replace(/[:.]/g, '-')}-fileinfo-${fileDetails.fileDetails.fileId}.xml`,
+      fileDetailsXML,
+    );
     const response = await this.#sendCyberTipRequest({
       cybertipAuthenticationCredentials,
       body: fileDetailsXML,
@@ -1873,7 +2374,7 @@ export default class NcmecReporting {
 
         const response = await this.#sendCyberTipRequest({
           cybertipAuthenticationCredentials,
-          body: requestBody as FormDataType,
+          body: requestBody,
           route: '/upload',
           includeContentType: false,
           isTest,
@@ -1919,12 +2420,13 @@ export default class NcmecReporting {
     cybertipAuthenticationCredentials: CyberTipAuth,
     isTest: boolean,
   ) {
+    ncmecDebugLog('finish.request', { reportId, isTest });
     const requestBody = new FormData();
     requestBody.append('id', reportId);
 
     const response = await this.#sendCyberTipRequest({
       cybertipAuthenticationCredentials,
-      body: requestBody as FormDataType,
+      body: requestBody,
       route: '/finish',
       includeContentType: false,
       isTest,
@@ -1938,9 +2440,53 @@ export default class NcmecReporting {
     return responseJson.reportDoneResponse.reportId;
   }
 
+  /** Best-effort write of a failed-submission row. Swallows its own DB errors
+   * so a follow-on failure can't turn a NCMEC FAILURE into an unhandled
+   * exception. */
+  async #recordSubmissionError(opts: {
+    jobId: string;
+    userId: string;
+    userTypeId: string;
+    error: string;
+    status?: 'RETRYABLE_ERROR' | 'PERMANENT_ERROR';
+  }) {
+    try {
+      const status = opts.status ?? 'RETRYABLE_ERROR';
+      // Atomic increment in `doUpdateSet` avoids the read-modify-write race
+      // when two retries land on the same job_id concurrently.
+      await this.pgQuery
+        .insertInto('ncmec_reporting.ncmec_reports_errors')
+        .values({
+          job_id: opts.jobId,
+          user_id: opts.userId,
+          user_type_id: opts.userTypeId,
+          status,
+          last_error: opts.error,
+          retry_count: 1,
+        })
+        .onConflict((oc) =>
+          oc.columns(['job_id']).doUpdateSet({
+            retry_count: sql`ncmec_reporting.ncmec_reports_errors.retry_count + 1`,
+            last_error: opts.error,
+            status,
+          }),
+        )
+        .execute();
+    } catch (e: unknown) {
+      // eslint-disable-next-line no-restricted-syntax
+      logErrorJson({
+        error: e,
+        message: jsonStringify({
+          context: 'recordSubmissionError',
+          jobId: opts.jobId,
+        }),
+      });
+    }
+  }
+
   async #sendCyberTipRequest(input: {
     cybertipAuthenticationCredentials: CyberTipAuth;
-    body: string | FormDataType | FormDataLikeWithStreams;
+    body: string | FormData | FormDataLikeWithStreams;
     route: `/${string}`;
     isTest: boolean;
     includeContentType?: boolean;
@@ -1966,10 +2512,17 @@ export default class NcmecReporting {
         jitter: true,
       },
       async () => {
+        const url = isTest
+          ? `https://exttest.cybertip.org/ispws${route}`
+          : `https://report.cybertip.org/ispws${route}`;
+        ncmecDebugLog('cybertip.request', {
+          route,
+          isTest,
+          bodyKind: typeof body === 'string' ? 'xml' : 'formData',
+          bodyLength: typeof body === 'string' ? body.length : undefined,
+        });
         const response = await this.fetchHTTP({
-          url: isTest
-            ? `https://exttest.cybertip.org/ispws${route}`
-            : `https://report.cybertip.org/ispws${route}`,
+          url,
           method: 'post',
           headers: {
             ...(includeContentType ? { 'Content-Type': 'text/xml' } : {}),
@@ -1981,8 +2534,17 @@ export default class NcmecReporting {
           handleResponseBody: 'as-json-from-xml',
         });
 
+        ncmecDebugLog('cybertip.response', {
+          route,
+          status: response.status,
+          ok: response.ok,
+          body: response.body ?? null,
+        });
+
         if (!response.ok) {
-          throw new Error('CyberTip Request Failed');
+          throw new Error(
+            summarizeCyberTipFailure(route, response.status, response.body),
+          );
         }
         return response;
       },

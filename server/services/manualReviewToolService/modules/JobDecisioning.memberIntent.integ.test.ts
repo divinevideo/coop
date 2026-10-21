@@ -3,7 +3,6 @@ import { readFile } from 'node:fs/promises';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 
-import { UserRole } from '../../../models/types/permissioning.js';
 import {
   deliverMemberIntent,
   prepareMemberIntent,
@@ -15,7 +14,10 @@ import {
   roomJobQueueComplete,
 } from '../../../routes/concord/roomDispositions.js';
 import { roomExecutionId } from '../../../routes/concord/service.js';
+import { UserRole } from '../../../services/userManagementService/index.js';
 import { memberIntentTestDatabaseUrl } from '../../../test/memberIntentTestDatabase.js';
+import { roomDecisionSettings } from '../../../test/roomDecisionSettings.js';
+import { getPermissionsForRole } from '../../userManagementService/index.js';
 import { type ManualReviewToolServicePg } from '../dbTypes.js';
 import JobDecisioning from './JobDecisioning.js';
 
@@ -34,6 +36,9 @@ const config = {
 const getActor = async () => ({
   id: 'staff',
   orgId: 'synthetic',
+  getPermissions() {
+    return getPermissionsForRole(this.role);
+  },
   role: UserRole.ADMIN,
   approvedByAdmin: true,
   rejectedByAdmin: false,
@@ -129,6 +134,7 @@ test.each([false, true])(
       onRecord,
       { getItemType: async () => undefined } as never,
       {} as never,
+      roomDecisionSettings() as never,
       getActor,
       async () => {
         const prepared = await prepareMemberIntent(
@@ -277,6 +283,7 @@ test.each([false, true])(
       },
       { getItemType: async () => undefined } as never,
       {} as never,
+      roomDecisionSettings() as never,
       getActor,
       async () => [
         await prepareMemberIntent(

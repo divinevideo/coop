@@ -2,7 +2,10 @@
 import { randomUUID } from 'node:crypto';
 import { buildSchema, graphql } from 'graphql';
 
-import { UserRole } from '../../models/types/permissioning.js';
+import {
+  getPermissionsForRole,
+  UserRole,
+} from '../../services/userManagementService/index.js';
 import {
   actor,
   config,
@@ -83,13 +86,13 @@ function fixture(operation: string, role: UserRole = UserRole.ADMIN) {
     ...actor,
     role,
     email: 'staff@example.invalid',
-    getPermissions: () => [],
+    getPermissions: () => getPermissionsForRole(role),
   };
   const accepted = response(input(), '1');
   const fetchHTTP = jest.fn(async (_wire: RoomRequest) => ({
     ok: true,
     status: 202,
-    body: accepted as unknown,
+    body: accepted,
   }));
   const deps = {
     fetchHTTP,

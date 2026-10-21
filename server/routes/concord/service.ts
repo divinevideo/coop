@@ -2,10 +2,9 @@ import { createHash, createHmac } from 'node:crypto';
 import { v5 as uuidv5 } from 'uuid';
 
 import {
-  hasPermission,
   UserPermission,
   UserRole,
-} from '../../models/types/permissioning.js';
+} from '../../services/userManagementService/index.js';
 import { jsonStringify } from '../../utils/encoding.js';
 import {
   parseDiscordRestriction,
@@ -18,6 +17,7 @@ export type StaffActor = {
   role: UserRole;
   approvedByAdmin: boolean;
   rejectedByAdmin: boolean;
+  getPermissions(): readonly UserPermission[];
 };
 export type ConcordConfig = {
   origin: string;
@@ -166,7 +166,7 @@ export function roomPermissions(actor: StaffActor): string[] {
     !actor.orgId ||
     !actor.approvedByAdmin ||
     actor.rejectedByAdmin ||
-    !hasPermission(UserPermission.MANUALLY_ACTION_CONTENT, actor.role)
+    !actor.getPermissions().includes(UserPermission.MANUALLY_ACTION_CONTENT)
   )
     return [];
   return [
@@ -303,7 +303,7 @@ export function parseRoomStatus(value: unknown): RoomStatus {
     !['communityId', 'channelId', 'rumorId'].every(
       (key) =>
         typeof target[key] === 'string' &&
-        /^[0-9a-f]{64}$/.test(target[key] as string),
+        /^[0-9a-f]{64}$/.test(target[key]),
     ) ||
     !Array.isArray(status.deliveries) ||
     status.deliveries.length !== 3

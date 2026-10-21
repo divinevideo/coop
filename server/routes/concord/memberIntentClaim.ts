@@ -1,6 +1,7 @@
 import { type Kysely } from 'kysely';
 
 import { jsonStringify } from '../../utils/encoding.js';
+import { makeKyselyTransactionWithRetry } from '../../utils/kyselyTransactionWithRetry.js';
 import { lockRoomExecution } from './manualRoomOperations.js';
 import { memberIntentFingerprint } from './memberIntentIdentity.js';
 import { type MemberIntentPg } from './memberIntentTypes.js';
@@ -13,7 +14,7 @@ export async function claimMemberIntent(
   retryAfterLookup = false,
 ) {
   const executionId = roomExecutionId(input);
-  return pg.transaction().execute(async (tx) => {
+  return makeKyselyTransactionWithRetry(pg)(async (tx) => {
     await lockRoomExecution(tx, input.orgId, executionId);
     const disposition = await getRoomExecutionDisposition(
       tx,

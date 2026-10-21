@@ -1,6 +1,5 @@
 #!/usr/bin/env -S node --loader ts-node/esm --require dotenv/config
-import type { DatabaseConfig } from '@roostorg/db-migrator';
-import { makeCli } from '@roostorg/db-migrator';
+import { makeCli, type DatabaseConfig } from '@roostorg/db-migrator';
 
 import apiServerPostgresConfig from './configs/api-server-pg.js';
 import clickhouseConfig from './configs/clickhouse.js';

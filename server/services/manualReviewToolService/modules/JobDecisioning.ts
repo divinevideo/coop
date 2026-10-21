@@ -24,9 +24,15 @@ import {
   isCoopErrorOfType,
   type ErrorInstanceData,
 } from '../../../utils/errors.js';
+import { makeKyselyTransactionWithRetry } from '../../../utils/kyselyTransactionWithRetry.js';
+import { assertUnreachable } from '../../../utils/misc.js';
+import { isNonEmptyString } from '../../../utils/typescript-types.js';
 import { getFieldValueForRole } from '../../itemProcessingService/index.js';
 import { type NCMECMediaReport } from '../../ncmecService/ncmecReporting.js';
-import { type ManualReviewToolServicePg } from '../dbTypes.js';
+import {
+  type ClearReportsDisposition,
+  type ManualReviewToolServicePg,
+} from '../dbTypes.js';
 import { type GetActionsByIdEventuallyConsistent } from '../manualReviewToolQueries.js';
 import {
   type AppealEnqueueSourceInfo,
@@ -36,6 +42,7 @@ import {
   type ManualReviewJobEnqueueSourceInfo,
   type ReportHistory,
 } from '../manualReviewToolService.js';
+import type ManualReviewToolSettings from './ManualReviewToolSettings.js';
 import type QueueOperations from './QueueOperations.js';
 import { jobIdToGuid } from './QueueOperations.js';
 
@@ -68,7 +75,22 @@ export type NCMECThreadReport = {
   reportedContent: readonly NCMECReportedContentInThread[];
 };
 
-type MRTJobAutoCloseReason = 'ITEM_DELETED_BEFORE_REVIEW';
+type MRTJobAutoCloseReason =
+  | 'ITEM_DELETED_BEFORE_REVIEW'
+  // Another job for this user was actioned and the queue closes their other
+  // reports (issue #650).
+  | 'USER_ACTIONED';
+
+/**
+ * `reviewer_id` recorded for decisions the system makes with no human reviewer
+ * (e.g. AUTOMATIC_CLOSE). `manual_review_decisions.reviewer_id` is NOT NULL, so
+ * we can't store null; we store the empty string instead. The MRT client treats
+ * a falsy reviewer id as "Automatic" (see getReviewerName in
+ * ManualReviewRecentDecisions.tsx), and the reviewer-grouped analytics table
+ * drops ids that don't match an org user, so the empty string renders correctly
+ * everywhere without a schema migration or any client change.
+ */
+export const AUTOMATED_DECISION_REVIEWER_ID = '';
 
 export type ManualReviewDecisionComponent =
   | { type: 'IGNORE' }
@@ -96,6 +118,7 @@ export type ManualReviewDecisionComponent =
       reportedMessages: readonly NCMECThreadReport[];
       incidentType: string;
       escalateToHighPriority?: string;
+      additionalInfo?: string;
     }
   | {
       type: 'TRANSFORM_JOB_AND_RECREATE_IN_QUEUE';
@@ -111,6 +134,11 @@ export type ManualReviewDecisionComponent =
 export type ManualReviewDecisionType =
   | ManualReviewDecisionComponent['type']
   | 'RELATED_ACTION';
+
+export type CustomActionDecisionComponent = Extract<
+  ManualReviewDecisionComponent,
+  { type: 'CUSTOM_ACTION' }
+>;
 
 export type SubmitDecisionInput = {
   isAppealsQueue?: boolean;
@@ -136,6 +164,9 @@ export type SubmitDecisionInput = {
       decisionComponents: ManualReviewDecisionComponent[];
       reviewerId: string;
       reviewerEmail: string;
+      // Set by the sweep on its own disposition decisions so SAME_ACTION
+      // can't recurse.
+      suppressUserReportSweep?: boolean;
     }
 );
 
@@ -149,6 +180,7 @@ export type OnRecordDecisionInput = {
   reviewerId: string;
   reviewerEmail: string;
   decisionReason?: string;
+  suppressUserReportSweep?: boolean;
 };
 
 export function assertRoomRelatedItemTypeAvailable(itemType: unknown) {
@@ -189,6 +221,7 @@ export default class JobDecisioning {
     readonly onRecordDecision: (params: OnRecordDecisionInput) => Promise<void>,
     private readonly moderationConfigService: Dependencies['ModerationConfigService'],
     private readonly tracer: Dependencies['Tracer'],
+    private readonly manualReviewToolSettings: ManualReviewToolSettings,
     private readonly getRoomActor?: (
       id: string,
       orgId: string,
@@ -261,6 +294,10 @@ export default class JobDecisioning {
       decisionReason,
       automaticCloseDecision,
     } = opts;
+    const suppressUserReportSweep =
+      opts.automaticCloseDecision === undefined
+        ? opts.suppressUserReportSweep
+        : undefined;
 
     const [job] = await this.#getJobsForDecision(opts);
 
@@ -284,8 +321,11 @@ export default class JobDecisioning {
     // (for security) before we save the data to the db. We accept that there
     // could be some legit policies/actions that are very rarely not found
     // (from eventually consistent pg lookup) as a reasonable tradeoff.
+    const customActionDecisions = decisions.flatMap((decision) =>
+      decision.type === 'CUSTOM_ACTION' ? [decision] : [],
+    );
     if (
-      decisions.some((decision) => decision.type === 'CUSTOM_ACTION') ||
+      customActionDecisions.length > 0 ||
       relatedActions.some((related) => related.actionIds.length > 0)
     ) {
       const primaryActionIds = decisions.flatMap((decision) =>
@@ -364,6 +404,68 @@ export default class JobDecisioning {
         !validActions.some((action) => primaryActionIds.includes(action.id))
       ) {
         throw makeSubmittedJobActionNotFoundError({ shouldErrorSpan: true });
+      }
+
+      // Enforce `requires_policy_for_decisions` server-side. The MRT UI already
+      // disables submit when this is on, but API/script callers can bypass that.
+      // Only check the flag when there's actually a policy-less decision to
+      // enforce against, so the common path avoids the extra DB hit. The check
+      // only fires for CUSTOM_ACTION decisions, so it applies even on NCMEC
+      // jobs that mix in a CUSTOM_ACTION (e.g. issuing a strike alongside an
+      // NCMEC ignore or report).
+      const hasEmptyPolicyCustomAction = customActionDecisions.some(
+        (decision) => decision.policies.length === 0,
+      );
+      if (hasEmptyPolicyCustomAction) {
+        const requiresPolicy =
+          await this.manualReviewToolSettings.getRequiresPolicyForDecisions(
+            orgId,
+          );
+        if (requiresPolicy) {
+          throw makeMissingRequiredPolicyForDecisionError({
+            shouldErrorSpan: true,
+          });
+        }
+      }
+    }
+
+    // Enforce the "require decision reason" settings server-side. The MRT UI
+    // already disables submit when these are on, but API/script callers can
+    // bypass that. Skip the AUTOMATIC_CLOSE path (no moderator, no reason to
+    // require) and only read a flag when there's actually a missing reason to
+    // enforce against, so the common path does no extra DB work. Matches the
+    // client gate at ManualReviewJobReview.tsx, which uses isNonEmptyString.
+    //
+    // The requirement is split in two (see #757): ignoring a job means "no
+    // violation / no action" and is governed by its own flag, separate from
+    // the flag for violating (non-ignore) decisions. A decision composed
+    // solely of IGNORE components is an ignore; anything else (custom actions,
+    // appeals, etc.) is a violating decision.
+    //
+    // Bypass the check entirely when the decision is NCMEC-native (Submit NCMEC
+    // Report or Ignore on an NCMEC job, no CUSTOM_ACTION mixed in): those
+    // decisions don't carry a written reason and the flags are irrelevant for
+    // them. A CUSTOM_ACTION on an NCMEC job still requires a reason. See #736.
+    const isNcmecNativeDecision =
+      job.payload.kind === 'NCMEC' && customActionDecisions.length === 0;
+    const isIgnoreDecision =
+      decisions.length > 0 &&
+      decisions.every((decision) => decision.type === 'IGNORE');
+    if (
+      decisionComponents != null &&
+      !isNonEmptyString(decisionReason) &&
+      !isNcmecNativeDecision
+    ) {
+      const requiresReason = isIgnoreDecision
+        ? await this.manualReviewToolSettings.getRequiresDecisionReasonOnIgnore(
+            orgId,
+          )
+        : await this.manualReviewToolSettings.getRequiresDecisionReason(orgId);
+      if (requiresReason) {
+        throw makeMissingRequiredDecisionReasonError({
+          detail: 'This org requires a decision reason for this decision',
+          shouldErrorSpan: true,
+        });
       }
     }
 
@@ -613,6 +715,7 @@ export default class JobDecisioning {
         reviewerId,
         reviewerEmail,
         decisionReason,
+        suppressUserReportSweep,
       }).catch((error) => {
         this.tracer.addSpan(
           { resource: 'actionPublisher', operation: 'publishAction' },
@@ -636,6 +739,157 @@ export default class JobDecisioning {
     }
   }
 
+  /**
+   * Logs the decision and runs side effects for a job the clear-other-reports
+   * sweep chose to dispose of. This only records the decision (in pg) and runs
+   * side effects; the caller is responsible for removing the job from its queue
+   * *after* this resolves, so the decision is durably recorded first (matching
+   * the invariant in `submitDecision`).
+   *
+   * Returns:
+   *  - `'logged'`: a new decision was recorded by this call.
+   *  - `'already-logged'`: a concurrent decider beat us to it.
+   *  - `'skipped'`: there was nothing to record.
+   */
+  async recordSweptJobDisposition(opts: {
+    orgId: string;
+    queueId: string;
+    job: ManualReviewJob;
+    disposition: ClearReportsDisposition;
+    // Re-targeted at this job's item when the disposition is SAME_ACTION.
+    triggerCustomActions: readonly CustomActionDecisionComponent[];
+    reviewerId: string;
+    reviewerEmail: string;
+    decisionReason?: string;
+  }): Promise<'logged' | 'already-logged' | 'skipped'> {
+    const {
+      orgId,
+      queueId,
+      job,
+      disposition,
+      triggerCustomActions,
+      reviewerId,
+      reviewerEmail,
+      decisionReason,
+    } = opts;
+
+    const itemType = await this.moderationConfigService.getItemType({
+      orgId,
+      itemTypeSelector: job.payload.item.itemTypeIdentifier,
+    });
+    // Room jobs use durable acceptance and audited stop before queue removal.
+    // The ordinary sweep cannot replace that decision or complete its queue job.
+    if (
+      ['concord_message', 'concord_member'].includes(itemType?.name ?? '') ||
+      (await this.#hasRecordedRoomDelivery(orgId, job.id))
+    )
+      return 'skipped';
+
+    const decisionComponents = this.#buildSweptDecisionComponents({
+      disposition,
+      job,
+      triggerCustomActions,
+    });
+    if (decisionComponents.length === 0) {
+      return 'skipped';
+    }
+
+    try {
+      await this.#logDecision({
+        id: jobIdToGuid(job.id),
+        job,
+        queueId,
+        reviewerId,
+        orgId,
+        decisionComponents,
+        relatedActions: [],
+        enqueueSourceInfo: job.enqueueSourceInfo,
+        decisionReason,
+      });
+    } catch (error) {
+      // A concurrent reviewer already decided this job; nothing left to do.
+      if (isDecisionAlreadyLoggedError(error)) {
+        return (await this.#hasRecordedRoomDelivery(orgId, job.id))
+          ? 'skipped'
+          : 'already-logged';
+      }
+      throw error;
+    }
+
+    if (disposition === 'AUTOMATIC_CLOSE') {
+      return 'logged';
+    }
+
+    // Best-effort: the decision is already persisted above, so a failure to
+    // publish actions (e.g. a transient DB/network error) must not prevent the
+    // caller from removing the job from the queue or continuing the sweep.
+    try {
+      await this.onRecordDecision({
+        decisionComponents,
+        relatedActions: [],
+        job,
+        queueId,
+        reviewerId,
+        reviewerEmail,
+        decisionReason,
+        suppressUserReportSweep: true,
+      });
+    } catch (error) {
+      this.tracer.addSpan(
+        { resource: 'mrtService', operation: 'sweptJob.onRecordDecision' },
+        (span) => {
+          span.setAttribute('job.id', job.id);
+          span.setAttribute('org.id', orgId);
+          this.tracer.logSpanFailed(span, error);
+          return null;
+        },
+      );
+    }
+    return 'logged';
+  }
+
+  async #hasRecordedRoomDelivery(
+    orgId: string,
+    jobId: JobId,
+  ): Promise<boolean> {
+    const prior = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .where('org_id', '=', orgId)
+      .where('id', '=', jobIdToGuid(jobId))
+      .select('job_payload')
+      .executeTakeFirst();
+    return prior?.job_payload.roomDeliveryRequired === true;
+  }
+
+  #buildSweptDecisionComponents(opts: {
+    disposition: ClearReportsDisposition;
+    job: ManualReviewJob;
+    triggerCustomActions: readonly CustomActionDecisionComponent[];
+  }): ManualReviewDecisionComponent[] {
+    const { disposition, job, triggerCustomActions } = opts;
+    switch (disposition) {
+      case 'AUTOMATIC_CLOSE':
+        return [{ type: 'AUTOMATIC_CLOSE', reason: 'USER_ACTIONED' }];
+      case 'IGNORE':
+        return [{ type: 'IGNORE' }];
+      case 'SAME_ACTION': {
+        // Re-target the moderator's custom action(s) at this job's own item.
+        const { item } = job.payload;
+        return triggerCustomActions.map((component) => ({
+          type: 'CUSTOM_ACTION',
+          actions: component.actions,
+          policies: component.policies,
+          itemIds: [item.itemId],
+          itemTypeId: item.itemTypeIdentifier.id,
+          actionIdsToMrtApiParamDecisionPayload:
+            component.actionIdsToMrtApiParamDecisionPayload,
+        }));
+      }
+      default:
+        return assertUnreachable(disposition);
+    }
+  }
+
   async #logDecision(opts: {
     id: string;
     job: ManualReviewJob | ManualReviewAppealJob;
@@ -648,7 +902,7 @@ export default class JobDecisioning {
       | ManualReviewJobEnqueueSourceInfo
       | AppealEnqueueSourceInfo;
     decisionReason?: string;
-    roomDeliveryRequired: boolean;
+    roomDeliveryRequired?: boolean;
   }) {
     const {
       id,
@@ -686,7 +940,7 @@ export default class JobDecisioning {
         ? { ...job, roomDeliveryRequired: true as const }
         : job,
       queue_id: queueId,
-      reviewer_id: reviewerId,
+      reviewer_id: reviewerId ?? AUTOMATED_DECISION_REVIEWER_ID,
       org_id: orgId,
       decision_components: decisionComponents,
       related_actions: relatedActions,
@@ -719,7 +973,7 @@ export default class JobDecisioning {
       decisionReason,
       roomDeliveryRequired: true,
     });
-    return this.pgQuery.transaction().execute(async (tx) => {
+    return makeKyselyTransactionWithRetry(this.pgQuery)(async (tx) => {
       await tx
         .insertInto('manual_review_tool.manual_review_decisions')
         .values(values)
@@ -781,13 +1035,109 @@ export default class JobDecisioning {
     );
   }
 
+  async getNcmecDecisionsForOrg(opts: { orgId: string; limit?: number }) {
+    const { orgId } = opts;
+    // Clamp `limit` so callers can't request an unreasonable number of rows;
+    // default of 500 matches the previous behavior. Non-numeric values fall
+    // back to the default via Number.isFinite.
+    const requestedLimit = opts.limit ?? 500;
+    const safeLimit =
+      Number.isFinite(requestedLimit) && requestedLimit > 0
+        ? Math.min(Math.floor(requestedLimit), 500)
+        : 500;
+    const allNcmecDecisions = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .where('org_id', '=', orgId)
+      .where(({ eb, selectFrom }) => {
+        return eb.exists(
+          selectFrom(
+            sql`unnest(manual_review_tool.manual_review_decisions.decision_components)`.as(
+              'decision_component',
+            ),
+          )
+            .selectAll()
+            .where(
+              sql<string>`decision_component->>'type'`,
+              '=',
+              'SUBMIT_NCMEC_REPORT',
+            ),
+        );
+      })
+      .select([
+        'org_id',
+        'decision_components',
+        'job_payload',
+        'id',
+        'queue_id',
+        'reviewer_id',
+        'created_at',
+      ])
+      .orderBy('created_at', 'desc')
+      .limit(safeLimit)
+      .execute();
+    return filterNullOrUndefined(
+      allNcmecDecisions.map((it) => {
+        if (
+          'policyIds' in it.job_payload &&
+          'submissionId' in it.job_payload.payload.item
+        ) {
+          return { ...it, job_payload: it.job_payload };
+        }
+        return undefined;
+      }),
+    );
+  }
+
+  /** Single-decision lookup gated on the caller's org. Returns `undefined` if
+   * the decision doesn't exist or belongs to a different org (callers should
+   * treat both cases as "not found" — never confirm cross-org existence). */
+  async getNcmecDecisionByIdForOrg(opts: {
+    orgId: string;
+    decisionId: string;
+  }) {
+    const { orgId, decisionId } = opts;
+    const row = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .where('id', '=', decisionId)
+      .where('org_id', '=', orgId)
+      .select([
+        'org_id',
+        'decision_components',
+        'job_payload',
+        'id',
+        'queue_id',
+        'reviewer_id',
+        'created_at',
+      ])
+      .executeTakeFirst();
+    if (!row) {
+      return undefined;
+    }
+    // Only return decisions that actually contain a SUBMIT_NCMEC_REPORT
+    // component so callers get the same `not_found` shape for both
+    // "wrong-org" and "wrong-decision-type" lookups.
+    const hasNcmecComponent = row.decision_components.some(
+      (component) => component.type === 'SUBMIT_NCMEC_REPORT',
+    );
+    if (!hasNcmecComponent) {
+      return undefined;
+    }
+    if (
+      !('policyIds' in row.job_payload) ||
+      !('submissionId' in row.job_payload.payload.item)
+    ) {
+      return undefined;
+    }
+    return { ...row, job_payload: row.job_payload };
+  }
+
   async getIgnoreCallbackForOrg(orgId: string): Promise<string | undefined> {
     const settings = await this.pgQuery
       .selectFrom('manual_review_tool.manual_review_tool_settings')
       .where('org_id', '=', orgId)
       .select('ignore_callback_url as ignoreCallback')
       .executeTakeFirst();
-    return settings?.ignoreCallback;
+    return settings?.ignoreCallback ?? undefined;
   }
 }
 
@@ -808,7 +1158,9 @@ export type SubmitDecisionErrorType =
   | 'JobHasAlreadyBeenSubmittedError'
   | 'SubmittedJobActionNotFoundError'
   | 'NoJobWithIdInQueueError'
-  | 'RecordingJobDecisionFailedError';
+  | 'RecordingJobDecisionFailedError'
+  | 'MissingRequiredDecisionReasonError'
+  | 'MissingRequiredPolicyForDecisionError';
 
 export const makeJobHasAlreadyBeenSubmittedError = (data: ErrorInstanceData) =>
   new CoopError({
@@ -843,5 +1195,29 @@ export const makeNoJobWithIdInQueueError = (data: ErrorInstanceData) =>
     type: [ErrorType.NotFound],
     title: String(data.detail),
     name: 'NoJobWithIdInQueueError',
+    ...data,
+  });
+
+export const makeMissingRequiredDecisionReasonError = (
+  data: ErrorInstanceData,
+) =>
+  new CoopError({
+    status: 400,
+    type: [ErrorType.InvalidUserInput],
+    title:
+      'This org requires every decision to include a reason. Add a reason and resubmit.',
+    name: 'MissingRequiredDecisionReasonError',
+    ...data,
+  });
+
+export const makeMissingRequiredPolicyForDecisionError = (
+  data: ErrorInstanceData,
+) =>
+  new CoopError({
+    status: 400,
+    type: [ErrorType.InvalidUserInput],
+    title:
+      'This org requires every decision to include at least one policy. Pick a policy and resubmit.',
+    name: 'MissingRequiredPolicyForDecisionError',
     ...data,
   });

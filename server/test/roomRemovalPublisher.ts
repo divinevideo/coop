@@ -1,11 +1,14 @@
 /* eslint-disable functional/immutable-data -- Authorization fixtures deliberately change between requests. */
 import { type Kysely } from 'kysely';
 
-import { UserRole } from '../models/types/permissioning.js';
 import { type MemberIntentPg } from '../routes/concord/memberIntentTypes.js';
 import { type RoomRequest } from '../routes/concord/service.js';
 import { ActionPublisher } from '../rule_engine/ActionPublisher.js';
 import { ActionType } from '../services/moderationConfigService/index.js';
+import {
+  getPermissionsForRole,
+  UserRole,
+} from '../services/userManagementService/index.js';
 import { toCorrelationId } from '../utils/correlationIds.js';
 import { tryJsonParse } from '../utils/encoding.js';
 import { config } from './memberIntentFixtures.js';
@@ -20,7 +23,9 @@ export async function checkRoomRemovalPublisher(
     role: UserRole.MODERATOR,
     approvedByAdmin: true,
     rejectedByAdmin: false,
-    getPermissions: () => [],
+    getPermissions() {
+      return getPermissionsForRole(this.role);
+    },
   };
   const status = {
     decisionId: '10000000-0000-4000-8000-000000000002',
@@ -67,6 +72,7 @@ export async function checkRoomRemovalPublisher(
       }),
     } as never,
     { applyUserStrikeFromPublishedActions: async () => {} } as never,
+    (async () => undefined),
     { getGraphQLUserFromId: async () => actor } as never,
     pgQuery,
   );

@@ -17,7 +17,7 @@ on:
       - '.github/workflows/build-and-push.yaml'
     tags:
       - 'divine-v*'
-  workflow_dispatch:   # manual rebuild to pick up new upstream client assets
+  workflow_dispatch: # manual rebuild to pick up new upstream client assets
 
 env:
   REGISTRY: ghcr.io

@@ -2,8 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { GraphQLError } from 'graphql';
 import { sql, type Kysely } from 'kysely';
 
-import { UserRole } from '../../models/types/permissioning.js';
+import { UserRole } from '../../services/userManagementService/index.js';
 import { jsonStringify } from '../../utils/encoding.js';
+import { makeKyselyTransactionWithRetry } from '../../utils/kyselyTransactionWithRetry.js';
 import { type ManualRoomOperationStatus } from './manualRoomOperationTypes.js';
 import { assertMemberIntentStatus } from './memberIntentStatus.js';
 import {
@@ -166,7 +167,7 @@ export async function beginManualRoomOperation(
     ...request,
     correlationId: `manual-action-run:${operationId}`,
   };
-  return pg.transaction().execute(async (tx) => {
+  return makeKyselyTransactionWithRetry(pg)(async (tx) => {
     await tx
       .insertInto('concord_integration.room_manual_operations')
       .values({
@@ -222,7 +223,7 @@ export async function retirePreparedManualRoomOperation(
   if (!validRoomReason(access.reason))
     throw new Error('Invalid retirement reason');
   const initial = await authorizedReceipt(pg, dependencies, access);
-  return pg.transaction().execute(async (tx) => {
+  return makeKyselyTransactionWithRetry(pg)(async (tx) => {
     await lockRoomExecution(tx, access.orgId, initial.execution_id);
     const receipt = await authorizedReceipt(tx, dependencies, access);
     const status = await statusOf(tx, receipt);
@@ -293,7 +294,7 @@ export async function claimManualRoomOperation(
     initial.request_payload.actionName,
     initial.request_payload.parameters ?? {},
   );
-  return pg.transaction().execute(async (tx) => {
+  return makeKyselyTransactionWithRetry(pg)(async (tx) => {
     await lockRoomExecution(tx, access.orgId, initial.execution_id);
     const receipt = await authorizedReceipt(tx, dependencies, access);
     const status = await statusOf(tx, receipt);
@@ -339,7 +340,7 @@ export async function settleManualRoomOperation(
   pg: Kysely<MemberIntentPg>,
   input: { orgId: string; executionId: string; outcome: MemberDeliveryOutcome },
 ) {
-  return pg.transaction().execute(async (tx) => {
+  return makeKyselyTransactionWithRetry(pg)(async (tx) => {
     await lockRoomExecution(tx, input.orgId, input.executionId);
     const receipt = await tx
       .selectFrom('concord_integration.room_manual_operations')

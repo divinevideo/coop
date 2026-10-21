@@ -10,19 +10,26 @@ import {
 } from '@/coop-ui/Select';
 import { toast } from '@/coop-ui/Toast';
 import { Heading, Text } from '@/coop-ui/Typography';
-import type { GQLNcmecInternetDetailType } from '@/graphql/generated';
 import {
+  GQLNcmecMediaReviewRequirement,
+  GQLUserPermission,
   useGQLNcmecOrgSettingsQuery,
   useGQLUpdateNcmecOrgSettingsMutation,
+  type GQLNcmecInternetDetailType,
 } from '@/graphql/generated';
+import { userHasPermissions } from '@/routing/permissions';
 import { gql } from '@apollo/client';
 import { useEffect, useState } from 'react';
 import { Helmet } from 'react-helmet-async';
+import { Navigate } from 'react-router-dom';
 
 import FullScreenLoading from '@/components/common/FullScreenLoading';
 
 gql`
   query NcmecOrgSettings {
+    me {
+      permissions
+    }
     ncmecOrgSettings {
       username
       password
@@ -39,6 +46,8 @@ gql`
       contactPersonFirstName
       contactPersonLastName
       contactPersonPhone
+      mediaReviewRequirement
+      minMediaToReview
     }
     myOrg {
       hasNCMECReportingEnabled
@@ -72,6 +81,8 @@ type NcmecSettings = {
   contactPersonFirstName: string;
   contactPersonLastName: string;
   contactPersonPhone: string;
+  mediaReviewRequirement: GQLNcmecMediaReviewRequirement;
+  minMediaToReview: string;
 };
 
 export default function NCMECSettings() {
@@ -91,9 +102,13 @@ export default function NCMECSettings() {
     contactPersonFirstName: '',
     contactPersonLastName: '',
     contactPersonPhone: '',
+    mediaReviewRequirement: GQLNcmecMediaReviewRequirement.All,
+    minMediaToReview: '1',
   });
 
-  const { loading, error, data } = useGQLNcmecOrgSettingsQuery();
+  const { loading, error, data } = useGQLNcmecOrgSettingsQuery({
+    errorPolicy: 'all',
+  });
 
   const [updateSettings, { loading: isUpdateLoading }] =
     useGQLUpdateNcmecOrgSettingsMutation({
@@ -120,22 +135,34 @@ export default function NCMECSettings() {
           data.ncmecOrgSettings.ncmecPreservationEndpoint ?? '',
         ncmecAdditionalInfoEndpoint:
           data.ncmecOrgSettings.ncmecAdditionalInfoEndpoint ?? '',
-        defaultNcmecQueueId:
-          data.ncmecOrgSettings.defaultNcmecQueueId ?? '',
+        defaultNcmecQueueId: data.ncmecOrgSettings.defaultNcmecQueueId ?? '',
         defaultInternetDetailType:
           data.ncmecOrgSettings.defaultInternetDetailType ?? '',
         termsOfService: data.ncmecOrgSettings.termsOfService ?? '',
         contactPersonEmail: data.ncmecOrgSettings.contactPersonEmail ?? '',
         contactPersonFirstName:
           data.ncmecOrgSettings.contactPersonFirstName ?? '',
-        contactPersonLastName: data.ncmecOrgSettings.contactPersonLastName ?? '',
+        contactPersonLastName:
+          data.ncmecOrgSettings.contactPersonLastName ?? '',
         contactPersonPhone: data.ncmecOrgSettings.contactPersonPhone ?? '',
+        mediaReviewRequirement:
+          data.ncmecOrgSettings.mediaReviewRequirement ??
+          GQLNcmecMediaReviewRequirement.All,
+        minMediaToReview: String(data.ncmecOrgSettings.minMediaToReview ?? 1),
       });
     }
   }, [data?.ncmecOrgSettings]);
 
   if (loading) {
     return <FullScreenLoading />;
+  }
+
+  const permissions = data?.me?.permissions;
+  if (
+    !permissions ||
+    !userHasPermissions(permissions, [GQLUserPermission.ManageOrg])
+  ) {
+    return <Navigate to="/dashboard/settings" replace />;
   }
 
   if (error) {
@@ -152,7 +179,38 @@ export default function NCMECSettings() {
     }
 
     if (!settings.companyTemplate || !settings.legalUrl) {
-      toast.error('Company Template and Legal URL are required for NCMEC reporting.');
+      toast.error(
+        'Company Template and Legal URL are required for NCMEC reporting.',
+      );
+      return;
+    }
+
+    const trimmedContactEmail = settings.contactEmail.trim();
+    if (trimmedContactEmail === '') {
+      toast.error('Contact Email is required for NCMEC reporting.');
+      return;
+    }
+    // Mirrors the server's MAX_EMAIL_LENGTH.
+    if (trimmedContactEmail.length > 254) {
+      toast.error('Contact Email must be 254 characters or fewer.');
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedContactEmail)) {
+      toast.error('Contact Email is not a valid email address.');
+      return;
+    }
+
+    const isMinimumPolicy =
+      settings.mediaReviewRequirement ===
+      GQLNcmecMediaReviewRequirement.Minimum;
+    const parsedMinMedia = Number(settings.minMediaToReview);
+    if (
+      isMinimumPolicy &&
+      (!Number.isInteger(parsedMinMedia) || parsedMinMedia < 1)
+    ) {
+      toast.error(
+        'Minimum media to review must be a whole number of at least 1.',
+      );
       return;
     }
 
@@ -161,12 +219,11 @@ export default function NCMECSettings() {
         input: {
           username: settings.username,
           password: settings.password,
-          contactEmail: settings.contactEmail || null,
+          contactEmail: trimmedContactEmail,
           moreInfoUrl: settings.moreInfoUrl || null,
           companyTemplate: settings.companyTemplate || null,
           legalUrl: settings.legalUrl || null,
-          ncmecPreservationEndpoint:
-            settings.ncmecPreservationEndpoint || null,
+          ncmecPreservationEndpoint: settings.ncmecPreservationEndpoint || null,
           ncmecAdditionalInfoEndpoint:
             settings.ncmecAdditionalInfoEndpoint || null,
           defaultNcmecQueueId: settings.defaultNcmecQueueId || null,
@@ -178,6 +235,8 @@ export default function NCMECSettings() {
           contactPersonFirstName: settings.contactPersonFirstName || null,
           contactPersonLastName: settings.contactPersonLastName || null,
           contactPersonPhone: settings.contactPersonPhone || null,
+          mediaReviewRequirement: settings.mediaReviewRequirement,
+          minMediaToReview: isMinimumPolicy ? parsedMinMedia : null,
         },
       },
     });
@@ -291,17 +350,21 @@ export default function NCMECSettings() {
 
           <div className="flex flex-col gap-2">
             <Label htmlFor="contactEmail" className="text-sm font-medium">
-              Contact Email
+              Contact Email <span className="text-red-600">*</span>
             </Label>
             <Input
               id="contactEmail"
               type="email"
+              required
               value={settings.contactEmail}
               onChange={(e) =>
                 setSettings({ ...settings, contactEmail: e.target.value })
               }
               placeholder="contact@yourcompany.com"
             />
+            <Text size="XS" className="text-gray-500">
+              Required. Used as the reporter contact on every NCMEC report.
+            </Text>
           </div>
 
           <div className="flex flex-col gap-2">
@@ -320,7 +383,8 @@ export default function NCMECSettings() {
               rows={3}
             />
             <Text size="XS" className="text-gray-500">
-              Optional TOS line included in the CyberTip reporter. {settings.termsOfService.length}/3000 characters.
+              Optional TOS line included in the CyberTip reporter.{' '}
+              {settings.termsOfService.length}/3000 characters.
             </Text>
           </div>
 
@@ -329,7 +393,8 @@ export default function NCMECSettings() {
               Contact person (for law enforcement)
             </Label>
             <Text size="XS" className="text-gray-500 mb-1">
-              Person law enforcement can contact other than the reporting person. All fields optional.
+              Person law enforcement can contact other than the reporting
+              person. All fields optional.
             </Text>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Input
@@ -384,6 +449,79 @@ export default function NCMECSettings() {
           </div>
 
           <div className="flex flex-col gap-2">
+            <Label
+              htmlFor="mediaReviewRequirement"
+              className="text-sm font-medium"
+            >
+              Media review requirement
+            </Label>
+            <Select
+              value={settings.mediaReviewRequirement}
+              onValueChange={(value) =>
+                setSettings({
+                  ...settings,
+                  mediaReviewRequirement:
+                    value as GQLNcmecMediaReviewRequirement,
+                })
+              }
+            >
+              <SelectTrigger id="mediaReviewRequirement">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={GQLNcmecMediaReviewRequirement.All}>
+                  Review all media before reporting
+                </SelectItem>
+                <SelectItem value={GQLNcmecMediaReviewRequirement.Minimum}>
+                  Require a minimum number of reviewed media
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            <Text size="XS" className="text-gray-500">
+              Controls how much media a reviewer must classify before they can
+              send an NCMEC report. &quot;Review all media&quot; requires a
+              decision on every item on the account (which can be hundreds);
+              &quot;minimum&quot; only requires the number below, so reviewers
+              can report the relevant media without classifying everything.
+            </Text>
+            {settings.mediaReviewRequirement ===
+            GQLNcmecMediaReviewRequirement.Minimum ? (
+              <div className="flex flex-col gap-2">
+                <Label
+                  htmlFor="minMediaToReview"
+                  className="text-sm font-medium"
+                >
+                  Minimum media to review{' '}
+                  <span className="text-red-500">*</span>
+                </Label>
+                <Input
+                  id="minMediaToReview"
+                  type="number"
+                  min={1}
+                  step={1}
+                  inputMode="numeric"
+                  value={settings.minMediaToReview}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    // Whole numbers only — fractional thresholds are invalid.
+                    if (value === '' || /^\d+$/.test(value)) {
+                      setSettings({
+                        ...settings,
+                        minMediaToReview: value,
+                      });
+                    }
+                  }}
+                  placeholder="1"
+                />
+                <Text size="XS" className="text-gray-500">
+                  Reviewers must classify at least this many media items (and
+                  report at least one) before they can submit the report.
+                </Text>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="flex flex-col gap-2">
             <Label htmlFor="moreInfoUrl" className="text-sm font-medium">
               More Info URL
             </Label>
@@ -410,8 +548,7 @@ export default function NCMECSettings() {
               onValueChange={(value) =>
                 setSettings({
                   ...settings,
-                  defaultNcmecQueueId:
-                    value === '__default__' ? '' : value,
+                  defaultNcmecQueueId: value === '__default__' ? '' : value,
                 })
               }
             >
@@ -448,8 +585,7 @@ export default function NCMECSettings() {
               onValueChange={(value) =>
                 setSettings({
                   ...settings,
-                  defaultInternetDetailType:
-                    value === '__none__' ? '' : value,
+                  defaultInternetDetailType: value === '__none__' ? '' : value,
                 })
               }
             >
@@ -495,7 +631,8 @@ export default function NCMECSettings() {
               placeholder="https://api.yourcompany.com/ncmec/preservation"
             />
             <Text size="XS" className="text-gray-500">
-              Optional: Webhook endpoint for NCMEC preservation requests after reporting
+              Optional: Webhook endpoint for NCMEC preservation requests after
+              reporting
             </Text>
           </div>
 
@@ -531,18 +668,21 @@ export default function NCMECSettings() {
             onClick={handleSave}
             disabled={!settings.username || !settings.password}
           >
-            {isNCMECEnabled ? 'Update Settings' : 'Enable NCMEC & Save Settings'}
+            {isNCMECEnabled
+              ? 'Update Settings'
+              : 'Enable NCMEC & Save Settings'}
           </Button>
         </div>
 
         {!isNCMECEnabled && (
           <Text size="XS" className="mt-4 text-gray-600">
             Note: Saving these settings will enable NCMEC reporting for your
-            organization. Reporting will only work if the organization has a manual review queue and content is only reported if it is flagged during review.
+            organization. Reporting will only work if the organization has a
+            manual review queue and content is only reported if it is flagged
+            during review.
           </Text>
         )}
       </div>
     </>
   );
 }
-

@@ -17,6 +17,7 @@ import {
   checkTransportRecovery,
 } from '../../test/memberIntentRecoveryChecks.js';
 import { memberIntentTestDatabaseUrl } from '../../test/memberIntentTestDatabase.js';
+import { makeKyselyTransactionWithRetry } from '../../utils/kyselyTransactionWithRetry.js';
 import {
   deliverMemberIntent,
   memberTargetKey,
@@ -36,9 +37,9 @@ let cleanup = async () => {};
 let pgQuery: Kysely<MemberIntentPg>;
 async function record(value: RoomDecisionInput, author?: string) {
   const intent = await prepared(value, author);
-  await pgQuery
-    .transaction()
-    .execute(async (tx) => registerMemberIntents(tx, [intent]));
+  await makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+    registerMemberIntents(tx, [intent]),
+  );
   return intent;
 }
 function barrier() {
@@ -136,7 +137,7 @@ test('failed transaction preserves counter; different targets and deterministic 
   const a = await prepared(input()),
     b = await prepared(input(), 'e'.repeat(64));
   await expect(
-    pgQuery.transaction().execute(async (tx) => {
+    makeKyselyTransactionWithRetry(pgQuery)(async (tx) => {
       await registerMemberIntents(tx, [a]);
       throw new Error('Synthetic rollback');
     }),
@@ -148,12 +149,12 @@ test('failed transaction preserves counter; different targets and deterministic 
       .execute(),
   ).toHaveLength(0);
   await Promise.all([
-    pgQuery
-      .transaction()
-      .execute(async (tx) => registerMemberIntents(tx, [a, b])),
-    pgQuery
-      .transaction()
-      .execute(async (tx) => registerMemberIntents(tx, [b, a])),
+    makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+      registerMemberIntents(tx, [a, b]),
+    ),
+    makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+      registerMemberIntents(tx, [b, a]),
+    ),
   ]);
   const heads = await pgQuery
     .selectFrom('concord_integration.member_intent_heads')
@@ -315,14 +316,12 @@ test('authoritative target validation fails closed before registration', async (
   ).rejects.toThrow('target');
   const intent = await prepared(a);
   await expect(
-    pgQuery
-      .transaction()
-      .execute(async (tx) =>
-        registerMemberIntents(tx, [
-          intent,
-          { ...intent, executionId: randomUUID() },
-        ]),
-      ),
+    makeKyselyTransactionWithRetry(pgQuery)(async (tx) =>
+      registerMemberIntents(tx, [
+        intent,
+        { ...intent, executionId: randomUUID() },
+      ]),
+    ),
   ).rejects.toThrow('per target');
 });
 

@@ -11,6 +11,7 @@ import {
 } from '../services/integrationRegistry/index.js';
 import { logErrorJson, logJson } from '../utils/logging.js';
 import { sleep } from '../utils/misc.js';
+import { printStartupBanner } from '../utils/startupBanner.js';
 
 const { app, shutdown } = await getBottle().then(async (bottle) =>
   makeServer(bottle.container),
@@ -40,6 +41,7 @@ app.set('port', port);
 const server = http
   .createServer(app)
   .listen(port, () => {
+    printStartupBanner();
     // eslint-disable-next-line no-restricted-syntax
     logJson(`Server is running at http://localhost:${port}`);
   })
@@ -130,6 +132,15 @@ process.on('uncaughtException', (err, _) => {
     error: err,
   });
   process.exit(1);
+});
+
+// Log but don't exit; a stray rejection shouldn't kill the server.
+process.on('unhandledRejection', (reason) => {
+  // eslint-disable-next-line no-restricted-syntax
+  logErrorJson({
+    message: 'UnhandledRejection',
+    error: reason instanceof Error ? reason : new Error(String(reason)),
+  });
 });
 
 process.once('SIGTERM', shutdownOnce);

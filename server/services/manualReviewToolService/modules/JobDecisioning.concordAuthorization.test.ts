@@ -1,5 +1,7 @@
 /* eslint-disable functional/immutable-data -- Tests vary actor authority and capture side effects. */
-import { UserRole } from '../../../models/types/permissioning.js';
+import { UserRole } from '../../../services/userManagementService/index.js';
+import { roomDecisionSettings } from '../../../test/roomDecisionSettings.js';
+import { getPermissionsForRole } from '../../userManagementService/index.js';
 import JobDecisioning from './JobDecisioning.js';
 
 test.each([
@@ -37,6 +39,9 @@ test.each([
       orgId: 'synthetic',
       approvedByAdmin: true,
       rejectedByAdmin: false,
+      getPermissions() {
+        return getPermissionsForRole(this.role);
+      },
       role:
         kind === 'guild_scope' || kind === 'related_guild_scope'
           ? UserRole.MODERATOR_MANAGER
@@ -64,6 +69,7 @@ test.each([
             : undefined,
       } as never,
       { addSpan: jest.fn() } as never,
+      roomDecisionSettings() as never,
       async () => actor,
     );
     const input: any = {
