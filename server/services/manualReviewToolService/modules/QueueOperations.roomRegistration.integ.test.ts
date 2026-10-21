@@ -38,7 +38,13 @@ const connection = {
   host: process.env.REDIS_HOST!,
   port: Number(process.env.REDIS_PORT),
 };
-const paths = ['direct', 'same-invoker', 'completion', 'purge'] as const;
+const paths = [
+  'direct',
+  'same-invoker',
+  'completion',
+  'purge',
+  'delete',
+] as const;
 type RemovalPath = (typeof paths)[number];
 
 beforeAll(async () => {
@@ -60,7 +66,7 @@ beforeAll(async () => {
     await admin.query(`DROP DATABASE IF EXISTS ${databaseName}`);
     await admin.end();
   };
-  await sql`CREATE TABLE public.orgs (id varchar(255) PRIMARY KEY); INSERT INTO public.orgs VALUES ('synthetic'); CREATE SCHEMA manual_review_tool; CREATE TABLE manual_review_tool.manual_review_decisions (id uuid PRIMARY KEY, job_payload jsonb, queue_id text, reviewer_id text, org_id text, decision_components jsonb[], related_actions jsonb[], enqueue_source_info jsonb, item_created_at timestamptz, decision_reason text, created_at timestamptz DEFAULT now())`.execute(
+  await sql`CREATE TABLE public.orgs (id varchar(255) PRIMARY KEY); INSERT INTO public.orgs VALUES ('synthetic'); CREATE SCHEMA manual_review_tool; CREATE TABLE manual_review_tool.manual_review_decisions (id uuid PRIMARY KEY, job_payload jsonb, queue_id text, reviewer_id text, org_id text, decision_components jsonb[], related_actions jsonb[], enqueue_source_info jsonb, item_created_at timestamptz, decision_reason text, created_at timestamptz DEFAULT now()); CREATE TABLE manual_review_tool.manual_review_queues (id text PRIMARY KEY, org_id text, is_default_queue boolean NOT NULL DEFAULT false, is_appeals_queue boolean NOT NULL DEFAULT false); INSERT INTO manual_review_tool.manual_review_queues (id, org_id, is_default_queue) VALUES ('default-test-queue', 'synthetic', true); CREATE TABLE manual_review_tool.users_and_accessible_queues (queue_id text, user_id text)`.execute(
     database,
   );
   const migrations = await Promise.all([
@@ -87,6 +93,9 @@ afterAll(async () => {
 async function fixture(path: RemovalPath, isAppealsQueue = false) {
   const guid = randomUUID();
   const queueId = `race-${guid}`;
+  await sql`INSERT INTO manual_review_tool.manual_review_queues (id, org_id) VALUES (${queueId}, 'synthetic')`.execute(
+    database,
+  );
   const prefix = `test-f1-${guid}`;
   const queue = new Queue(queueId, { connection, prefix });
   const job = {
@@ -200,25 +209,27 @@ async function fixture(path: RemovalPath, isAppealsQueue = false) {
       ],
     } as never);
   const remove = async () =>
-    path === 'purge'
-      ? ops.deleteAllJobsFromQueue({
-          orgId: 'synthetic',
-          queueId,
-          userPermissions: [UserPermission.MANAGE_ORG],
-        })
-      : path === 'completion'
-        ? ops.removeJob({
+    path === 'delete'
+      ? ops.deleteManualReviewQueue('synthetic', queueId)
+      : path === 'purge'
+        ? ops.deleteAllJobsFromQueue({
             orgId: 'synthetic',
             queueId,
-            jobId: job.id as never,
-            lockToken: 'staff',
+            userPermissions: [UserPermission.MANAGE_ORG],
           })
-        : ops.removeJobAllowingInvokerLock({
-            orgId: 'synthetic',
-            queueId,
-            jobId: job.id as never,
-            invokerUserId: 'staff',
-          });
+        : path === 'completion'
+          ? ops.removeJob({
+              orgId: 'synthetic',
+              queueId,
+              jobId: job.id as never,
+              lockToken: 'staff',
+            })
+          : ops.removeJobAllowingInvokerLock({
+              orgId: 'synthetic',
+              queueId,
+              jobId: job.id as never,
+              invokerUserId: 'staff',
+            });
   const hold = () => {
     const gate = { entered: barrier(), resume: barrier() };
     paused = gate;
