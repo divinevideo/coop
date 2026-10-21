@@ -72,7 +72,7 @@ export async function checkRoomRemovalPublisher(
       }),
     } as never,
     { applyUserStrikeFromPublishedActions: async () => {} } as never,
-    (async () => undefined),
+    async () => undefined,
     { getGraphQLUserFromId: async () => actor } as never,
     pgQuery,
   );
