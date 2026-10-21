@@ -1134,8 +1134,14 @@ export default class QueueOperations {
   ): Promise<T> {
     return this.#withRoomQueueMutation(opts.orgId, opts.queueId, async (tx) => {
       const queue = opts.isAppealsQueue
-        ? await this.getOrCreateBullAppealQueue(opts)
-        : await this.getOrCreateBullQueue(opts);
+        ? await this.getOrCreateBullAppealQueue({
+            orgId: opts.orgId,
+            queueId: opts.queueId,
+          })
+        : await this.getOrCreateBullQueue({
+            orgId: opts.orgId,
+            queueId: opts.queueId,
+          });
       const job = await queue.getJob(parseExternalId(opts.jobId).bullId);
       // A submission may have loaded its job before a deletion won the lock.
       if (!job || job.data.id !== opts.jobId)
