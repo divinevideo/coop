@@ -84,7 +84,7 @@ test.each([
       {} as never,
       {} as never,
       {} as never,
-      (async () => undefined),
+      async () => undefined,
       {
         getGraphQLUserFromId: async () => ({
           id: 'staff',

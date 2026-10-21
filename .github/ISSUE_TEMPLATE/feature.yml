@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: >
-        Thanks for taking the time to request a feature for Coop! **Please 
+        Thanks for taking the time to request a feature for Coop! **Please
         provide as much detail as you can** so we can fully understand, triage,
         address your request.
 

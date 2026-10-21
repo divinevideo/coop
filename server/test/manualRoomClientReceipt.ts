@@ -88,7 +88,7 @@ export function roomActionFixture(
     {} as never,
     investigation as never,
     { applyUserStrikeFromPublishedActions: async () => {} } as never,
-    (async () => undefined),
+    async () => undefined,
     {
       getGraphQLUserFromId: async () => ({
         ...actor,
@@ -218,7 +218,6 @@ export async function withRoomTestEnvironment(run: () => Promise<void>) {
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) Reflect.deleteProperty(process.env, key);
-       
       else process.env[key] = value;
     }
   }
