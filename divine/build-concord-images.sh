@@ -10,4 +10,8 @@ for image in server worker; do
   docker run --rm --entrypoint sh "divine-local/coop-source-$image:$revision" -c 'test -r routes/concord/service.js && test -r routes/concord/index.js'
 done
 docker run --rm --entrypoint sh "divine-local/coop-source-client:$revision" -c 'test -r /usr/share/nginx/html/source-build.json && test -r /usr/share/nginx/html/index.html'
+# A read-only, networkless production start catches runtime npm installs and
+# accidental development-only preloads as well as missing compiled files.
+docker run --rm --platform linux/amd64 --network none --read-only -e NODE_ENV=production "divine-local/coop-source-migrator:$revision"
+docker run --rm --platform linux/amd64 --network none --read-only -e NODE_ENV=production "divine-local/coop-source-migrator:$revision" npm run db:update -- --help
 echo "PASS four source images and artifact manifest at $artifacts; no publication performed."

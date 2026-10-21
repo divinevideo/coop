@@ -37,7 +37,7 @@ REGISTRY = 'ghcr.io/divinevideo/coop-'
 TARGETS = [
     {'name': 'server', 'repository': REGISTRY + 'server', 'target': 'build_server', 'dockerfile': 'Dockerfile', 'entrypoint': ['/usr/bin/dumb-init', '--'], 'command': ['node', 'bin/www.js'], 'migrations': False, 'migration_prefix': 'app/'},
     {'name': 'worker', 'repository': REGISTRY + 'worker', 'target': 'build_worker_runner', 'dockerfile': 'Dockerfile', 'entrypoint': ['/usr/bin/dumb-init', '--'], 'command': ['node', 'bin/run-worker-or-job.js'], 'migrations': False, 'migration_prefix': 'app/'},
-    {'name': 'migrator', 'repository': REGISTRY + 'migrator', 'target': 'build_migrator', 'dockerfile': 'Dockerfile', 'entrypoint': ['docker-entrypoint.sh'], 'command': ['npm', 'run', 'db:update', '--', '--help'], 'migrations': True, 'migration_prefix': 'app/'},
+    {'name': 'migrator', 'repository': REGISTRY + 'migrator', 'target': 'build_migrator', 'dockerfile': 'Dockerfile', 'entrypoint': ['docker-entrypoint.sh'], 'command': ['node', 'build/index.js', 'apply', '--help'], 'migrations': True, 'migration_prefix': 'app/db/build/'},
     {'name': 'client', 'repository': REGISTRY + 'client', 'target': 'source-client', 'dockerfile': 'divine/coop-client-source/Dockerfile', 'entrypoint': ['/docker-entrypoint.sh'], 'command': ['nginx', '-g', 'daemon off;'], 'migrations': False, 'migration_prefix': 'app/'},
 ]
 
@@ -67,7 +67,7 @@ def file_hash(path):
 def source_contract(source, revision):
     full_sha(revision)
     paths = run(['git', 'ls-tree', '-r', '--name-only', revision], cwd=source).decode().splitlines()
-    migrations = sorted(p for p in paths if p.startswith(MIGRATION_ROOT + '/') and p.endswith('.sql'))
+    migrations = sorted(p for p in paths if p.startswith(MIGRATION_ROOT + '/') and p.endswith(('.sql', '.cjs')))
     require(all(p in migrations for p in REQUIRED_MIGRATIONS), 'Required release migrations are missing from source')
     if KIND == 'coop':
         require(any(p.endswith('.add_room_operation_lifecycle.sql') for p in migrations), 'Coop lifecycle migration missing')
@@ -139,8 +139,12 @@ def layer_stream(archive, name):
     return gzip.GzipFile(fileobj=stream) if magic == b'\x1f\x8b' else stream
 
 
+def image_migration_path(entry, source_path):
+    return entry['migration_prefix'] + source_path.removeprefix('db/src/')
+
+
 def inspect_archive(path, entry, revision, contract):
-    required = {entry['migration_prefix'] + p: h for p, h in contract['migrations'].items()} if entry['migrations'] else {}
+    required = {image_migration_path(entry, p): h for p, h in contract['migrations'].items()} if entry['migrations'] else {}
     found = {}
     client_assets = {}
     client_proof = None
