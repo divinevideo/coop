@@ -507,28 +507,9 @@ export default class JobDecisioning {
     //
     // 1. logDecision() succeeds; then, removeJob() succeeds. All good.
     //
-    // 2. logDecision() succeeds; then, removeJob() fails. This is the
-    //    trickiest case. The job is still in the queue and could be dequeued
-    //    again, but the decision's already logged. I _think_ the only way to
-    //    perfectly-reliably handle/avoid this case would be to use a "pending
-    //    decisions" table, plus a background worker that eventually moves
-    //    "pending decisions" to "applied decisions" if the corresponding job
-    //    has been removed from redis. While that seems like it could be made
-    //    bulletproof(?), it's way too involved. (Note: the server moving
-    //    "pending" decisions to "applied" after deleting the job from redis
-    //    wouldn't be totally reliable, as it could crash between those steps.)
-    //
-    //    So, instead, we throw a generic "decision couldn't be logged" error;
-    //    this reflects that the job is still in the queue, and the client
-    //    should retry submitting the decision. When they do, they'll get a
-    //    "decision already submitted" error (see below), which they can ignore.
-    //    This is a bit weird from the client's POV -- it allows a sequence of
-    //    events in which the decision appears to have failed to save, but then
-    //    shows up as having already been saved, even if no one else acted on
-    //    the job in the meantime. Nevertheless, it works well enough (and this
-    //    sort of logical anomaly is one clients should expect anyway, as it
-    //    could also happen if a concurrent user acted on the job after the
-    //    client's lock expired).
+    // 2. logDecision() succeeds; then, removeJob() fails. Report that the
+    //    decision is recorded but cleanup is incomplete. The client can retry
+    //    the original decision; PostgreSQL and Redis are not one transaction.
     //
     // 3. logDecision() fails because the decision's already been logged; then,
     //    removeJob() succeeds. If we're in this case, it means that
@@ -539,13 +520,12 @@ export default class JobDecisioning {
     // 4. logDecision() fails because the decision's already been logged; then,
     //    removeJob() fails. Again, this must mean that we were in case 2
     //    and retried. But, because `removeJob()` failed, we can throw the
-    //    same "decision couldn't be logged" error from case 2 again.
+    //    same recorded-but-cleanup-incomplete error from case 2 again.
     //
     // 5. logDecision() fails for another reason (e.g., pg down), so
     //    removeJob() is not called. This is a simple path, because at
     //    least redis and pg are still in agreement that the job is incomplete.
-    //    So we just throw the same "decision couldn't be logged" error from
-    //    case 2, so the client will retry.
+    //    Report that recording failed, so the client can retry.
     //
     // The code below attempts to log the job decision, remove the job from
     // redis, handle all the error cases above, and return whether a new
@@ -672,7 +652,7 @@ export default class JobDecisioning {
       );
 
       const decisioningFailedError = makeRecordingJobDecisionFailedError({
-        detail: `The decision for job ${jobId} was not recorded. Please try again.`,
+        detail: `The decision for job ${jobId} was recorded, but queue cleanup did not finish. Retry the original decision.`,
         cause: removeJobErr,
         shouldErrorSpan: true,
       });

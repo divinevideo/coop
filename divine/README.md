@@ -75,7 +75,7 @@ Previously recorded executions without a registered revision enter `member_inten
 
 Deploy the additive schemas and execution lookup before enabling revision-aware membership writers. Pause membership mutation during cutover, reconcile old recorded operations, and invalidate/drain old manual-operation writers and pending operations before reopening mutation. An old manual operation that was never durably recorded has no reliable original order; it must not be reintroduced as a new operation. New unfenced membership requests must remain rejected by the bridge. Message removal and accepted-decision delivery retry do not allocate membership revisions.
 
-Source-ordered clients use a new session-storage namespace and `source-order-v1_<action>_<UUID>` operation token. The token remains opaque and is part of the hashed execution identity, so it cannot collide with a pre-cutover bare-UUID execution. Its action tag must match the selected room action: a pending removal token cannot allocate a membership revision if the user switches to ban or unban. The client still pins the original token until confirmed acceptance rather than silently minting a second operation after uncertainty. The server refuses to allocate an unseen bare-UUID membership operation; an already registered execution can still resume its existing revision and immutable payload. Refreshing an old client does not relabel its old stored operation: that key is retained for reconciliation but is not reused by the new form. A new submission is a new explicit staff decision. Deploy matching server and client code before reopening mutation; an older server rejects the new token rather than silently accepting it.
+Legacy bare-UUID and `source-order-v1_<action>_<UUID>` operations remain under their original browser keys. Known registered executions recover their original immutable payload and revision; unseen legacy executions are lookup-only and never receive a new revision. The current form first obtains a server-issued `source-order-v2` receipt using a persisted nonce and exact input, as documented below. It never relabels an old operation or silently mints a replacement after uncertainty. Deploy matching server and client code before reopening mutation.
 
 Rollback and restore must pause membership writes and recovery. Before any revisioned data exists, application rollback can leave the additive tables in place; only a separately verified empty ledger permits schema removal. Once a revision exists, retain both services' ledgers, counters, execution identities and bridge fence together. Never resume an old unfenced writer, lower a counter, remove source order, or restore one service's counter independently. Generic database clean/drop tooling is not a safe rollback or restore procedure for this feature. Use a compatible build or roll forward, verify retained high-water marks against the bridge, then reopen mutation. These tables intentionally have no destructive down migration.
 
@@ -91,7 +91,16 @@ npm run typecheck
 npm run lint
 ```
 
-CI runs both PostgreSQL ordering suites explicitly after the normal database suite, using the existing isolated compose test service with `NODE_ENV=test` and `MEMBER_INTENT_TEST_COMPOSE=1`. The shared test helper rejects any other remote host or an unguarded compose connection. Each suite creates and drops only its own uniquely named database; it never resets the existing CI database.
+CI includes the PostgreSQL ordering and recovery suites in its integration-test job, using the isolated compose test service with `NODE_ENV=test` and `MEMBER_INTENT_TEST_COMPOSE=1`. The shared test helper rejects any other remote host or an unguarded compose connection. Each suite creates and drops only its own uniquely named database; it never resets the existing CI database.
+
+Individual job registration and removal share a queue fence and exclude mutations
+of the same physical Bull job ID. Independent ordinary jobs do not contend with
+one another. Whole-queue purge and deletion require exclusive queue access and
+refuse queues with recorded room history, even when earlier executions settled.
+They are not per-execution stop or teardown consent. This keeps recorded MRT jobs and
+their queue authorization intact; a later teardown needs
+its own reviewed plan. A post-recording cleanup failure reports that the decision
+is recorded and asks for the original decision to be retried.
 
 ### Manual room operation recovery contract
 
