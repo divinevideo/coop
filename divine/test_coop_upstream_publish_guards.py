@@ -35,6 +35,55 @@ class UpstreamPublisherGuards(unittest.TestCase):
         self.assertIn("context: ./divine/coop-client-unprivileged", text)
 
 
+    def test_checklist_has_no_pr_checkout_in_write_job_and_fails_closed(self):
+        text = (ROOT / ".github/workflows/checklist.yaml").read_text()
+        generator = re.search(r"(?ms)^  checklist_inputs:\n(.*?)(?=^  checklist_job:)", text).group(1)
+        publisher = re.search(r"(?ms)^  checklist_job:\n(.*)\Z", text).group(1)
+        self.assertIn("contents: read", generator)
+        self.assertNotIn("pull-requests: write", generator)
+        self.assertNotIn("GITHUB_TOKEN:", generator)
+        self.assertIn("persist-credentials: false", generator)
+        self.assertIn("fetch-depth: 0", generator)
+        self.assertIn("needs: checklist_inputs", publisher)
+        self.assertIn("if: always()", publisher)
+        self.assertNotIn("actions/checkout@", publisher)
+        self.assertIn("pull-requests: write", publisher)
+        self.assertIn("GENERATION_RESULT !== 'success'", publisher)
+        script = publisher.split("        run: |", 1)[1]
+        self.assertNotIn("${{", script)
+        self.assertNotIn(".github/scripts/", script)
+        self.assertIn("JSON.parse(env.CHECKLIST_DATA)", script)
+
+    def test_tooling_actions_are_pinned_and_checkouts_do_not_persist_tokens(self):
+        for name in ("apply_pr_checks.yaml", "build-and-push.yaml", "checklist.yaml", "mdbook.yml", "publish-db-migrator.yaml", "publish-types.yaml", "semantic_pr.yml"):
+            text = (ROOT / ".github/workflows" / name).read_text()
+            for action in re.findall(r"(?m)^\s*(?:- )?uses: ([^ \n]+)", text):
+                with self.subTest(workflow=name, action=action):
+                    if not action.startswith("./"):
+                        self.assertRegex(action, r"@[0-9a-f]{40}$")
+            for checkout in re.finditer(r"(?m)^\s*(?:- )?uses: actions/checkout@[^\n]+\n", text):
+                with self.subTest(workflow=name, checkout=checkout.start()):
+                    lines = text[checkout.end():].splitlines()
+                    self.assertEqual(lines[0].strip(), "with:")
+                    indent = len(lines[0]) - len(lines[0].lstrip())
+                    options = []
+                    for line in lines[1:]:
+                        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                            break
+                        options.append(line.strip())
+                    self.assertIn("persist-credentials: false", options)
+
+    def test_pages_write_permissions_are_limited_to_deployment(self):
+        text = (ROOT / ".github/workflows/mdbook.yml").read_text()
+        before_jobs = text.split("jobs:", 1)[0]
+        build = re.search(r"(?ms)^  build:\n(.*?)(?=^  deploy:)", text).group(1)
+        deploy = re.search(r"(?ms)^  deploy:\n(.*)\Z", text).group(1)
+        for permission in ("pages: write", "id-token: write"):
+            self.assertNotIn(permission, before_jobs)
+            self.assertNotIn(permission, build)
+            self.assertIn(permission, deploy)
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,19 +1,125 @@
 on: [pull_request]
 
-permissions:
-  pull-requests: write
-  contents: read
+permissions: {}
+
+concurrency:
+  group: checklist-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  checklist_job:
+  checklist_inputs:
+    name: Generate checklist data
     runs-on: ubuntu-latest
-    name: Checklist job
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      checklist: ${{ steps.generate.outputs.checklist }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Checklist
-        uses: ethanresnick/pr-checklists@v1
+      - name: Checkout complete diff history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Test checklist behavior
+        run: node --test .github/scripts/pr-checklist.test.mjs
+      - name: Generate checklist from local git diff
+        id: generate
+        run: node .github/scripts/pr-checklist.mjs
+
+  checklist_job:
+    name: Checklist job
+    needs: checklist_inputs
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      # No checkout: this job never executes PR-controlled helper files with write credentials.
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Publish checklist and retain checkbox history
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          config: .github/workflows/checklistConfig.json
+          GENERATION_RESULT: ${{ needs.checklist_inputs.result }}
+          CHECKLIST_DATA: ${{ needs.checklist_inputs.outputs.checklist }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          node --input-type=module <<'CHECKLIST_PUBLISH'
+          const env = process.env;
+          if (env.GENERATION_RESULT !== 'success') throw new Error('Checklist generation failed; refusing publication');
+          const data = JSON.parse(env.CHECKLIST_DATA);
+          const repository = env.GITHUB_REPOSITORY;
+          if (!/^[\w.-]+\/[\w.-]+$/.test(repository ?? '') || data.version !== 1 || data.repository !== repository || data.number !== Number(env.PR_NUMBER) || !Number.isSafeInteger(data.number) || data.number < 1 || !/^[0-9a-f]{40}$/.test(data.head) || !/^[0-9a-f]{40}$/.test(data.base) || data.head !== env.EXPECTED_HEAD || data.base !== env.EXPECTED_BASE || !Array.isArray(data.items) || data.items.length > 1000) throw new Error('Invalid checklist source identity or output');
+          const api = async (path, method = 'GET', body) => {
+            const response = await fetch(`${env.GITHUB_API_URL}/repos/${repository}/${path}`, {
+              method, signal: AbortSignal.timeout(30000), headers: { 'User-Agent': 'coop-dynamic-checklist', Authorization: `Bearer ${env.GITHUB_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28' },
+              ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            });
+            if (!response.ok) throw new Error(`Checklist API ${method} failed (${response.status})`);
+            return response.json();
+          };
+          const current = await api(`pulls/${data.number}`);
+          if (current.head?.sha !== data.head || current.base?.sha !== data.base) throw new Error('Stale checklist source; rerun for current PR');
+          const config = await api(`contents/.github/workflows/checklistConfig.json?ref=${data.head}`);
+          if (config.encoding !== 'base64' || typeof config.content !== 'string') throw new Error('Complete checklist configuration required');
+          const configuration = Buffer.from(config.content, 'base64');
+          const digest = Buffer.from(await crypto.subtle.digest('SHA-256', configuration)).toString('hex');
+          if (data.configurationDigest !== digest) throw new Error('Checklist configuration identity mismatch');
+          const { mappings } = JSON.parse(configuration.toString('utf8'));
+          if (!Array.isArray(mappings) || !mappings.length) throw new Error('Checklist mappings required');
+          const labels = new Set(mappings.flatMap((mapping) => mapping.items));
+          const renderPath = (path) => `\`${path.replaceAll('`', '&#96;').replaceAll('\r', '\\r').replaceAll('\n', '\\n')}\``;
+          const active = new Map();
+          for (const item of data.items) {
+            if (!item || typeof item.label !== 'string' || !labels.has(item.label) || /[\r\n]/.test(item.label) || !Array.isArray(item.paths) || item.paths.length > 10000 || item.paths.some((path) => typeof path !== 'string' || !path || path.length > 4096)) throw new Error('Invalid checklist item');
+            const suffix = item.paths.length ? ` (${item.paths.map(renderPath).join(', ')})` : '';
+            const text = item.label + suffix;
+            const legacy = item.label + (item.paths.length ? ` (${item.paths.join(', ')})` : '');
+            active.set(text, legacy);
+          }
+          const comments = [];
+          for (let page = 1; ; page++) {
+            if (page > 100) throw new Error('Complete checklist history required');
+            const entries = await api(`issues/${data.number}/comments?per_page=100&page=${page}`);
+            if (!Array.isArray(entries)) throw new Error('Invalid checklist history');
+            comments.push(...entries);
+            if (entries.length < 100) break;
+          }
+          const owned = comments.filter((comment) => comment.user?.login === 'github-actions[bot]' && typeof comment.body === 'string' && (comment.body.includes('<!-- coop-dynamic-checklist:v1 -->') || comment.body.startsWith('**Checklist:**\n')));
+          const previous = new Map();
+          for (const comment of owned) {
+            for (const line of comment.body.split('\n')) {
+              const item = /^- \[([ xX])\] (.+)$/.exec(line);
+              if (item) previous.set(item[2], previous.get(item[2]) || item[1].toLowerCase() === 'x');
+            }
+          }
+          const lines = [];
+          for (const [text, legacy] of active) {
+            const checked = previous.get(text) || previous.get(legacy);
+            lines.push(`- [${checked ? 'x' : ' '}] ${text}`);
+            previous.delete(text); previous.delete(legacy);
+          }
+          if (active.size || owned.length) {
+          const history = [...previous].map(([text, checked]) => `- [${checked ? 'x' : ' '}] ${text}`);
+          const body = '<!-- coop-dynamic-checklist:v1 -->\n**Checklist:**\n' + (lines.join('\n') || 'No checklist items for the current diff.') + (history.length ? '\n\n<details>\n<summary>Previous checklist items</summary>\n\n' + history.join('\n') + '\n\n</details>' : '');
+          if (Buffer.byteLength(body) > 64000) throw new Error('Checklist comment too large; refusing partial history');
+          const latest = await api(`pulls/${data.number}`);
+          if (latest.head?.sha !== data.head || latest.base?.sha !== data.base) throw new Error('Stale checklist source before publication');
+          const old = owned.at(-1);
+          if (old) {
+            if (!Number.isSafeInteger(old.id) || old.id < 1) throw new Error('Invalid checklist comment identity');
+            if (old.body !== body) await api(`issues/comments/${old.id}`, 'PATCH', { body });
+          } else await api(`issues/${data.number}/comments`, 'POST', { body });
+          }
+          CHECKLIST_PUBLISH
