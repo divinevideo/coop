@@ -16,6 +16,7 @@ import {
 import { roomExecutionId } from '../../../routes/concord/service.js';
 import { UserRole } from '../../../services/userManagementService/index.js';
 import { memberIntentTestDatabaseUrl } from '../../../test/memberIntentTestDatabase.js';
+import { roomDecisionQueueFixture } from '../../../test/roomDecisionQueueFixture.js';
 import { roomDecisionSettings } from '../../../test/roomDecisionSettings.js';
 import { getPermissionsForRole } from '../../userManagementService/index.js';
 import { type ManualReviewToolServicePg } from '../dbTypes.js';
@@ -125,7 +126,10 @@ test.each([false, true])(
       throw new Error('Synthetic post-commit delivery loss');
     });
     const service = new JobDecisioning(
-      { getJobs: async () => [job], removeJob } as never,
+      roomDecisionQueueFixture(
+        { getJobs: async () => [job], removeJob },
+        pgQuery,
+      ) as never,
       pgQuery,
       Object.assign(
         async () => [{ id: 'action', name: 'concord_ban_member' }],
@@ -262,11 +266,14 @@ test.each([false, true])(
       })
       .mockRejectedValueOnce(new Error('Synthetic Redis cleanup loss'));
     const service = new JobDecisioning(
-      {
-        getJobs: async () => [job],
-        getAppealJobs: async () => [job],
-        removeJob,
-      } as never,
+      roomDecisionQueueFixture(
+        {
+          getJobs: async () => [job],
+          getAppealJobs: async () => [job],
+          removeJob,
+        },
+        pgQuery,
+      ) as never,
       pgQuery,
       Object.assign(
         async () => [{ id: 'action', name: 'concord_ban_member' }],

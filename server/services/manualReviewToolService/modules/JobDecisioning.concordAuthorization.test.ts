@@ -1,5 +1,6 @@
 /* eslint-disable functional/immutable-data -- Tests vary actor authority and capture side effects. */
 import { UserRole } from '../../../services/userManagementService/index.js';
+import { roomDecisionQueueFixture } from '../../../test/roomDecisionQueueFixture.js';
 import { roomDecisionSettings } from '../../../test/roomDecisionSettings.js';
 import { getPermissionsForRole } from '../../userManagementService/index.js';
 import JobDecisioning from './JobDecisioning.js';
@@ -52,7 +53,9 @@ test.each([
             : UserRole.MODERATOR,
     };
     const service = new JobDecisioning(
-      queue as never,
+      roomDecisionQueueFixture(queue, {
+        insertInto: () => ({ values: () => ({ execute: record }) }),
+      } as never) as never,
       { insertInto: () => ({ values: () => ({ execute: record }) }) } as never,
       Object.assign(async () => [{ id: 'ban', name: 'concord_ban_member' }], {
         close: async () => {},

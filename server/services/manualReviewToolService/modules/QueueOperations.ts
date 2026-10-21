@@ -17,6 +17,7 @@ import { filterNullOrUndefined } from '../../../utils/collections.js';
 import {
   b64UrlDecode,
   b64UrlEncode,
+  jsonStringify,
   type B64UrlOf,
 } from '../../../utils/encoding.js';
 import {
@@ -1099,16 +1100,56 @@ export default class QueueOperations {
     }
   }
 
-  /**
-   * Removes a pending job. Tries an unlocked `remove`; if the job is
-   * locked, atomically completes it with `invokerUserId` as the lock
-   * token (per the `lockToken === userId` convention) so a reviewer
-   * deleting a job they themselves dequeued succeeds without stealing
-   * another reviewer's lock. Returns `false` on token mismatch so
-   * callers can fall back to scrubbing.
-   */
-  async #recordedRoomJobCanBeRemoved(orgId: string, jobId: JobId) {
-    const decision = await this.pgQuery
+  async #withRoomQueueMutation<T>(
+    orgId: string,
+    queueId: string,
+    mutate: (tx: Transaction<ManualReviewToolServicePg>) => Promise<T>,
+  ): Promise<T> {
+    // Redis mutations cannot be rolled back with SQL. Surface any commit failure
+    // without replaying the callback; a caller retry revalidates the queue state.
+    return this.transactionWithRetry(
+      { retrySerializationFailures: false },
+      async (tx) => {
+        // Registration and Redis deletion share the same queue exclusion. A busy
+        // queue fails closed rather than waiting indefinitely or inventing consent.
+        const result = await sql<{ locked: boolean }>`
+        SELECT pg_try_advisory_xact_lock(hashtextextended(
+          ${jsonStringify(['room-mrt-queue-v1', orgId, queueId])}, 0
+        )) AS locked`.execute(tx);
+        if (!result.rows[0]?.locked)
+          throw new Error('Room queue mutation in progress; retry');
+        return mutate(tx);
+      },
+    );
+  }
+
+  async withRoomDecisionRegistration<T>(
+    opts: {
+      orgId: string;
+      queueId: string;
+      jobId: JobId;
+      isAppealsQueue?: boolean;
+    },
+    register: (tx: Transaction<ManualReviewToolServicePg>) => Promise<T>,
+  ): Promise<T> {
+    return this.#withRoomQueueMutation(opts.orgId, opts.queueId, async (tx) => {
+      const queue = opts.isAppealsQueue
+        ? await this.getOrCreateBullAppealQueue(opts)
+        : await this.getOrCreateBullQueue(opts);
+      const job = await queue.getJob(parseExternalId(opts.jobId).bullId);
+      // A submission may have loaded its job before a deletion won the lock.
+      if (!job || job.data.id !== opts.jobId)
+        throw new Error('Room job no longer pending; decision not recorded');
+      return register(tx);
+    });
+  }
+
+  async #recordedRoomJobCanBeRemoved(
+    pg: Kysely<ManualReviewToolServicePg>,
+    orgId: string,
+    jobId: JobId,
+  ) {
+    const decision = await pg
       .selectFrom('manual_review_tool.manual_review_decisions')
       .select(['job_payload', 'decision_components', 'related_actions'])
       .where('org_id', '=', orgId)
@@ -1116,7 +1157,7 @@ export default class QueueOperations {
       .executeTakeFirst();
     if (decision?.job_payload.roomDeliveryRequired !== true) return true;
     return roomJobQueueComplete(
-      this.pgQuery as unknown as Kysely<MemberIntentPg>,
+      pg as unknown as Kysely<MemberIntentPg>,
       orgId,
       `mrt-decision:${jobId}`,
       decision.decision_components.reduce(
@@ -1131,6 +1172,14 @@ export default class QueueOperations {
     );
   }
 
+  /**
+   * Removes a pending job. Tries an unlocked `remove`; if the job is
+   * locked, atomically completes it with `invokerUserId` as the lock
+   * token (per the `lockToken === userId` convention) so a reviewer
+   * deleting a job they themselves dequeued succeeds without stealing
+   * another reviewer's lock. Returns `false` on token mismatch so
+   * callers can fall back to scrubbing.
+   */
   async removeJobAllowingInvokerLock(opts: {
     orgId: string;
     queueId: string;
@@ -1138,35 +1187,38 @@ export default class QueueOperations {
     invokerUserId: string;
   }): Promise<boolean> {
     const { orgId, queueId, jobId, invokerUserId } = opts;
-    if (!(await this.#recordedRoomJobCanBeRemoved(orgId, jobId))) return false;
-    const queue = await this.getOrCreateBullQueue({ orgId, queueId });
-    const { bullId: bullJobId } = parseExternalId(jobId);
-    const job = await queue.getJob(bullJobId);
-    if (!job || job.data.id !== jobId) {
-      return false;
-    }
+    return this.#withRoomQueueMutation(orgId, queueId, async (tx) => {
+      if (!(await this.#recordedRoomJobCanBeRemoved(tx, orgId, jobId)))
+        return false;
+      const queue = await this.getOrCreateBullQueue({ orgId, queueId });
+      const { bullId: bullJobId } = parseExternalId(jobId);
+      const job = await queue.getJob(bullJobId);
+      if (!job || job.data.id !== jobId) {
+        return false;
+      }
 
-    try {
-      const status = await queue.remove(bullJobId);
-      if (status === 1) {
+      try {
+        const status = await queue.remove(bullJobId);
+        if (status === 1) {
+          return true;
+        }
+      } catch (err: unknown) {
+        if (!isJobLockedError(err)) {
+          throw err;
+        }
+        // Locked: fall through to the token-validated path.
+      }
+
+      try {
+        await job.moveToCompleted(null, invokerUserId, false);
         return true;
+      } catch {
+        // Lock token mismatch (different user) or the job's state moved
+        // between getJob and moveToCompleted. Either way, caller should
+        // scrub.
+        return false;
       }
-    } catch (err: unknown) {
-      if (!isJobLockedError(err)) {
-        throw err;
-      }
-      // Locked: fall through to the token-validated path.
-    }
-
-    try {
-      await job.moveToCompleted(null, invokerUserId, false);
-      return true;
-    } catch {
-      // Lock token mismatch (different user) or the job's state moved
-      // between getJob and moveToCompleted. Either way, caller should
-      // scrub.
-      return false;
-    }
+    });
   }
 
   async deleteAllJobsFromQueue(opts: {
@@ -1183,23 +1235,25 @@ export default class QueueOperations {
       });
     }
 
-    // Bulk removal has no per-execution settlement/stop consent. Refuse queues
-    // with recorded room delivery; supported recovery completes jobs individually.
-    const roomDecision = await this.pgQuery
-      .selectFrom('manual_review_tool.manual_review_decisions')
-      .select('id')
-      .where('org_id', '=', orgId)
-      .where('queue_id', '=', queueId)
-      .where(sql<boolean>`job_payload->>'roomDeliveryRequired' = 'true'`)
-      .limit(1)
-      .executeTakeFirst();
-    if (roomDecision)
-      throw new Error(
-        'Room queue requires per-execution settlement or audited stop',
-      );
+    return this.#withRoomQueueMutation(orgId, queueId, async (tx) => {
+      // Bulk removal has no per-execution settlement/stop consent. Refuse queues
+      // with recorded room delivery; supported recovery completes jobs individually.
+      const roomDecision = await tx
+        .selectFrom('manual_review_tool.manual_review_decisions')
+        .select('id')
+        .where('org_id', '=', orgId)
+        .where('queue_id', '=', queueId)
+        .where(sql<boolean>`job_payload->>'roomDeliveryRequired' = 'true'`)
+        .limit(1)
+        .executeTakeFirst();
+      if (roomDecision)
+        throw new Error(
+          'Room queue requires per-execution settlement or audited stop',
+        );
 
-    const queue = await this.#getBullQueue(orgId, queueId);
-    await queue.obliterate({ force: true });
+      const queue = await this.#getBullQueue(orgId, queueId);
+      await queue.obliterate({ force: true });
+    });
   }
 
   async dequeueNextAppealJobWithLock(opts: {
@@ -1568,23 +1622,27 @@ export default class QueueOperations {
     jobId: JobId;
     lockToken: string;
   }) {
-    if (!(await this.#recordedRoomJobCanBeRemoved(opts.orgId, opts.jobId)))
-      throw new Error(
-        'Room execution requires durable settlement or audited stop',
-      );
-    try {
-      await this.#markLockedJobCompleted(opts);
-    } catch (error: unknown) {
-      // The most common case where this throws if the lock token has expired,
-      // so try to remove it manually.
-      const { orgId, queueId, jobId } = opts;
-      const queue = await this.getOrCreateBullQueue({ orgId, queueId });
-      const bullJobId = parseExternalId(jobId).bullId;
-      const removeJobStatus = await queue.remove(bullJobId);
-      if (removeJobStatus !== 1) {
-        throw new Error('Failed to remove job');
+    return this.#withRoomQueueMutation(opts.orgId, opts.queueId, async (tx) => {
+      if (
+        !(await this.#recordedRoomJobCanBeRemoved(tx, opts.orgId, opts.jobId))
+      )
+        throw new Error(
+          'Room execution requires durable settlement or audited stop',
+        );
+      try {
+        await this.#markLockedJobCompleted(opts);
+      } catch (error: unknown) {
+        // The most common case where this throws if the lock token has expired,
+        // so try to remove it manually.
+        const { orgId, queueId, jobId } = opts;
+        const queue = await this.getOrCreateBullQueue({ orgId, queueId });
+        const bullJobId = parseExternalId(jobId).bullId;
+        const removeJobStatus = await queue.remove(bullJobId);
+        if (removeJobStatus !== 1) {
+          throw new Error('Failed to remove job');
+        }
       }
-    }
+    });
   }
 
   /**
