@@ -4,10 +4,7 @@ Divine's moderation review surface. Fork of [roostorg/coop](https://github.com/r
 
 ## Cross-Repo Coordination
 
-This repo is **Layer 4** (human review surface) in the moderation pipeline. Read the coordination doc at session start:
-`~/code/support-trust-safety/docs/moderation/auto-hide-evolution-plan.md`
-
-When you make decisions or discover constraints that affect other layers, update that doc and flag it for the user.
+This repo provides the staff review surface for Divine moderation. Load the shared Divine context and review guidance through `AGENTS.md` before cross-repository work. The existing relay-manager pipeline and the separate Concord room integration coexist; preserve their distinct item types and delivery contracts.
 
 ## Architecture
 
@@ -25,11 +22,15 @@ Moderator decision → COOP webhook → adapter → relay-manager RPC
 - **Adapter:** `support-trust-safety/scripts/coop-webhook-adapter.mjs` translates webhooks to relay-manager RPC
 - **Bridge import:** `divine/coop-bridge-import.sh` pulls Kind 1984 reports from staging relay
 
+## Concord Room Integration
+
+The separate room pipeline uses `concord_message` and `concord_member` item types, configured by `divine/coop_setup_concord.py`. Authenticated room reports enter through `server/routes/concord/`; staff decisions use durable server-issued operation receipts and ordered delivery. Preserve the original identity through unknown responses and exact retries. Recovery, evidence retention, stop and reversal contracts live in the room service and its tests; broader recovery UI remains separately owned.
+
 ## Deployment
 
-GitHub Actions builds only Divine's nginx-unprivileged client image at `ghcr.io/divinevideo/coop-client`.
-The server and worker images come from Roost's official GHCR images, and migrations run via the official server image.
-K8s manifests live in `divine-iac-coreconfig/k8s/applications/coop/`.
+The chat candidate ports the integration onto fixed upstream Coop 1.0.2. `divine/concord-image-artifacts.py` builds and verifies a complete source-bound server, worker, migrator and client image set; the client uses `divine/coop-client-source/Dockerfile`. Protected publication requires reviewed source in main and explicit publication authorization. Existing local candidate receipts are not registry deployment digests.
+
+The legacy client-only workflow and official-image deployment are separate from this candidate. Do not deploy the room changes by mixing new source-built components with older application/database inputs. K8s manifests live in `divine-iac-coreconfig/k8s/applications/coop/`; source readiness, registry publication and production activation are separate steps.
 
 ## Staging Dependencies
 
@@ -50,7 +51,7 @@ docker compose run migrations
 
 Use `divine-v<semver>` tags for stable releases only (e.g., `divine-v0.1.0`). The `divine-` prefix avoids collisions with upstream roostorg tags when syncing. Do NOT use plain `v*` tags — those belong to upstream's namespace. Do NOT use pre-release tags (`divine-v0.1.0-rc1`) — use branch builds (`divine/*`) for pre-release testing instead.
 
-Pushing a `divine-v*` tag triggers CI for the Divine client image, producing Docker image tags `<version>` and `<major>.<minor>` (e.g., `0.1.0` and `0.1`). Pin these in iac-coreconfig kustomization overlays.
+Pushing a `divine-v*` tag triggers CI for the Divine client image, producing Docker image tags `<version>` and `<major>.<minor>` (e.g., `0.1.0` and `0.1`). This legacy client-only tagging does not publish the complete source-bound chat image set described above.
 
 ## Upstream Sync
 
