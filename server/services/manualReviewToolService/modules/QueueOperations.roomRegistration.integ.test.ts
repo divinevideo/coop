@@ -13,6 +13,10 @@ import {
   type RoomDecisionInput,
   type RoomStatus,
 } from '../../../routes/concord/service.js';
+import {
+  duplicateRoomTargetCases,
+  duplicateRoomTargetFixture,
+} from '../../../test/duplicateRoomTargetFixtures.js';
 import { memberIntentTestDatabaseUrl } from '../../../test/memberIntentTestDatabase.js';
 import { roomDecisionSettings } from '../../../test/roomDecisionSettings.js';
 import {
@@ -349,9 +353,13 @@ test('appeal registration revalidates the exact appeal job rather than the ordin
   }
 });
 
-test.each(['direct', 'same-invoker', 'completion'] as const)(
-  '%s preserves accepted and audited-stop completion',
-  async (path) => {
+test.each(
+  (['direct', 'same-invoker', 'completion'] as const).flatMap((path) =>
+    duplicateRoomTargetCases.map((duplicates) => ({ path, duplicates })),
+  ),
+)(
+  '$path preserves accepted and audited-stop completion ($duplicates)',
+  async ({ path, duplicates }) => {
     for (const settlement of ['accepted', 'stopped']) {
       const f = await fixture(path);
       const input: RoomDecisionInput = {
@@ -371,7 +379,20 @@ test.each(['direct', 'same-invoker', 'completion'] as const)(
         await expect(f.submit()).rejects.toThrow(
           'Synthetic acceptance pending',
         );
+        // Model an already-recorded pre-validation decision. Never rewrite such
+        // intent in production: only completion counts use unique identities.
+        await database
+          .updateTable('manual_review_tool.manual_review_decisions')
+          .set(duplicateRoomTargetFixture(duplicates))
+          .where('id', '=', f.guid)
+          .execute();
         const ledger = database as unknown as Kysely<MemberIntentPg>;
+        if (duplicates !== 'none') {
+          if (path === 'completion')
+            await expect(f.remove()).rejects.toThrow('Room');
+          else expect(await f.remove()).toBe(false);
+          expect(await f.exists()).toBe(true);
+        }
         if (settlement === 'accepted') {
           const status: RoomStatus = {
             executionId: roomExecutionId(input),
