@@ -64,6 +64,7 @@ import {
   type OriginJobInfo,
   type StoredManualReviewJob,
 } from '../manualReviewToolService.js';
+import { recordedRoomExecutionCount } from './roomDecisionTargets.js';
 
 export type ManualReviewQueue = {
   id: string;
@@ -1221,15 +1222,11 @@ export default class QueueOperations {
       pg as unknown as Kysely<MemberIntentPg>,
       orgId,
       `mrt-decision:${jobId}`,
-      decision.decision_components.reduce(
-        (count, part) =>
-          count + (part.type === 'CUSTOM_ACTION' ? part.actions.length : 0),
-        0,
-      ) +
-        decision.related_actions.reduce(
-          (count, part) => count + part.actionIds.length * part.itemIds.length,
-          0,
-        ),
+      recordedRoomExecutionCount(
+        decision.job_payload.payload.item,
+        decision.decision_components,
+        decision.related_actions,
+      ),
     );
   }
 
@@ -1355,17 +1352,11 @@ export default class QueueOperations {
             this.pgQuery as unknown as Kysely<MemberIntentPg>,
             orgId,
             `mrt-decision:${job.data.id}`,
-            decision.decision_components.reduce(
-              (count, part) =>
-                count +
-                (part.type === 'CUSTOM_ACTION' ? part.actions.length : 0),
-              0,
-            ) +
-              decision.related_actions.reduce(
-                (count, part) =>
-                  count + part.actionIds.length * part.itemIds.length,
-                0,
-              ),
+            recordedRoomExecutionCount(
+              decision.job_payload.payload.item,
+              decision.decision_components,
+              decision.related_actions,
+            ),
           )));
 
       if (hasDecision) {
@@ -1431,17 +1422,11 @@ export default class QueueOperations {
             this.pgQuery as unknown as Kysely<MemberIntentPg>,
             orgId,
             `mrt-decision:${convertedJob.data.id}`,
-            decision.decision_components.reduce(
-              (count, part) =>
-                count +
-                (part.type === 'CUSTOM_ACTION' ? part.actions.length : 0),
-              0,
-            ) +
-              decision.related_actions.reduce(
-                (count, part) =>
-                  count + part.actionIds.length * part.itemIds.length,
-                0,
-              ),
+            recordedRoomExecutionCount(
+              decision.job_payload.payload.item,
+              decision.decision_components,
+              decision.related_actions,
+            ),
           )));
 
       if (hasDecision) {

@@ -8,7 +8,12 @@ function fixture(
   commitFailure?: Error,
 ) {
   const row = {
-    job_payload: { roomDeliveryRequired: settlement !== 'ordinary' },
+    job_payload: {
+      roomDeliveryRequired: settlement !== 'ordinary',
+      payload: {
+        item: { itemId: 'case', itemTypeIdentifier: { id: 'room-type' } },
+      },
+    },
     decision_components: [
       { type: 'CUSTOM_ACTION', actions: [{ id: 'remove' }] },
     ],

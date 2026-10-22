@@ -44,6 +44,7 @@ import {
 import type ManualReviewToolSettings from './ManualReviewToolSettings.js';
 import type QueueOperations from './QueueOperations.js';
 import { jobIdToGuid } from './QueueOperations.js';
+import { assertUniqueRoomDecisionTargets } from './roomDecisionTargets.js';
 
 export type ManualReviewDecisionRelatedAction = {
   actionIdsToMrtApiParamDecisionPayload?: JsonObject | null;
@@ -946,6 +947,13 @@ export default class JobDecisioning {
           'duplicate key value violates unique constraint "manual_review_decisions_pkey"',
         );
     }
+    // Reject ambiguous new arrays before recording immutable intent. Previously
+    // recorded arrays retain their exact bytes and recover by execution identity.
+    assertUniqueRoomDecisionTargets(
+      job.payload.item,
+      decisionComponents,
+      relatedActions,
+    );
     const intents = this.prepareRoomIntents
       ? await this.prepareRoomIntents({
           job,
