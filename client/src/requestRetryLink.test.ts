@@ -1,27 +1,29 @@
 import {
   ApolloLink,
   execute,
-  gql,
   Observable,
   type FetchResult,
 } from '@apollo/client';
 import { vi } from 'vitest';
 
-import { GQLBulkActionExecutionDocument } from './graphql/generated';
+import {
+  GQLBulkActionExecutionDocument,
+  GQLRoomScopeStaffDocument,
+} from './graphql/generated';
 import { requestRetryLink } from './requestRetryLink';
 
 afterEach(() => vi.useRealTimers());
-const query = gql`
-  query RetryableRead {
-    me {
-      id
-    }
-  }
-`;
-
 test.each([
-  { document: query, roomOperationAttempt: false, attempts: 3 },
-  { document: query, roomOperationAttempt: true, attempts: 1 },
+  {
+    document: GQLRoomScopeStaffDocument,
+    roomOperationAttempt: false,
+    attempts: 3,
+  },
+  {
+    document: GQLRoomScopeStaffDocument,
+    roomOperationAttempt: true,
+    attempts: 1,
+  },
   {
     document: GQLBulkActionExecutionDocument,
     roomOperationAttempt: false,
