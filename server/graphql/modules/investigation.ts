@@ -1,13 +1,13 @@
 /* eslint-disable max-lines */
-import { type DateString } from '@roostorg/types';
-
+import { isIP } from 'node:net';
+import { type DateString } from '@roostorg/coop-types';
 import _ from 'lodash';
 
-import { type ConditionSetWithResult } from '../../services/moderationConfigService/index.js';
 import {
   getFieldValueForRole,
   type ItemSubmission,
 } from '../../services/itemProcessingService/index.js';
+import { type ConditionSetWithResult } from '../../services/moderationConfigService/index.js';
 import {
   asyncIterableToArray,
   asyncIterableToArrayWithTimeout,
@@ -18,14 +18,19 @@ import { jsonStringify } from '../../utils/encoding.js';
 import { isCoopErrorOfType, makeNotFoundError } from '../../utils/errors.js';
 import { MONTH_MS } from '../../utils/time.js';
 import {
+  type GQLQueryItemsWithIdArgs,
   type GQLQueryResolvers,
-  type GQLResolversTypes,
   type GQLRuleEnvironment,
   type GQLUserHistoryResolvers,
 } from '../generated.js';
+import { type Context } from '../resolvers.js';
 import { formatItemSubmissionForGQL } from '../types.js';
-import { gqlErrorResult, gqlSuccessResult } from '../utils/gqlResult.js';
 import { unauthenticatedError } from '../utils/errors.js';
+import { gqlErrorResult, gqlSuccessResult } from '../utils/gqlResult.js';
+
+// Upper bound on how many items an IP reverse-lookup can return in one call, so
+// a caller-supplied `limit` can't trigger an unbounded index scan.
+const MAX_ITEMS_BY_IP_LIMIT = 200;
 
 const typeDefs = /* GraphQL */ `
   type Query {
@@ -41,6 +46,15 @@ const typeDefs = /* GraphQL */ `
     latestItemsCreatedByWithThread(
       itemIdentifier: ItemIdentifierInput!
     ): [ThreadWithMessages!]!
+
+    # Reverse lookup of every item associated with a given IP address. Powers
+    # the "other items from this IP" investigation view.
+    latestItemsByIpAddress(
+      ipAddress: String!
+      limit: Int
+      oldestReturnedSubmissionDate: DateTime
+      earliestReturnedSubmissionDate: DateTime
+    ): [ItemSubmissions!]!
 
     userHistory(itemIdentifier: ItemIdentifierInput!): UserHistoryResponse!
 
@@ -127,6 +141,56 @@ const typeDefs = /* GraphQL */ `
   }
 `;
 
+type FormattedItemSubmission = ReturnType<typeof formatItemSubmissionForGQL>;
+
+type ItemsWithIdResultEntry = {
+  latest: FormattedItemSubmission;
+  prior?: ReadonlyArray<FormattedItemSubmission>;
+  isSynthetic?: true;
+};
+
+type ItemInvestigationServiceForItemsWithId = Pick<
+  Context['services']['ItemInvestigationService'],
+  | 'getItemByIdentifier'
+  | 'getItemByTypeAgnosticIdentifier'
+  | 'synthesizeUserItemFromCreatorReferences'
+>;
+
+export type ItemsWithIdContext = {
+  getUser: () => { orgId: string } | null | undefined;
+  services: {
+    ItemInvestigationService: ItemInvestigationServiceForItemsWithId;
+  };
+};
+
+async function tryBuildSyntheticItemsWithIdResult(
+  service: Pick<
+    ItemInvestigationServiceForItemsWithId,
+    'synthesizeUserItemFromCreatorReferences'
+  >,
+  orgId: string,
+  itemId: string,
+  knownUserTypeId?: string,
+): Promise<ReadonlyArray<ItemsWithIdResultEntry> | null> {
+  const synthetic = await service.synthesizeUserItemFromCreatorReferences({
+    orgId,
+    itemId,
+    knownUserTypeId,
+  });
+
+  if (!synthetic) {
+    return null;
+  }
+
+  return [
+    {
+      latest: formatItemSubmissionForGQL(synthetic.latestSubmission),
+      prior: undefined,
+      isSynthetic: true,
+    },
+  ];
+}
+
 const UserHistory: GQLUserHistoryResolvers = {
   async executions(it, _, context) {
     const user = context.getUser();
@@ -178,6 +242,100 @@ const UserHistory: GQLUserHistoryResolvers = {
     return { countsByItemType: submissions };
   },
 };
+
+export async function resolveItemsWithId(
+  { itemId, typeId, returnFirstResultOnly }: GQLQueryItemsWithIdArgs,
+  context: ItemsWithIdContext,
+) {
+  const user = context.getUser();
+  if (user == null) {
+    throw unauthenticatedError('Unauthenticated User');
+  }
+
+  if (typeId) {
+    const item =
+      await context.services.ItemInvestigationService.getItemByIdentifier({
+        orgId: user.orgId,
+        itemIdentifier: { id: itemId, typeId },
+        latestSubmissionOnly: true,
+      });
+
+    if (item == null) {
+      const synthetic = await tryBuildSyntheticItemsWithIdResult(
+        context.services.ItemInvestigationService,
+        user.orgId,
+        itemId,
+        typeId,
+      );
+      return synthetic ?? [];
+    }
+
+    return [
+      {
+        latest: formatItemSubmissionForGQL(item.latestSubmission),
+        prior: item.priorSubmissions?.map((priorSubmission: ItemSubmission) =>
+          formatItemSubmissionForGQL(priorSubmission),
+        ),
+      },
+    ];
+  }
+
+  const itemsAsyncIterator =
+    context.services.ItemInvestigationService.getItemByTypeAgnosticIdentifier({
+      orgId: user.orgId,
+      itemId,
+      latestSubmissionOnly: true,
+    });
+
+  if (returnFirstResultOnly) {
+    const items = await asyncIterableToArrayWithTimeoutAndLimit(
+      itemsAsyncIterator,
+      25_000,
+      1,
+    );
+
+    if (items.length === 0) {
+      const synthetic = await tryBuildSyntheticItemsWithIdResult(
+        context.services.ItemInvestigationService,
+        user.orgId,
+        itemId,
+      );
+      return synthetic ?? [];
+    }
+
+    const item = items[0];
+    return [
+      {
+        latest: formatItemSubmissionForGQL(item.latestSubmission),
+        prior: item.priorSubmissions?.map((priorSubmission: ItemSubmission) =>
+          formatItemSubmissionForGQL(priorSubmission),
+        ),
+      },
+    ];
+  }
+
+  // 25s timeout caps slow upstream streams.
+  const items = await asyncIterableToArrayWithTimeout(
+    itemsAsyncIterator,
+    25_000,
+  );
+
+  if (items.length === 0) {
+    const synthetic = await tryBuildSyntheticItemsWithIdResult(
+      context.services.ItemInvestigationService,
+      user.orgId,
+      itemId,
+    );
+    return synthetic ?? [];
+  }
+
+  return items.map((it) => ({
+    latest: formatItemSubmissionForGQL(it.latestSubmission),
+    prior: it.priorSubmissions?.map((priorSubmission) =>
+      formatItemSubmissionForGQL(priorSubmission),
+    ),
+  }));
+}
 
 const Query: GQLQueryResolvers = {
   async itemSubmissions(_, { itemIdentifiers }, context) {
@@ -257,80 +415,8 @@ const Query: GQLQueryResolvers = {
       throw e;
     }
   },
-  async itemsWithId(_, { itemId, typeId, returnFirstResultOnly }, context) {
-    const user = context.getUser();
-    if (user == null) {
-      throw unauthenticatedError('Unauthenticated User');
-    }
-
-    if (typeId) {
-      const item =
-        await context.services.ItemInvestigationService.getItemByIdentifier({
-          orgId: user.orgId,
-          itemIdentifier: { id: itemId, typeId },
-          latestSubmissionOnly: true,
-        });
-
-      if (item == null) {
-        return [];
-      }
-
-      return [
-        {
-          latest: formatItemSubmissionForGQL(item.latestSubmission),
-          prior: item.priorSubmissions?.map((priorSubmission: ItemSubmission) =>
-            formatItemSubmissionForGQL(priorSubmission),
-          ),
-        },
-      ];
-    }
-
-    const itemsAsyncIterator =
-      context.services.ItemInvestigationService.getItemByTypeAgnosticIdentifier(
-        {
-          orgId: user.orgId,
-          itemId,
-          latestSubmissionOnly: true,
-        },
-      );
-
-    if (returnFirstResultOnly) {
-      const items = await asyncIterableToArrayWithTimeoutAndLimit(
-        itemsAsyncIterator,
-        25_000,
-        1,
-      );
-
-      if (items.length === 0) {
-        return [];
-      }
-
-      const item = items[0];
-      return [
-        {
-          latest: formatItemSubmissionForGQL(item.latestSubmission),
-          prior: item.priorSubmissions?.map((priorSubmission: ItemSubmission) =>
-            formatItemSubmissionForGQL(priorSubmission),
-          ),
-        },
-      ];
-    } else {
-      const items = await asyncIterableToArrayWithTimeout(
-        itemsAsyncIterator,
-        // Set to 25 seconds to avoid long-running requests and we
-        // want to make sure we get some results in the event of a possible
-        // timeout (which is why we're using an async iterable in the first
-        // place instead of just returning an array)
-        25_000,
-      );
-
-      return items.map((it) => ({
-        latest: formatItemSubmissionForGQL(it.latestSubmission),
-        prior: it.priorSubmissions?.map((priorSubmission) =>
-          formatItemSubmissionForGQL(priorSubmission),
-        ),
-      }));
-    }
+  async itemsWithId(_, args, context) {
+    return resolveItemsWithId(args, context);
   },
   async itemWithHistory(_, { itemIdentifier, submissionTime }, context) {
     const { id: itemId, typeId } = itemIdentifier;
@@ -366,9 +452,7 @@ const Query: GQLQueryResolvers = {
       {
         item: formatItemSubmissionForGQL(item.latestSubmission),
         // TODO: Fix casting here
-        executions: itemExecutionHistory as ReadonlyArray<
-          GQLResolversTypes['RuleExecutionResult']
-        >,
+        executions: itemExecutionHistory,
       },
       'ItemHistoryResult',
     );
@@ -440,6 +524,58 @@ const Query: GQLQueryResolvers = {
       return {
         latest: formattedItem,
         prior: formattedPriors,
+      };
+    });
+  },
+
+  async latestItemsByIpAddress(
+    _,
+    {
+      ipAddress,
+      limit,
+      oldestReturnedSubmissionDate,
+      earliestReturnedSubmissionDate,
+    },
+    context,
+  ) {
+    const user = context.getUser();
+    if (user == null) {
+      throw unauthenticatedError('Unauthenticated User');
+    }
+
+    // Validate the IP server-side so we never run an index scan on arbitrary
+    // attacker-controlled input. Return an empty result for anything that
+    // isn't a well-formed IPv4/IPv6 address.
+    const normalizedIp = ipAddress.trim();
+    if (!isIP(normalizedIp)) {
+      return [];
+    }
+
+    // Clamp the caller-supplied limit to a sane, bounded range.
+    const validatedLimit =
+      limit == null
+        ? undefined
+        : Math.min(Math.max(Math.trunc(limit), 1), MAX_ITEMS_BY_IP_LIMIT);
+
+    const items = await asyncIterableToArray(
+      context.services.ItemInvestigationService.getItemSubmissionsByIpAddress({
+        orgId: user.orgId,
+        ipAddress: normalizedIp,
+        limit: validatedLimit,
+        oldestReturnedSubmissionDate: oldestReturnedSubmissionDate
+          ? new Date(oldestReturnedSubmissionDate)
+          : undefined,
+        earliestReturnedSubmissionDate: earliestReturnedSubmissionDate
+          ? new Date(earliestReturnedSubmissionDate)
+          : undefined,
+      }),
+    );
+
+    return items.map((contentItems) => {
+      const { latestSubmission, priorSubmissions = [] } = contentItems;
+      return {
+        latest: formatItemSubmissionForGQL(latestSubmission),
+        prior: priorSubmissions.map(formatItemSubmissionForGQL),
       };
     });
   },

@@ -1,7 +1,7 @@
 import { gql } from '@apollo/client';
-import { ItemIdentifier } from '@roostorg/types';
-import { Input } from 'antd';
-import { useEffect, useState } from 'react';
+import { ItemIdentifier } from '@roostorg/coop-types';
+import { Alert, Input } from 'antd';
+import { useEffect, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import ComponentLoading from '../../../components/common/ComponentLoading';
@@ -17,11 +17,13 @@ import {
   useGQLGetOrgDataQuery,
 } from '../../../graphql/generated';
 import { filterNullOrUndefined } from '../../../utils/collections';
+import { getFieldValueForRole } from '../../../utils/itemUtils';
 import { __throw } from '../../../utils/misc';
 import ManualReviewJobPrimaryUserComponent from '../mrt/manual_review_job/v2/user/ManualReviewJobPrimaryUserComponent';
 import { ITEM_TYPE_FRAGMENT } from '../rules/rule_form/RuleForm';
 import ItemInvestigationRuleResults from './ItemInvestigationRuleResults';
 import ItemInvestigationSummary from './ItemInvestigationSummary';
+import ItemsByIpAddress from './ItemsByIpAddress';
 import ThreadInvestigation from './ThreadInvestigation';
 
 export type RuleExecutionHistory = GQLItemHistoryResult['executions'][0];
@@ -67,6 +69,7 @@ gql`
 
   query GetItemsWithId($id: ID!, $typeId: ID) {
     itemsWithId(itemId: $id, typeId: $typeId, returnFirstResultOnly: true) {
+      isSynthetic
       latest {
         ... on ItemBase {
           id
@@ -96,6 +99,7 @@ gql`
                   threadId
                   createdAt
                   creatorId
+                  ipAddress
                 }
               }
               ... on UserItemType {
@@ -103,6 +107,7 @@ gql`
                   displayName
                   createdAt
                   profileIcon
+                  ipAddress
                 }
               }
               ... on ThreadItemType {
@@ -110,13 +115,14 @@ gql`
                   displayName
                   createdAt
                   creatorId
+                  ipAddress
                 }
               }
             }
           }
         }
         ... on UserItem {
-          userScore
+          userStrikeCount
         }
       }
     }
@@ -214,11 +220,13 @@ export default function ItemInvestigation(props: {
   itemId: string | undefined;
   itemTypeId: string | undefined;
   submissionTime: string | undefined;
+  ipAddress?: string | undefined;
 }) {
   const {
     itemId: initialItemId,
     itemTypeId: initialItemTypeId,
     submissionTime: initialSubmissionTime,
+    ipAddress,
   } = props;
 
   if (initialItemTypeId && !initialItemId) {
@@ -352,9 +360,31 @@ export default function ItemInvestigation(props: {
       );
     }
 
-    const item = eligibleItems.find(
-      (it) => it.id === selectedItem?.id && it.type.id === selectedItem.typeId,
-    )!;
+    const selectedWrapper = eligibleItemsResult.find(
+      (wrapper) =>
+        wrapper.latest.id === selectedItem?.id &&
+        wrapper.latest.type.id === selectedItem.typeId,
+    );
+    if (!selectedWrapper) {
+      return (
+        <InvestigationError message="Could not match selected item to investigation results." />
+      );
+    }
+    const item = selectedWrapper.latest;
+    const isSynthetic = selectedWrapper.isSynthetic === true;
+    const syntheticBanner = isSynthetic ? (
+      <Alert
+        type="info"
+        showIcon
+        className="w-full mb-4"
+        message="No submission record found for this user"
+        description={
+          'Your integration has never sent this user to the Content API, so we have no profile data to show. ' +
+          'The history below (actions, strikes, related content) is derived from items where this id appears as the author. ' +
+          'To populate the user profile, POST the user to the items endpoint with the matching user type id.'
+        }
+      />
+    ) : null;
 
     const {
       itemTypes: allItemTypes,
@@ -365,9 +395,39 @@ export default function ItemInvestigation(props: {
       allowMultiplePoliciesPerAction = false,
     } = orgData?.myOrg ?? {};
 
+    // The item type's `ipAddress` field role (when configured) tells us which
+    // field holds the IP, so we can offer a reverse lookup of other items that
+    // share it. Named distinctly from the `ipAddress` prop (URL `?ip=`) to avoid
+    // shadowing it.
+    const derivedIpAddress = (() => {
+      try {
+        return getFieldValueForRole(
+          {
+            // eslint-disable-next-line custom-rules/no-casting-in-getFieldValueForRole
+            type: item.type as Parameters<
+              typeof getFieldValueForRole
+            >[0]['type'],
+            data: item.data,
+          },
+          'ipAddress',
+        );
+      } catch {
+        return undefined;
+      }
+    })();
+
+    const ipPanel = derivedIpAddress ? (
+      <ItemsByIpAddress
+        ipAddress={derivedIpAddress}
+        currentItemId={item.id}
+        currentItemTypeId={item.type.id}
+      />
+    ) : null;
+
+    let investigationContent: ReactNode = null;
     switch (item.__typename) {
       case 'ContentItem':
-        return (
+        investigationContent = (
           <div className="flex flex-col w-full mb-8">
             <ItemInvestigationSummary
               item={{
@@ -386,16 +446,17 @@ export default function ItemInvestigation(props: {
             />
           </div>
         );
+        break;
       case 'UserItem':
-        return (
+        investigationContent = (
           <div className="flex flex-col w-full mb-8">
+            {syntheticBanner}
             <ManualReviewJobPrimaryUserComponent
               user={
                 item
                   ? (item as GQLUserItem)
                   : __throw(`User not found for item with ID ${itemId}`)
               }
-              userScore={item.userScore ?? undefined}
               unblurAllMedia={false}
               allItemTypes={(allItemTypes as GQLItemType[] | undefined) ?? []}
               allActions={allActions ?? []}
@@ -410,8 +471,9 @@ export default function ItemInvestigation(props: {
             />
           </div>
         );
+        break;
       case 'ThreadItem':
-        return (
+        investigationContent = (
           <div className="flex flex-col w-full mb-8">
             <ThreadInvestigation
               threadItem={item as GQLThreadItem}
@@ -429,7 +491,15 @@ export default function ItemInvestigation(props: {
             />
           </div>
         );
+        break;
     }
+
+    return (
+      <>
+        {investigationContent}
+        {ipPanel}
+      </>
+    );
   })();
 
   return (
@@ -438,8 +508,8 @@ export default function ItemInvestigation(props: {
         Input an Item ID to see which Coop rules it matched against, why they
         matched, and what actions those rules applied to the item.
       </div>
-      <div className="flex items-start justify-between w-full gap-4">
-        <div className="flex flex-row items-end mb-6">
+      <div className="flex flex-wrap items-start justify-between w-full gap-4">
+        <div className="flex flex-row flex-wrap items-end mb-6">
           <div className="flex flex-col items-start mr-2">
             <div className="mb-2 font-bold">Item ID</div>
             <Input
@@ -470,6 +540,9 @@ export default function ItemInvestigation(props: {
         </div>
         {selectedItem ? <ItemAction itemIdentifier={selectedItem} /> : null}
       </div>
+      {!selectedItem && ipAddress ? (
+        <ItemsByIpAddress ipAddress={ipAddress} />
+      ) : null}
       {results}
     </div>
   );

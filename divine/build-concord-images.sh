@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Build/test only. The publisher defaults to verify and needs explicit run authorization.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+revision=$(git rev-parse HEAD)
+[[ ${BUILD_PLATFORM:-linux/amd64} == linux/amd64 ]] || { echo 'Source image contract requires linux/amd64.' >&2; exit 1; }
+artifacts=${ARTIFACT_DIR:-${TMPDIR:-/tmp}/coop-source-artifacts-$revision}
+python3 divine/concord-image-artifacts.py build --source "$PWD" --source-sha "$revision" --harness-sha "$revision" --artifacts "$artifacts"
+for image in server worker; do
+  docker run --rm --entrypoint sh "divine-local/coop-source-$image:$revision" -c 'test -r routes/concord/service.js && test -r routes/concord/index.js'
+done
+docker run --rm --entrypoint sh "divine-local/coop-source-client:$revision" -c 'test -r /usr/share/nginx/html/source-build.json && test -r /usr/share/nginx/html/index.html'
+# A read-only, networkless production start catches runtime npm installs and
+# accidental development-only preloads as well as missing compiled files.
+docker run --rm --platform linux/amd64 --network none --read-only -e NODE_ENV=production "divine-local/coop-source-migrator:$revision"
+docker run --rm --platform linux/amd64 --network none --read-only -e NODE_ENV=production "divine-local/coop-source-migrator:$revision" npm run db:update -- --help
+echo "PASS four source images and artifact manifest at $artifacts; no publication performed."

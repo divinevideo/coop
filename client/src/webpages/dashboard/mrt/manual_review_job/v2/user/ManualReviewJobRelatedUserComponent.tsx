@@ -2,9 +2,13 @@ import UserAlt4 from '@/icons/lni/User/user-alt-4.svg?react';
 import { arrayFromArrayOrSingleItem } from '@/utils/collections';
 import type { ItemTypeFieldFieldData } from '@/webpages/dashboard/item_types/itemTypeUtils';
 import ItemActionHistory from '@/webpages/dashboard/items/ItemActionHistory';
+import {
+  convertRelatedItemToFieldData,
+  userStrikeCountField,
+} from '@/webpages/dashboard/mrt/manual_review_job/v2/user/ManualReviewJobUserUtils';
 import { LoadingOutlined } from '@ant-design/icons';
 import { gql } from '@apollo/client';
-import { ItemIdentifier, RelatedItem } from '@roostorg/types';
+import { ItemIdentifier, RelatedItem } from '@roostorg/coop-types';
 import isEmpty from 'lodash/isEmpty';
 
 import {
@@ -14,6 +18,7 @@ import {
   useGQLGetUserItemsQuery,
 } from '../../../../../../graphql/generated';
 import { getFieldValueForRole } from '../../../../../../utils/itemUtils';
+import { selectPreferredUserItem } from '../../../../../../utils/manualReviewTool';
 import {
   ManualReviewJobAction,
   ManualReviewJobEnqueuedActionData,
@@ -22,7 +27,6 @@ import FieldsComponent from '../ManualReviewJobFieldsComponent';
 import ManualReviewJobMagnifyImageComponent from '../ManualReviewJobMagnifyImageComponent';
 import ManualReviewJobEnqueueRelatedActionWithPoliciesButton from '../related_actions/ManualReviewJobEnqueueRelatedActionWithPoliciesButton';
 import ManualReviewJobLatestSubmissionsWithThreadComponent from './ManualReviewJobLatestSubmissionsWithThreadComponent';
-import { convertRelatedItemToFieldData } from './ManualReviewJobUserUtils';
 
 gql`
   query OrgData {
@@ -59,7 +63,6 @@ gql`
               id
             }
             data
-            userScore
           }
         }
       }
@@ -87,6 +90,7 @@ gql`
         submissionId
         submissionTime
         data
+        userStrikeCount
         type {
           id
           name
@@ -181,13 +185,12 @@ export default function ManualReviewJobRelatedUserComponent(props: {
       },
     });
 
-  const moreInfo =
-    moreInfoData?.partialItems.__typename === 'PartialItemsSuccessResponse' &&
-    moreInfoData.partialItems.items[0].__typename === 'UserItem'
-      ? moreInfoData.partialItems.items[0]
-      : userItemData?.latestItemSubmissions[0]?.__typename === 'UserItem'
-      ? userItemData.latestItemSubmissions[0]
-      : undefined;
+  const moreInfo = selectPreferredUserItem(
+    moreInfoData?.partialItems.__typename === 'PartialItemsSuccessResponse'
+      ? moreInfoData.partialItems.items
+      : undefined,
+    userItemData?.latestItemSubmissions,
+  );
 
   const userItem = userItemData?.latestItemSubmissions?.find(
     (it) => it.__typename === 'UserItem',
@@ -329,7 +332,13 @@ export default function ManualReviewJobRelatedUserComponent(props: {
           <div className="flex justify-start w-full">
             <FieldsComponent
               fields={[
-                ...convertRelatedItemToFieldData(user, userItem?.userScore),
+                ...convertRelatedItemToFieldData(
+                  user,
+                  (userSubmissionItems ?? []).map((it) => it.name),
+                ),
+                ...(userItem
+                  ? [userStrikeCountField(userItem.userStrikeCount)]
+                  : []),
                 ...(userSubmissionItems ?? []),
               ]}
               itemTypeId={user.typeId}
@@ -348,8 +357,8 @@ export default function ManualReviewJobRelatedUserComponent(props: {
                 moreInfoError != null
                   ? 'Error Fetching Data'
                   : moreInfo != null && isEmpty(moreInfo?.data)
-                  ? 'No info returned'
-                  : undefined
+                    ? 'No info returned'
+                    : undefined
               }
             />
           ) : undefined}

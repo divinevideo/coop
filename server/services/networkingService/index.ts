@@ -64,8 +64,8 @@ export function makeFormDataLikeWithStreams(parts: {
 function isFormDataLikeWithStreams(it: unknown): it is FormDataLikeWithStreams {
   return Boolean(
     typeof it === 'object' &&
-      it != null &&
-      (it as { [formDataLikeWithStreams]?: unknown })[formDataLikeWithStreams],
+    it != null &&
+    (it as { [formDataLikeWithStreams]?: unknown })[formDataLikeWithStreams],
   );
 }
 
@@ -81,6 +81,8 @@ export type CoopRequestQuery<T extends HandleResponseBody> = {
   url: string;
   method: 'get' | 'post' | 'put' | 'patch' | 'delete' | 'head' | 'options';
   handleResponseBody: T;
+  /** Credential-bound service calls must not forward headers to redirects. */
+  redirect?: 'follow' | 'error';
   headers?: Record<string, string | ReadonlyArray<string>>;
   logRequestAndResponseBody?: 'ALWAYS' | 'ON_FAILURE' | 'NEVER';
   /**
@@ -307,6 +309,7 @@ export async function fetchHTTP<T extends HandleResponseBody>(
         duplex: finalBody instanceof ReadableStream ? 'half' : undefined,
         dispatcher: agentMapping[query.maxResponseSize ?? '5mb'],
         signal,
+        redirect: query.redirect,
       });
 
       span.setAttribute('http.status_code', response.status);
@@ -336,16 +339,21 @@ export async function fetchHTTP<T extends HandleResponseBody>(
 
               return [parsedJson, tempArrayBuffer.byteLength];
             } catch (e) {
-              // when parsing JSON fails, since in this case we explicity
-              // called this function wiht 'as-json' we expect to recieve
-              // JSON from the remote server, we should log the body of the
-              // response to inspect, then re-throw the error so we are not
-              // changing behavior for callers
-              span.setAttribute(
-                'responseBody',
-                utf8DecodeBytes(new Uint8Array(tempArrayBuffer)),
+              const decodedBody = utf8DecodeBytes(
+                new Uint8Array(tempArrayBuffer),
               );
-              throw e;
+              const bodyPrefix = sanitizedBodyPrefix(decodedBody);
+              span.setAttribute(
+                'responseBodyByteLength',
+                tempArrayBuffer.byteLength,
+              );
+              span.setAttribute('responseBodyPrefix', bodyPrefix);
+              throw new Error(
+                `Failed to parse response body as JSON (${tempArrayBuffer.byteLength} bytes): ${
+                  e instanceof Error ? e.message : String(e)
+                }. Response body started with: ${bodyPrefix}`,
+                { cause: e },
+              );
             }
           }
           case 'as-json-from-xml': {
@@ -410,6 +418,17 @@ export async function fetchHTTP<T extends HandleResponseBody>(
       };
     },
   );
+}
+
+// Bounded so unbounded customer response bodies don't end up in log
+// aggregators verbatim when JSON parsing fails.
+const JSON_PARSE_ERROR_BODY_PREFIX_LENGTH = 96;
+
+function sanitizedBodyPrefix(body: string): string {
+  const prefix = body.slice(0, JSON_PARSE_ERROR_BODY_PREFIX_LENGTH);
+  const printableOnly = prefix.replace(/[^\x20-\x7E]/g, '.');
+  const ellipsis = body.length > JSON_PARSE_ERROR_BODY_PREFIX_LENGTH ? '…' : '';
+  return `"${printableOnly}${ellipsis}"`;
 }
 
 // TextDecoder reused by each utf8DecodeBytes call,

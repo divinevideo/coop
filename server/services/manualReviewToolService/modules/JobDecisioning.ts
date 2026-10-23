@@ -1,30 +1,53 @@
 /* eslint-disable max-lines */
+import { isDeepStrictEqual } from 'node:util';
 import { sql, type Kysely } from 'kysely';
 import { match } from 'ts-pattern';
 import { type JsonObject } from 'type-fest';
 
 import { type Dependencies } from '../../../iocContainer/index.js';
+import {
+  registerMemberIntents,
+  type MemberIntentPg,
+  type PreparedMemberIntent,
+} from '../../../routes/concord/memberIntents.js';
+import {
+  object,
+  validateRoomActionPermission,
+  validRoomReason,
+  type StaffActor,
+} from '../../../routes/concord/service.js';
 import { filterNullOrUndefined } from '../../../utils/collections.js';
+import { jsonParse, jsonStringify } from '../../../utils/encoding.js';
 import {
   CoopError,
   ErrorType,
+  isCoopErrorOfType,
   type ErrorInstanceData,
 } from '../../../utils/errors.js';
+import { assertUnreachable } from '../../../utils/misc.js';
+import { isNonEmptyString } from '../../../utils/typescript-types.js';
 import { getFieldValueForRole } from '../../itemProcessingService/index.js';
 import { type NCMECMediaReport } from '../../ncmecService/ncmecReporting.js';
-import { type ManualReviewToolServicePg } from '../dbTypes.js';
+import {
+  type ClearReportsDisposition,
+  type ManualReviewToolServicePg,
+} from '../dbTypes.js';
 import { type GetActionsByIdEventuallyConsistent } from '../manualReviewToolQueries.js';
 import {
+  type AppealEnqueueSourceInfo,
   type JobId,
   type ManualReviewAppealJob,
   type ManualReviewJob,
   type ManualReviewJobEnqueueSourceInfo,
   type ReportHistory,
 } from '../manualReviewToolService.js';
+import type ManualReviewToolSettings from './ManualReviewToolSettings.js';
 import type QueueOperations from './QueueOperations.js';
 import { jobIdToGuid } from './QueueOperations.js';
+import { assertUniqueRoomDecisionTargets } from './roomDecisionTargets.js';
 
 export type ManualReviewDecisionRelatedAction = {
+  actionIdsToMrtApiParamDecisionPayload?: JsonObject | null;
   actionIds: readonly string[];
   itemIds: readonly string[];
   itemTypeId: string;
@@ -52,7 +75,22 @@ export type NCMECThreadReport = {
   reportedContent: readonly NCMECReportedContentInThread[];
 };
 
-type MRTJobAutoCloseReason = 'ITEM_DELETED_BEFORE_REVIEW';
+type MRTJobAutoCloseReason =
+  | 'ITEM_DELETED_BEFORE_REVIEW'
+  // Another job for this user was actioned and the queue closes their other
+  // reports (issue #650).
+  | 'USER_ACTIONED';
+
+/**
+ * `reviewer_id` recorded for decisions the system makes with no human reviewer
+ * (e.g. AUTOMATIC_CLOSE). `manual_review_decisions.reviewer_id` is NOT NULL, so
+ * we can't store null; we store the empty string instead. The MRT client treats
+ * a falsy reviewer id as "Automatic" (see getReviewerName in
+ * ManualReviewRecentDecisions.tsx), and the reviewer-grouped analytics table
+ * drops ids that don't match an org user, so the empty string renders correctly
+ * everywhere without a schema migration or any client change.
+ */
+export const AUTOMATED_DECISION_REVIEWER_ID = '';
 
 export type ManualReviewDecisionComponent =
   | { type: 'IGNORE' }
@@ -80,6 +118,7 @@ export type ManualReviewDecisionComponent =
       reportedMessages: readonly NCMECThreadReport[];
       incidentType: string;
       escalateToHighPriority?: string;
+      additionalInfo?: string;
     }
   | {
       type: 'TRANSFORM_JOB_AND_RECREATE_IN_QUEUE';
@@ -96,7 +135,13 @@ export type ManualReviewDecisionType =
   | ManualReviewDecisionComponent['type']
   | 'RELATED_ACTION';
 
+export type CustomActionDecisionComponent = Extract<
+  ManualReviewDecisionComponent,
+  { type: 'CUSTOM_ACTION' }
+>;
+
 export type SubmitDecisionInput = {
+  isAppealsQueue?: boolean;
   queueId: string;
   reportHistory: ReportHistory;
   jobId: JobId;
@@ -119,10 +164,15 @@ export type SubmitDecisionInput = {
       decisionComponents: ManualReviewDecisionComponent[];
       reviewerId: string;
       reviewerEmail: string;
+      // Set by the sweep on its own disposition decisions so SAME_ACTION
+      // can't recurse.
+      suppressUserReportSweep?: boolean;
     }
 );
 
 export type OnRecordDecisionInput = {
+  // Retain the durable-delivery contract across configuration races.
+  roomDeliveryRequired?: boolean;
   relatedActions: readonly ManualReviewDecisionRelatedAction[];
   job: ManualReviewJob | ManualReviewAppealJob;
   queueId: string;
@@ -130,7 +180,38 @@ export type OnRecordDecisionInput = {
   reviewerId: string;
   reviewerEmail: string;
   decisionReason?: string;
+  suppressUserReportSweep?: boolean;
 };
+
+export function assertRoomRelatedItemTypeAvailable(itemType: unknown) {
+  if (itemType == null)
+    throw new Error('Room related item type configuration unavailable');
+}
+
+export function assertRoomActionConfigurationAvailable(
+  actionIds: readonly string[],
+  actions: readonly { id: string; name: string }[],
+) {
+  if (
+    actions.length !== actionIds.length ||
+    actionIds.some((id) => !actions.some((action) => action.id === id)) ||
+    actions.some((action) => !action.name.startsWith('concord_'))
+  )
+    throw new Error('Room action configuration unavailable');
+}
+
+// Compare the representation Postgres stores in JSONB: undefined object fields
+// disappear, while object key order is immaterial. Real action/scope changes
+// must still fail the immutable-intent check.
+function samePersistedJson(
+  left: readonly unknown[],
+  right: readonly unknown[],
+) {
+  return isDeepStrictEqual(
+    jsonParse(jsonStringify(left)),
+    jsonParse(jsonStringify(right)),
+  );
+}
 
 export default class JobDecisioning {
   constructor(
@@ -140,7 +221,65 @@ export default class JobDecisioning {
     readonly onRecordDecision: (params: OnRecordDecisionInput) => Promise<void>,
     private readonly moderationConfigService: Dependencies['ModerationConfigService'],
     private readonly tracer: Dependencies['Tracer'],
+    private readonly manualReviewToolSettings: ManualReviewToolSettings,
+    private readonly getRoomActor?: (
+      id: string,
+      orgId: string,
+    ) => Promise<StaffActor>,
+    private readonly prepareRoomIntents?: (
+      input: OnRecordDecisionInput,
+    ) => Promise<PreparedMemberIntent[]>,
   ) {}
+
+  /** Resume only persisted room intent; the trigger never supplies new intent. */
+  async retryRecordedRoomDecision(opts: {
+    orgId: string;
+    queueId: string;
+    jobId: JobId;
+    lockToken: string;
+    reviewerId: string;
+    isAppealsQueue?: boolean;
+  }): Promise<boolean> {
+    const prior = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .where('id', '=', jobIdToGuid(opts.jobId))
+      .where('org_id', '=', opts.orgId)
+      .selectAll()
+      .executeTakeFirst();
+    if (prior?.job_payload.roomDeliveryRequired !== true) return false;
+    if (!prior.reviewer_id || prior.queue_id !== opts.queueId)
+      throw new Error('Recorded room decision unavailable');
+    await this.submitDecision({
+      ...opts,
+      reviewerEmail: '',
+      reportHistory: [],
+      decisionComponents: prior.decision_components,
+      relatedActions: prior.related_actions,
+      decisionReason: prior.decision_reason ?? undefined,
+    }).catch((error: unknown) => {
+      // Existing submit callers receive this after successful duplicate-record
+      // cleanup (or concurrent completion). Both mean recovery can advance.
+      if (!isCoopErrorOfType(error, 'JobHasAlreadyBeenSubmittedError'))
+        throw error;
+    });
+    return true;
+  }
+
+  async #getJobsForDecision(
+    opts: Pick<
+      SubmitDecisionInput,
+      'orgId' | 'queueId' | 'jobId' | 'isAppealsQueue'
+    >,
+  ) {
+    const query = opts.isAppealsQueue
+      ? this.queueOps.getAppealJobs.bind(this.queueOps)
+      : this.queueOps.getJobs.bind(this.queueOps);
+    return query({
+      orgId: opts.orgId,
+      queueId: opts.queueId,
+      jobIds: [opts.jobId],
+    });
+  }
 
   async submitDecision(opts: SubmitDecisionInput) {
     const {
@@ -155,12 +294,12 @@ export default class JobDecisioning {
       decisionReason,
       automaticCloseDecision,
     } = opts;
+    const suppressUserReportSweep =
+      opts.automaticCloseDecision === undefined
+        ? opts.suppressUserReportSweep
+        : undefined;
 
-    const [job] = await this.queueOps.getJobs({
-      orgId,
-      queueId,
-      jobIds: [jobId],
-    });
+    const [job] = await this.#getJobsForDecision(opts);
 
     // If job id is not found in the queue, assume it was already acted on.
     // It could also have never existed, and we could actually check to see
@@ -175,26 +314,163 @@ export default class JobDecisioning {
       });
     }
     const decisions = decisionComponents ?? [automaticCloseDecision];
+    let roomDeliveryRequired = false;
 
     // If the decision included some actionIds or policyIds, we want to verify
     // that those ids actually correspond to known actions/policies in the org
     // (for security) before we save the data to the db. We accept that there
     // could be some legit policies/actions that are very rarely not found
     // (from eventually consistent pg lookup) as a reasonable tradeoff.
-    if (decisions.some((decision) => decision.type === 'CUSTOM_ACTION')) {
-      const allActionIds = decisions.flatMap((decision) =>
+    const customActionDecisions = decisions.flatMap((decision) =>
+      decision.type === 'CUSTOM_ACTION' ? [decision] : [],
+    );
+    if (
+      customActionDecisions.length > 0 ||
+      relatedActions.some((related) => related.actionIds.length > 0)
+    ) {
+      const primaryActionIds = decisions.flatMap((decision) =>
         decision.type === 'CUSTOM_ACTION'
           ? decision.actions.map((action) => action.id)
           : [],
       );
+      const allActionIds = [
+        ...new Set([
+          ...primaryActionIds,
+          ...relatedActions.flatMap((related) => related.actionIds),
+        ]),
+      ];
       const validActions = await this.getCustomActionsByIds({
         ids: allActionIds,
         orgId,
       });
+      roomDeliveryRequired = validActions.some((action) =>
+        action.name.startsWith('concord_'),
+      );
+      if (
+        roomDeliveryRequired &&
+        (validActions.length !== allActionIds.length ||
+          validActions.some((action) => !action.name.startsWith('concord_')) ||
+          decisions.some(
+            (decision) =>
+              decision.type !== 'CUSTOM_ACTION' && decision.type !== 'IGNORE',
+          ))
+      )
+        throw new Error(
+          'Submit room enforcement separately from other actions',
+        );
+      if (roomDeliveryRequired) {
+        if (!reviewerId || !this.getRoomActor)
+          throw new Error('Room staff verification required');
+        const actor = await this.getRoomActor(reviewerId, orgId);
+        for (const decision of decisions) {
+          if (decision.type !== 'CUSTOM_ACTION') continue;
+          for (const action of decision.actions) {
+            const configured = validActions.find(
+              (candidate) => candidate.id === action.id,
+            )!;
+            const parameters =
+              decision.actionIdsToMrtApiParamDecisionPayload?.[action.id];
+            validateRoomActionPermission(
+              actor,
+              configured.name,
+              parameters === undefined ? {} : object(parameters),
+            );
+          }
+        }
+        for (const related of relatedActions) {
+          // Reject unavailable targets before recording immutable room intent.
+          if (related.actionIds.length > 0) {
+            assertRoomRelatedItemTypeAvailable(
+              await this.moderationConfigService.getItemType({
+                orgId,
+                itemTypeSelector: { id: related.itemTypeId },
+              }),
+            );
+          }
+          for (const id of related.actionIds) {
+            const parameters =
+              related.actionIdsToMrtApiParamDecisionPayload?.[id];
+            validateRoomActionPermission(
+              actor,
+              validActions.find((action) => action.id === id)!.name,
+              parameters === undefined ? {} : object(parameters),
+            );
+          }
+        }
+      }
       // We only throw if there aren't any valid actions.
-      if (validActions.length === 0) {
+      if (
+        decisions.some((decision) => decision.type === 'CUSTOM_ACTION') &&
+        !validActions.some((action) => primaryActionIds.includes(action.id))
+      ) {
         throw makeSubmittedJobActionNotFoundError({ shouldErrorSpan: true });
       }
+
+      // Enforce `requires_policy_for_decisions` server-side. The MRT UI already
+      // disables submit when this is on, but API/script callers can bypass that.
+      // Only check the flag when there's actually a policy-less decision to
+      // enforce against, so the common path avoids the extra DB hit. The check
+      // only fires for CUSTOM_ACTION decisions, so it applies even on NCMEC
+      // jobs that mix in a CUSTOM_ACTION (e.g. issuing a strike alongside an
+      // NCMEC ignore or report).
+      const hasEmptyPolicyCustomAction = customActionDecisions.some(
+        (decision) => decision.policies.length === 0,
+      );
+      if (hasEmptyPolicyCustomAction) {
+        const requiresPolicy =
+          await this.manualReviewToolSettings.getRequiresPolicyForDecisions(
+            orgId,
+          );
+        if (requiresPolicy) {
+          throw makeMissingRequiredPolicyForDecisionError({
+            shouldErrorSpan: true,
+          });
+        }
+      }
+    }
+
+    // Enforce the "require decision reason" settings server-side. The MRT UI
+    // already disables submit when these are on, but API/script callers can
+    // bypass that. Skip the AUTOMATIC_CLOSE path (no moderator, no reason to
+    // require) and only read a flag when there's actually a missing reason to
+    // enforce against, so the common path does no extra DB work. Matches the
+    // client gate at ManualReviewJobReview.tsx, which uses isNonEmptyString.
+    //
+    // The requirement is split in two (see #757): ignoring a job means "no
+    // violation / no action" and is governed by its own flag, separate from
+    // the flag for violating (non-ignore) decisions. A decision composed
+    // solely of IGNORE components is an ignore; anything else (custom actions,
+    // appeals, etc.) is a violating decision.
+    //
+    // Bypass the check entirely when the decision is NCMEC-native (Submit NCMEC
+    // Report or Ignore on an NCMEC job, no CUSTOM_ACTION mixed in): those
+    // decisions don't carry a written reason and the flags are irrelevant for
+    // them. A CUSTOM_ACTION on an NCMEC job still requires a reason. See #736.
+    const isNcmecNativeDecision =
+      job.payload.kind === 'NCMEC' && customActionDecisions.length === 0;
+    const isIgnoreDecision =
+      decisions.length > 0 &&
+      decisions.every((decision) => decision.type === 'IGNORE');
+    if (
+      decisionComponents != null &&
+      !isNonEmptyString(decisionReason) &&
+      !isNcmecNativeDecision
+    ) {
+      const requiresReason = isIgnoreDecision
+        ? await this.manualReviewToolSettings.getRequiresDecisionReasonOnIgnore(
+            orgId,
+          )
+        : await this.manualReviewToolSettings.getRequiresDecisionReason(orgId);
+      if (requiresReason) {
+        throw makeMissingRequiredDecisionReasonError({
+          detail: 'This org requires a decision reason for this decision',
+          shouldErrorSpan: true,
+        });
+      }
+    }
+
+    if (roomDeliveryRequired && !validRoomReason(decisionReason)) {
+      throw new Error('Room actions require a reason of 1 to 2048 characters');
     }
 
     const removeJob = async () =>
@@ -216,6 +492,8 @@ export default class JobDecisioning {
         relatedActions,
         enqueueSourceInfo: job.enqueueSourceInfo,
         decisionReason,
+        roomDeliveryRequired,
+        isAppealsQueue: opts.isAppealsQueue,
       });
 
     // When a job decision is submitted, we want to record the decision (in pg)
@@ -230,28 +508,9 @@ export default class JobDecisioning {
     //
     // 1. logDecision() succeeds; then, removeJob() succeeds. All good.
     //
-    // 2. logDecision() succeeds; then, removeJob() fails. This is the
-    //    trickiest case. The job is still in the queue and could be dequeued
-    //    again, but the decision's already logged. I _think_ the only way to
-    //    perfectly-reliably handle/avoid this case would be to use a "pending
-    //    decisions" table, plus a background worker that eventually moves
-    //    "pending decisions" to "applied decisions" if the corresponding job
-    //    has been removed from redis. While that seems like it could be made
-    //    bulletproof(?), it's way too involved. (Note: the server moving
-    //    "pending" decisions to "applied" after deleting the job from redis
-    //    wouldn't be totally reliable, as it could crash between those steps.)
-    //
-    //    So, instead, we throw a generic "decision couldn't be logged" error;
-    //    this reflects that the job is still in the queue, and the client
-    //    should retry submitting the decision. When they do, they'll get a
-    //    "decision already submitted" error (see below), which they can ignore.
-    //    This is a bit weird from the client's POV -- it allows a sequence of
-    //    events in which the decision appears to have failed to save, but then
-    //    shows up as having already been saved, even if no one else acted on
-    //    the job in the meantime. Nevertheless, it works well enough (and this
-    //    sort of logical anomaly is one clients should expect anyway, as it
-    //    could also happen if a concurrent user acted on the job after the
-    //    client's lock expired).
+    // 2. logDecision() succeeds; then, removeJob() fails. Report that the
+    //    decision is recorded but cleanup is incomplete. The client can retry
+    //    the original decision; PostgreSQL and Redis are not one transaction.
     //
     // 3. logDecision() fails because the decision's already been logged; then,
     //    removeJob() succeeds. If we're in this case, it means that
@@ -262,13 +521,12 @@ export default class JobDecisioning {
     // 4. logDecision() fails because the decision's already been logged; then,
     //    removeJob() fails. Again, this must mean that we were in case 2
     //    and retried. But, because `removeJob()` failed, we can throw the
-    //    same "decision couldn't be logged" error from case 2 again.
+    //    same recorded-but-cleanup-incomplete error from case 2 again.
     //
     // 5. logDecision() fails for another reason (e.g., pg down), so
     //    removeJob() is not called. This is a simple path, because at
     //    least redis and pg are still in agreement that the job is incomplete.
-    //    So we just throw the same "decision couldn't be logged" error from
-    //    case 2, so the client will retry.
+    //    Report that recording failed, so the client can retry.
     //
     // The code below attempts to log the job decision, remove the job from
     // redis, handle all the error cases above, and return whether a new
@@ -295,6 +553,99 @@ export default class JobDecisioning {
         };
       }
 
+      let roomIntent =
+        automaticCloseDecision === undefined
+          ? {
+              decisionComponents,
+              relatedActions,
+              job,
+              queueId,
+              reviewerId,
+              reviewerEmail,
+              decisionReason,
+            }
+          : undefined;
+      if (logDecisionStatus === 'ALREADY_LOGGED') {
+        const prior = await this.pgQuery
+          .selectFrom('manual_review_tool.manual_review_decisions')
+          .where('id', '=', jobIdToGuid(jobId))
+          .where('org_id', '=', orgId)
+          .selectAll()
+          .executeTakeFirst();
+        if (!prior) throw new Error('Recorded decision unavailable');
+        // New room records retain their delivery classification independently of
+        // mutable action configuration. Legacy room records use their item type;
+        // ordinary queues must not depend on retaining deleted action rows.
+        const wasRoomJob =
+          prior.job_payload.roomDeliveryRequired === true ||
+          ['concord_message', 'concord_member'].includes(
+            (
+              await this.moderationConfigService.getItemType({
+                orgId,
+                itemTypeSelector: job.payload.item.itemTypeIdentifier,
+              })
+            )?.name ?? '',
+          );
+        if (roomDeliveryRequired || wasRoomJob) {
+          const ids = [
+            ...new Set([
+              ...prior.decision_components.flatMap((part) =>
+                part.type === 'CUSTOM_ACTION'
+                  ? part.actions.map((action) => action.id)
+                  : [],
+              ),
+              ...prior.related_actions.flatMap((related) => related.actionIds),
+            ]),
+          ];
+          const originalActions = ids.length
+            ? await this.getCustomActionsByIds({ orgId, ids })
+            : [];
+          if (originalActions.length !== ids.length)
+            throw new Error('Recorded action configuration unavailable');
+          const wasRoomDecision = originalActions.some((action) =>
+            action.name.startsWith('concord_'),
+          );
+          if (
+            roomDeliveryRequired ||
+            wasRoomDecision ||
+            prior.job_payload.roomDeliveryRequired === true
+          ) {
+            if (
+              !wasRoomDecision ||
+              !prior.reviewer_id ||
+              prior.queue_id !== queueId ||
+              !samePersistedJson(prior.decision_components, decisions) ||
+              !samePersistedJson(prior.related_actions, relatedActions) ||
+              (prior.decision_reason ?? undefined) !== decisionReason
+            ) {
+              throw new Error(
+                'Room decision already recorded with a different intent',
+              );
+            }
+            roomDeliveryRequired = true;
+            roomIntent = {
+              decisionComponents: prior.decision_components,
+              relatedActions: prior.related_actions,
+              job,
+              queueId: prior.queue_id,
+              reviewerId: prior.reviewer_id,
+              // Room publication resolves the original actor from current server-side
+              // staff records. Never attribute this retry to the new session's email.
+              reviewerEmail: '',
+              decisionReason: prior.decision_reason ?? undefined,
+            };
+          }
+        }
+      }
+
+      // Keep room jobs reviewable until the enforcement service durably accepts
+      // their immutable decision. A retry uses the same job-derived identity.
+      if (roomDeliveryRequired && roomIntent) {
+        await this.onRecordDecision({
+          ...roomIntent,
+          roomDeliveryRequired: true,
+        });
+      }
       // logDecision() succeeded (now or previously), so call removeJob().
       const [removeJobStatus, removeJobErr] = await removeJob().then(
         () => ['SUCCESS'] as const,
@@ -302,7 +653,7 @@ export default class JobDecisioning {
       );
 
       const decisioningFailedError = makeRecordingJobDecisionFailedError({
-        detail: `The decision for job ${jobId} was not recorded. Please try again.`,
+        detail: `The decision for job ${jobId} was recorded, but queue cleanup did not finish. Retry the original decision.`,
         cause: removeJobErr,
         shouldErrorSpan: true,
       });
@@ -331,7 +682,11 @@ export default class JobDecisioning {
     // so we can skip the onRecordDecisionCall
     // TODO: start sending automatic close decisions when we are sending the
     // report decision callbacks
-    if (newDecisionStored && automaticCloseDecision === undefined) {
+    if (
+      newDecisionStored &&
+      automaticCloseDecision === undefined &&
+      !roomDeliveryRequired
+    ) {
       // TODO: use proper publishing to a durable queue and retry
       this.onRecordDecision({
         decisionComponents,
@@ -341,6 +696,7 @@ export default class JobDecisioning {
         reviewerId,
         reviewerEmail,
         decisionReason,
+        suppressUserReportSweep,
       }).catch((error) => {
         this.tracer.addSpan(
           { resource: 'actionPublisher', operation: 'publishAction' },
@@ -364,16 +720,171 @@ export default class JobDecisioning {
     }
   }
 
+  /**
+   * Logs the decision and runs side effects for a job the clear-other-reports
+   * sweep chose to dispose of. This only records the decision (in pg) and runs
+   * side effects; the caller is responsible for removing the job from its queue
+   * *after* this resolves, so the decision is durably recorded first (matching
+   * the invariant in `submitDecision`).
+   *
+   * Returns:
+   *  - `'logged'`: a new decision was recorded by this call.
+   *  - `'already-logged'`: a concurrent decider beat us to it.
+   *  - `'skipped'`: there was nothing to record.
+   */
+  async recordSweptJobDisposition(opts: {
+    orgId: string;
+    queueId: string;
+    job: ManualReviewJob;
+    disposition: ClearReportsDisposition;
+    // Re-targeted at this job's item when the disposition is SAME_ACTION.
+    triggerCustomActions: readonly CustomActionDecisionComponent[];
+    reviewerId: string;
+    reviewerEmail: string;
+    decisionReason?: string;
+  }): Promise<'logged' | 'already-logged' | 'skipped'> {
+    const {
+      orgId,
+      queueId,
+      job,
+      disposition,
+      triggerCustomActions,
+      reviewerId,
+      reviewerEmail,
+      decisionReason,
+    } = opts;
+
+    const itemType = await this.moderationConfigService.getItemType({
+      orgId,
+      itemTypeSelector: job.payload.item.itemTypeIdentifier,
+    });
+    // Room jobs use durable acceptance and audited stop before queue removal.
+    // The ordinary sweep cannot replace that decision or complete its queue job.
+    if (
+      ['concord_message', 'concord_member'].includes(itemType?.name ?? '') ||
+      (await this.#hasRecordedRoomDelivery(orgId, job.id))
+    )
+      return 'skipped';
+
+    const decisionComponents = this.#buildSweptDecisionComponents({
+      disposition,
+      job,
+      triggerCustomActions,
+    });
+    if (decisionComponents.length === 0) {
+      return 'skipped';
+    }
+
+    try {
+      await this.#logDecision({
+        id: jobIdToGuid(job.id),
+        job,
+        queueId,
+        reviewerId,
+        orgId,
+        decisionComponents,
+        relatedActions: [],
+        enqueueSourceInfo: job.enqueueSourceInfo,
+        decisionReason,
+      });
+    } catch (error) {
+      // A concurrent reviewer already decided this job; nothing left to do.
+      if (isDecisionAlreadyLoggedError(error)) {
+        return (await this.#hasRecordedRoomDelivery(orgId, job.id))
+          ? 'skipped'
+          : 'already-logged';
+      }
+      throw error;
+    }
+
+    if (disposition === 'AUTOMATIC_CLOSE') {
+      return 'logged';
+    }
+
+    // Best-effort: the decision is already persisted above, so a failure to
+    // publish actions (e.g. a transient DB/network error) must not prevent the
+    // caller from removing the job from the queue or continuing the sweep.
+    try {
+      await this.onRecordDecision({
+        decisionComponents,
+        relatedActions: [],
+        job,
+        queueId,
+        reviewerId,
+        reviewerEmail,
+        decisionReason,
+        suppressUserReportSweep: true,
+      });
+    } catch (error) {
+      this.tracer.addSpan(
+        { resource: 'mrtService', operation: 'sweptJob.onRecordDecision' },
+        (span) => {
+          span.setAttribute('job.id', job.id);
+          span.setAttribute('org.id', orgId);
+          this.tracer.logSpanFailed(span, error);
+          return null;
+        },
+      );
+    }
+    return 'logged';
+  }
+
+  async #hasRecordedRoomDelivery(
+    orgId: string,
+    jobId: JobId,
+  ): Promise<boolean> {
+    const prior = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .where('org_id', '=', orgId)
+      .where('id', '=', jobIdToGuid(jobId))
+      .select('job_payload')
+      .executeTakeFirst();
+    return prior?.job_payload.roomDeliveryRequired === true;
+  }
+
+  #buildSweptDecisionComponents(opts: {
+    disposition: ClearReportsDisposition;
+    job: ManualReviewJob;
+    triggerCustomActions: readonly CustomActionDecisionComponent[];
+  }): ManualReviewDecisionComponent[] {
+    const { disposition, job, triggerCustomActions } = opts;
+    switch (disposition) {
+      case 'AUTOMATIC_CLOSE':
+        return [{ type: 'AUTOMATIC_CLOSE', reason: 'USER_ACTIONED' }];
+      case 'IGNORE':
+        return [{ type: 'IGNORE' }];
+      case 'SAME_ACTION': {
+        // Re-target the moderator's custom action(s) at this job's own item.
+        const { item } = job.payload;
+        return triggerCustomActions.map((component) => ({
+          type: 'CUSTOM_ACTION',
+          actions: component.actions,
+          policies: component.policies,
+          itemIds: [item.itemId],
+          itemTypeId: item.itemTypeIdentifier.id,
+          actionIdsToMrtApiParamDecisionPayload:
+            component.actionIdsToMrtApiParamDecisionPayload,
+        }));
+      }
+      default:
+        return assertUnreachable(disposition);
+    }
+  }
+
   async #logDecision(opts: {
     id: string;
-    job: ManualReviewJob;
+    job: ManualReviewJob | ManualReviewAppealJob;
     queueId: string;
     reviewerId?: string;
     orgId: string;
     decisionComponents: ManualReviewDecisionComponent[];
     relatedActions: ManualReviewDecisionRelatedAction[];
-    enqueueSourceInfo?: ManualReviewJobEnqueueSourceInfo;
+    enqueueSourceInfo?:
+      | ManualReviewJobEnqueueSourceInfo
+      | AppealEnqueueSourceInfo;
     decisionReason?: string;
+    roomDeliveryRequired?: boolean;
+    isAppealsQueue?: boolean;
   }) {
     const {
       id,
@@ -385,6 +896,7 @@ export default class JobDecisioning {
       relatedActions,
       enqueueSourceInfo,
       decisionReason,
+      roomDeliveryRequired,
     } = opts;
 
     const itemType = await this.moderationConfigService.getItemType({
@@ -404,21 +916,70 @@ export default class JobDecisioning {
       ? new Date(itemCreatedAtField)
       : null;
 
-    return this.pgQuery
-      .insertInto('manual_review_tool.manual_review_decisions')
-      .values({
-        id,
-        job_payload: job,
-        queue_id: queueId,
-        reviewer_id: reviewerId,
-        org_id: orgId,
-        decision_components: decisionComponents,
-        related_actions: relatedActions,
-        enqueue_source_info: enqueueSourceInfo,
-        item_created_at: itemCreatedAt,
-        decision_reason: decisionReason,
-      })
-      .execute();
+    const values = {
+      id,
+      job_payload: roomDeliveryRequired
+        ? { ...job, roomDeliveryRequired: true as const }
+        : job,
+      queue_id: queueId,
+      reviewer_id: reviewerId ?? AUTOMATED_DECISION_REVIEWER_ID,
+      org_id: orgId,
+      decision_components: decisionComponents,
+      related_actions: relatedActions,
+      enqueue_source_info: enqueueSourceInfo,
+      item_created_at: itemCreatedAt,
+      decision_reason: decisionReason,
+    };
+    if (!roomDeliveryRequired)
+      return this.pgQuery
+        .insertInto('manual_review_tool.manual_review_decisions')
+        .values(values)
+        .execute();
+    if (this.prepareRoomIntents) {
+      const prior = await this.pgQuery
+        .selectFrom('manual_review_tool.manual_review_decisions')
+        .select('id')
+        .where('org_id', '=', orgId)
+        .where('id', '=', id)
+        .executeTakeFirst();
+      if (prior)
+        throw new Error(
+          'duplicate key value violates unique constraint "manual_review_decisions_pkey"',
+        );
+    }
+    // Reject ambiguous new arrays before recording immutable intent. Previously
+    // recorded arrays retain their exact bytes and recover by execution identity.
+    assertUniqueRoomDecisionTargets(
+      job.payload.item,
+      decisionComponents,
+      relatedActions,
+    );
+    const intents = this.prepareRoomIntents
+      ? await this.prepareRoomIntents({
+          job,
+          queueId,
+          reviewerId: reviewerId!,
+          reviewerEmail: '',
+          decisionComponents,
+          relatedActions,
+          decisionReason,
+          roomDeliveryRequired: true,
+        })
+      : [];
+    return this.queueOps.withRoomDecisionRegistration(
+      { orgId, queueId, jobId: job.id, isAppealsQueue: opts.isAppealsQueue },
+      async (tx) => {
+        await tx
+          .insertInto('manual_review_tool.manual_review_decisions')
+          .values(values)
+          .execute();
+        await registerMemberIntents(
+          tx as unknown as Kysely<MemberIntentPg>,
+          intents,
+          id,
+        );
+      },
+    );
   }
 
   async getNcmecDecisions(opts: { startDate: Date; endDate: Date }) {
@@ -469,13 +1030,109 @@ export default class JobDecisioning {
     );
   }
 
+  async getNcmecDecisionsForOrg(opts: { orgId: string; limit?: number }) {
+    const { orgId } = opts;
+    // Clamp `limit` so callers can't request an unreasonable number of rows;
+    // default of 500 matches the previous behavior. Non-numeric values fall
+    // back to the default via Number.isFinite.
+    const requestedLimit = opts.limit ?? 500;
+    const safeLimit =
+      Number.isFinite(requestedLimit) && requestedLimit > 0
+        ? Math.min(Math.floor(requestedLimit), 500)
+        : 500;
+    const allNcmecDecisions = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .where('org_id', '=', orgId)
+      .where(({ eb, selectFrom }) => {
+        return eb.exists(
+          selectFrom(
+            sql`unnest(manual_review_tool.manual_review_decisions.decision_components)`.as(
+              'decision_component',
+            ),
+          )
+            .selectAll()
+            .where(
+              sql<string>`decision_component->>'type'`,
+              '=',
+              'SUBMIT_NCMEC_REPORT',
+            ),
+        );
+      })
+      .select([
+        'org_id',
+        'decision_components',
+        'job_payload',
+        'id',
+        'queue_id',
+        'reviewer_id',
+        'created_at',
+      ])
+      .orderBy('created_at', 'desc')
+      .limit(safeLimit)
+      .execute();
+    return filterNullOrUndefined(
+      allNcmecDecisions.map((it) => {
+        if (
+          'policyIds' in it.job_payload &&
+          'submissionId' in it.job_payload.payload.item
+        ) {
+          return { ...it, job_payload: it.job_payload };
+        }
+        return undefined;
+      }),
+    );
+  }
+
+  /** Single-decision lookup gated on the caller's org. Returns `undefined` if
+   * the decision doesn't exist or belongs to a different org (callers should
+   * treat both cases as "not found" — never confirm cross-org existence). */
+  async getNcmecDecisionByIdForOrg(opts: {
+    orgId: string;
+    decisionId: string;
+  }) {
+    const { orgId, decisionId } = opts;
+    const row = await this.pgQuery
+      .selectFrom('manual_review_tool.manual_review_decisions')
+      .where('id', '=', decisionId)
+      .where('org_id', '=', orgId)
+      .select([
+        'org_id',
+        'decision_components',
+        'job_payload',
+        'id',
+        'queue_id',
+        'reviewer_id',
+        'created_at',
+      ])
+      .executeTakeFirst();
+    if (!row) {
+      return undefined;
+    }
+    // Only return decisions that actually contain a SUBMIT_NCMEC_REPORT
+    // component so callers get the same `not_found` shape for both
+    // "wrong-org" and "wrong-decision-type" lookups.
+    const hasNcmecComponent = row.decision_components.some(
+      (component) => component.type === 'SUBMIT_NCMEC_REPORT',
+    );
+    if (!hasNcmecComponent) {
+      return undefined;
+    }
+    if (
+      !('policyIds' in row.job_payload) ||
+      !('submissionId' in row.job_payload.payload.item)
+    ) {
+      return undefined;
+    }
+    return { ...row, job_payload: row.job_payload };
+  }
+
   async getIgnoreCallbackForOrg(orgId: string): Promise<string | undefined> {
     const settings = await this.pgQuery
       .selectFrom('manual_review_tool.manual_review_tool_settings')
       .where('org_id', '=', orgId)
       .select('ignore_callback_url as ignoreCallback')
       .executeTakeFirst();
-    return settings?.ignoreCallback;
+    return settings?.ignoreCallback ?? undefined;
   }
 }
 
@@ -496,7 +1153,9 @@ export type SubmitDecisionErrorType =
   | 'JobHasAlreadyBeenSubmittedError'
   | 'SubmittedJobActionNotFoundError'
   | 'NoJobWithIdInQueueError'
-  | 'RecordingJobDecisionFailedError';
+  | 'RecordingJobDecisionFailedError'
+  | 'MissingRequiredDecisionReasonError'
+  | 'MissingRequiredPolicyForDecisionError';
 
 export const makeJobHasAlreadyBeenSubmittedError = (data: ErrorInstanceData) =>
   new CoopError({
@@ -531,5 +1190,29 @@ export const makeNoJobWithIdInQueueError = (data: ErrorInstanceData) =>
     type: [ErrorType.NotFound],
     title: String(data.detail),
     name: 'NoJobWithIdInQueueError',
+    ...data,
+  });
+
+export const makeMissingRequiredDecisionReasonError = (
+  data: ErrorInstanceData,
+) =>
+  new CoopError({
+    status: 400,
+    type: [ErrorType.InvalidUserInput],
+    title:
+      'This org requires every decision to include a reason. Add a reason and resubmit.',
+    name: 'MissingRequiredDecisionReasonError',
+    ...data,
+  });
+
+export const makeMissingRequiredPolicyForDecisionError = (
+  data: ErrorInstanceData,
+) =>
+  new CoopError({
+    status: 400,
+    type: [ErrorType.InvalidUserInput],
+    title:
+      'This org requires every decision to include at least one policy. Pick a policy and resubmit.',
+    name: 'MissingRequiredPolicyForDecisionError',
     ...data,
   });

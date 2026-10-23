@@ -4,7 +4,7 @@ import { CogFilled, ExitFilled, UserAlt3Filled } from '@/icons';
 import AngleDoubleLeft from '@/icons/lni/Direction/angle-double-left.svg?react';
 import AngleDoubleRight from '@/icons/lni/Direction/angle-double-right.svg?react';
 import { cn } from '@/lib/utils';
-import { makeEnumLike } from '@roostorg/types';
+import { makeEnumLike } from '@roostorg/coop-types';
 import React, {
   ReactElement,
   useEffect,
@@ -34,6 +34,7 @@ const MenuItemNames = makeEnumLike([
   'NCMEC Reports',
   'Policies',
   'Matching Banks',
+  'User Strikes',
   'Log Out',
   'Account',
   'Settings',
@@ -98,19 +99,34 @@ export default function Sidebar(props: SidebarProps) {
         return;
       }
       if (item.subItems) {
-        items = item.subItems;
+        if (i === pathParts.length - 1) {
+          setSelectedMenuItem(item.title);
+        } else {
+          items = item.subItems;
+        }
       } else {
         setSelectedMenuItem(item.title);
       }
     }
   }, [menuItems, pathname, settingsMenuItems, setSelectedMenuItem]);
 
+  const accessibleSettingsSubItems = useMemo(
+    () =>
+      settingsMenuItems[0]?.subItems?.filter((item) =>
+        item.requiredPermissions.every(
+          (perm) => permissions?.includes(perm) ?? false,
+        ),
+      ) ?? [],
+    [settingsMenuItems, permissions],
+  );
+
   const isSettingsSelected = useMemo(
     () =>
-      settingsMenuItems[0]?.subItems?.some(
+      selectedMenuItem === 'Settings' ||
+      accessibleSettingsSubItems.some(
         (item) => item.title === selectedMenuItem,
-      ) ?? false,
-    [selectedMenuItem, settingsMenuItems],
+      ),
+    [selectedMenuItem, accessibleSettingsSubItems],
   );
 
   const isDescendant = (
@@ -230,7 +246,14 @@ export default function Sidebar(props: SidebarProps) {
     );
   };
 
-  const isSettingsMenuVisible = isSettingsSelected && !collapsed;
+  const [isSettingsMenuExpanded, setIsSettingsMenuExpanded] =
+    useState(isSettingsSelected);
+  useEffect(() => {
+    if (isSettingsSelected) {
+      setIsSettingsMenuExpanded(true);
+    }
+  }, [isSettingsSelected]);
+  const isSettingsMenuVisible = isSettingsMenuExpanded && !collapsed;
 
   const settingsMenu = (
     <div
@@ -247,7 +270,7 @@ export default function Sidebar(props: SidebarProps) {
       }}
     >
       <div className="flex flex-col gap-[4px] m-[16px]">
-        {settingsMenuItems[0]?.subItems?.map((item) => (
+        {accessibleSettingsSubItems.map((item) => (
           <Link
             key={item.title}
             to={`settings/${item.urlPath}`}
@@ -323,12 +346,35 @@ export default function Sidebar(props: SidebarProps) {
               menuItemName: 'Log Out' as const,
               onClick: async () => logout(),
             })}
-          {!(collapsed && selectedMenuItem === 'Account') &&
-            footerButton({
-              icon: CogFilled,
-              menuItemName: 'Settings' as const,
-              url: '/dashboard/settings',
-            })}
+          {accessibleSettingsSubItems.length > 0 &&
+            !(collapsed && selectedMenuItem === 'Account') && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setIsSettingsMenuExpanded((prev) => !prev)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setIsSettingsMenuExpanded((prev) => !prev);
+                      }
+                    }}
+                    className={`flex cursor-pointer w-min h-min p-[8px] rounded border-none ${
+                      isSettingsSelected
+                        ? 'text-primary hover:text-primary bg-indigo-50 hover:bg-indigo-50'
+                        : 'text-black hover:text-black/70 bg-transparent hover:bg-gray-100'
+                    }`}
+                  >
+                    <CogFilled
+                      style={{ width: '16px', height: '16px' }}
+                      className="fill-black"
+                    />
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="top">Settings</TooltipContent>
+              </Tooltip>
+            )}
           {!(collapsed && selectedMenuItem !== 'Account') &&
             footerButton({
               icon: UserAlt3Filled,

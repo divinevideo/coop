@@ -1,6 +1,7 @@
+import { isTypingInEditableElement } from '@/utils/misc';
 import { BulbOutlined, ExclamationCircleOutlined } from '@ant-design/icons';
 import { gql } from '@apollo/client';
-import { ItemIdentifier, TaggedScalar } from '@roostorg/types';
+import { ItemIdentifier, MediaKind, TaggedScalar } from '@roostorg/coop-types';
 import { Button } from 'antd';
 import pick from 'lodash/pick';
 import uniqBy from 'lodash/uniqBy';
@@ -20,12 +21,15 @@ import {
   GQLNcmecFileAnnotation,
   GQLNcmecIncidentType,
   GQLNcmecIndustryClassification,
+  GQLNcmecMediaReviewRequirement,
   GQLNcmecThreadInput,
   GQLThreadItem,
   useGQLGetMoreInfoForThreadItemsQuery,
+  useGQLNcmecMediaReviewPolicyQuery,
   useGQLPersonalSafetySettingsQuery,
 } from '../../../../../../graphql/generated';
 import { filterNullOrUndefined } from '../../../../../../utils/collections';
+import { inferMediaKindFromUrl } from '../../../../../../utils/contentUrlUtils';
 import {
   getFieldValueForRole,
   getFieldValueOrValues,
@@ -67,6 +71,15 @@ type NCMECJobPayloadQueryResult = Extract<
 
 export type NCMECMediaQueryResult =
   NCMECJobPayloadQueryResult['allMediaItems'][0];
+
+gql`
+  query NcmecMediaReviewPolicy {
+    myOrg {
+      ncmecMediaReviewRequirement
+      ncmecMinMediaToReview
+    }
+  }
+`;
 
 gql`
   query getMoreInfoForThreadItems($ids: [ItemIdentifierInput!]!) {
@@ -113,6 +126,25 @@ gql`
   }
 `;
 
+// NCMEC covers images and videos only. For the MEDIA scalar the kind isn't
+// implied by the field type, so use the resolved `mediaType` (or infer from URL).
+function toNcmecUrlInfo(tagged: {
+  type: string;
+  value: { url?: string; mediaType?: MediaKind | null };
+}): NCMECUrlInfo | undefined {
+  const url = tagged.value?.url;
+  if (!url) {
+    return undefined;
+  }
+  const kind =
+    tagged.type === 'IMAGE' || tagged.type === 'VIDEO'
+      ? tagged.type
+      : (tagged.value?.mediaType ?? inferMediaKindFromUrl(url));
+  return kind === 'IMAGE' || kind === 'VIDEO'
+    ? { url, mediaType: kind }
+    : undefined;
+}
+
 function getUrlsFromItem(
   item: NCMECMediaQueryResult['contentItem'],
 ): NCMECUrlInfo[] {
@@ -120,24 +152,23 @@ function getUrlsFromItem(
     (it) =>
       it.type === 'IMAGE' ||
       it.type === 'VIDEO' ||
+      it.type === 'MEDIA' ||
       it.container?.valueScalarType === 'IMAGE' ||
-      it.container?.valueScalarType === 'VIDEO',
+      it.container?.valueScalarType === 'VIDEO' ||
+      it.container?.valueScalarType === 'MEDIA',
   );
   return filterNullOrUndefined(
     mediaFields
       .map((field) => {
         const valueOrValues = getFieldValueOrValues(item.data, field) as
-          | TaggedScalar<'IMAGE' | 'VIDEO'>
-          | TaggedScalar<'IMAGE' | 'VIDEO'>[];
+          | TaggedScalar<'IMAGE' | 'VIDEO' | 'MEDIA'>
+          | TaggedScalar<'IMAGE' | 'VIDEO' | 'MEDIA'>[];
         if (valueOrValues === undefined) {
           return undefined;
         }
-        return Array.isArray(valueOrValues)
-          ? valueOrValues.map((it) => ({
-            url: it.value.url,
-            mediaType: it.type,
-          }))
-          : { url: valueOrValues.value.url, mediaType: valueOrValues.type };
+        return (
+          Array.isArray(valueOrValues) ? valueOrValues : [valueOrValues]
+        ).map(toNcmecUrlInfo);
       })
       .flat(),
   );
@@ -152,8 +183,10 @@ export function getMatchedBanksForMediaUrl(
     (it) =>
       it.type === 'IMAGE' ||
       it.type === 'VIDEO' ||
+      it.type === 'MEDIA' ||
       it.container?.valueScalarType === 'IMAGE' ||
-      it.container?.valueScalarType === 'VIDEO',
+      it.container?.valueScalarType === 'VIDEO' ||
+      it.container?.valueScalarType === 'MEDIA',
   );
   for (const field of mediaFields) {
     const valueOrValues = getFieldValueOrValues(item.data, field) as
@@ -161,7 +194,9 @@ export function getMatchedBanksForMediaUrl(
       | { value: { url?: string; matchedBanks?: string[] }; type: string }[]
       | undefined;
     if (valueOrValues === undefined) continue;
-    const values = Array.isArray(valueOrValues) ? valueOrValues : [valueOrValues];
+    const values = Array.isArray(valueOrValues)
+      ? valueOrValues
+      : [valueOrValues];
     for (const tagged of values) {
       const v = tagged.value;
       if (v?.url === mediaUrl) {
@@ -203,7 +238,7 @@ export default function NCMECReviewUser(
     payload: NCMECJobPayloadQueryResult;
     showMessages?: boolean;
   } & (
-      | {
+    | {
         isActionable: false;
         ncmecDecisions?: readonly {
           readonly id: string;
@@ -213,13 +248,13 @@ export default function NCMECReviewUser(
           readonly industryClassification: GQLNcmecIndustryClassification;
         }[];
       }
-      | {
+    | {
         isActionable: true;
         submitDecision: (input: GQLDecisionSubmission) => Promise<void>;
         skipToNextJob: () => Promise<void>;
         ncmecDecisions: undefined;
       }
-    ),
+  ),
 ) {
   const { orgId, payload, isActionable, ncmecDecisions, showMessages } = props;
   const { item, allMediaItems } = payload;
@@ -267,9 +302,9 @@ export default function NCMECReviewUser(
                   : undefined;
               return threadId
                 ? {
-                  id: threadId.id,
-                  typeId: threadId.typeId,
-                }
+                    id: threadId.id,
+                    typeId: threadId.typeId,
+                  }
                 : undefined;
             }),
           ),
@@ -285,10 +320,10 @@ export default function NCMECReviewUser(
   >(
     allMediaItemsWithUrls.length > 0
       ? {
-        itemId: allMediaItemsWithUrls[0].contentItem.id,
-        urlInfo: allMediaItemsWithUrls[0].urlInfo,
-        itemTypeId: allMediaItemsWithUrls[0].contentItem.type.id,
-      }
+          itemId: allMediaItemsWithUrls[0].contentItem.id,
+          urlInfo: allMediaItemsWithUrls[0].urlInfo,
+          itemTypeId: allMediaItemsWithUrls[0].contentItem.type.id,
+        }
       : undefined,
   );
   // Selected Media = media that has been selected to be included in the
@@ -296,28 +331,33 @@ export default function NCMECReviewUser(
   const [selectedMedia, setSelectedMedia] = useState<NCMECMediaState[]>(
     ncmecDecisions
       ? allMediaItemsWithUrls.map((media) => {
-        const decision = ncmecDecisions.find(
-          (decision) =>
-            media.contentItem.id === decision.id &&
-            media.contentItem.type.id === decision.typeId,
-        );
-        if (decision) {
+          // Match on (id, typeId) only — media URLs in this codebase are
+          // signed/ephemeral and don't round-trip byte-identical across
+          // fetches, so adding `url` to the predicate drops every prior
+          // classification. Multi-media-per-item gets the first decision;
+          // fixing that needs a stable per-media identifier (follow-up).
+          const decision = ncmecDecisions.find(
+            (decision) =>
+              media.contentItem.id === decision.id &&
+              media.contentItem.type.id === decision.typeId,
+          );
+          if (decision) {
+            return {
+              itemId: decision.id,
+              itemTypeId: decision.typeId,
+              urlInfo: media.urlInfo,
+              category: decision.industryClassification,
+              labels: [...decision.fileAnnotations],
+            };
+          }
           return {
-            itemId: decision.id,
-            itemTypeId: decision.typeId,
+            itemId: media.contentItem.id,
+            itemTypeId: media.contentItem.type.id,
             urlInfo: media.urlInfo,
-            category: decision.industryClassification,
-            labels: [...decision.fileAnnotations],
+            category: 'None',
+            labels: [],
           };
-        }
-        return {
-          itemId: media.contentItem.id,
-          itemTypeId: media.contentItem.type.id,
-          urlInfo: media.urlInfo,
-          category: 'None',
-          labels: [],
-        };
-      })
+        })
       : [],
   );
   const [selectedThreadsWithMessages, setSelectedThreadsWithMessages] =
@@ -326,6 +366,11 @@ export default function NCMECReviewUser(
     GQLNcmecIncidentType.ChildPornography,
   );
   const [escalateToHighPriority, setEscalateToHighPriority] = useState('');
+  const [escalateChecked, setEscalateChecked] = useState(false);
+  const [additionalInfo, setAdditionalInfo] = useState('');
+  const trimmedEscalate = escalateToHighPriority.trim();
+  const trimmedAdditionalInfo = additionalInfo.trim();
+  const escalateMissingReason = escalateChecked && trimmedEscalate === '';
   const [sendReportModalVisible, setSendReportModalVisible] = useState(false);
   const [deselectAndIgnoreModalVisible, setDeselectAndIgnoreModalVisible] =
     useState(false);
@@ -344,6 +389,12 @@ export default function NCMECReviewUser(
   const navigate = useNavigate();
 
   const { loading, data } = useGQLPersonalSafetySettingsQuery();
+  const { data: mediaReviewPolicyData } = useGQLNcmecMediaReviewPolicyQuery();
+  const mediaReviewRequirement =
+    mediaReviewPolicyData?.myOrg?.ncmecMediaReviewRequirement ??
+    GQLNcmecMediaReviewRequirement.All;
+  const mediaReviewMinToReview =
+    mediaReviewPolicyData?.myOrg?.ncmecMinMediaToReview ?? 1;
   const noValidMedia = (
     <div className="flex items-start justify-center w-full h-full">
       <div className="flex flex-col items-center justify-center p-12 mt-20 shadow rounded-xl bg-slate-50 text-slate-500">
@@ -355,9 +406,11 @@ export default function NCMECReviewUser(
         </div>
         <CopyTextComponent
           value={erroredMedia.map((it) => it.id).join(',')}
-          displayValue={`${erroredMedia.length} video${erroredMedia.length === 1 ? '' : 's'
-            } or image${erroredMedia.length === 1 ? '' : 's'
-            } failed to load. Click here to copy a list of the IDs that failed to load.`}
+          displayValue={`${erroredMedia.length} video${
+            erroredMedia.length === 1 ? '' : 's'
+          } or image${
+            erroredMedia.length === 1 ? '' : 's'
+          } failed to load. Click here to copy a list of the IDs that failed to load.`}
           isError={true}
         />
         {isActionable ? (
@@ -580,22 +633,24 @@ export default function NCMECReviewUser(
           >
             <div className="overflow-hidden shadow-lg rounded-2xl w-fit">
               {!loading &&
-                moderatorSafetyBlurLevel != null &&
-                moderatorSafetyGrayscale != null ? (
+              moderatorSafetyBlurLevel != null &&
+              moderatorSafetyGrayscale != null ? (
                 media.urlInfo.mediaType === 'IMAGE' ? (
                   <img
-                    className={`object-scale-down w-64 h-48 rounded-2xl ${unblurAllMediaInConfirmation
+                    className={`object-scale-down w-64 h-48 rounded-2xl ${
+                      unblurAllMediaInConfirmation
                         ? 'blur-0'
                         : BLUR_LEVELS[moderatorSafetyBlurLevel as BlurStrength]
-                      } ${moderatorSafetyGrayscale ? 'grayscale' : ''}`}
+                    } ${moderatorSafetyGrayscale ? 'grayscale' : ''}`}
                     alt=""
                     src={media.urlInfo.url}
                   />
                 ) : (
                   <ManualReviewJobContentBlurableVideo
                     url={media.urlInfo.url}
-                    className={`object-scale-down w-64 h-48 rounded-2xl ${moderatorSafetyGrayscale ? 'grayscale' : ''
-                      }`}
+                    className={`object-scale-down w-64 h-48 rounded-2xl ${
+                      moderatorSafetyGrayscale ? 'grayscale' : ''
+                    }`}
                     options={{
                       shouldBlur:
                         !unblurAllMediaInConfirmation &&
@@ -634,12 +689,14 @@ export default function NCMECReviewUser(
 
   const sendReportModal = isActionable ? (
     <CoopModal
+      className="!w-[64rem] !max-w-[90vw]"
       visible={sendReportModalVisible}
       onClose={() => setSendReportModalVisible(false)}
       title="Confirm & Send NCMEC Report"
       footer={[
         {
           title: 'Submit Report',
+          disabled: escalateMissingReason,
           onClick: async () => {
             await props.submitDecision({
               submitNcmecReport: {
@@ -658,8 +715,11 @@ export default function NCMECReviewUser(
                   }),
                 reportedMessages: selectedThreadsWithMessages,
                 incidentType,
-                ...(escalateToHighPriority.trim() !== ''
-                  ? { escalateToHighPriority: escalateToHighPriority.trim() }
+                ...(escalateChecked && trimmedEscalate !== ''
+                  ? { escalateToHighPriority: trimmedEscalate }
+                  : {}),
+                ...(trimmedAdditionalInfo !== ''
+                  ? { additionalInfo: trimmedAdditionalInfo }
                   : {}),
               },
             });
@@ -668,31 +728,26 @@ export default function NCMECReviewUser(
         },
       ]}
     >
-      <div className="flex flex-col w-full">
+      <div className="flex flex-col w-full min-w-0">
         <div className="!my-4 divider" />
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4 text-start">
-            <div className="text-base font-bold">Suspect</div>
-            <div className="flex flex-row items-center mr-12">
+        <div className="flex items-start justify-between gap-4 min-w-0">
+          <div className="flex items-start gap-4 text-start min-w-0 flex-1">
+            <div className="text-base font-bold shrink-0 pt-1">Suspect</div>
+            <div className="flex flex-row items-start min-w-0 flex-1">
               {profilePicUrl ? (
                 <img
                   alt="profile pic"
-                  className="w-10 h-10 border-2 border-solid rounded-full border-slate-400"
+                  className="w-10 h-10 border-2 border-solid rounded-full border-slate-400 shrink-0"
                   src={profilePicUrl.url}
                 />
               ) : null}
-              {displayName ? (
-                <div className="ml-3 font-bold truncate text-slate-700">
-                  {displayName} ({item.id})
-                </div>
-              ) : (
-                <div className="ml-3 font-bold truncate text-slate-700">
-                  {item.id}
-                </div>
-              )}
+              <div className="ml-3 font-bold text-slate-700 break-all min-w-0 flex-1">
+                {displayName ? `${displayName} (${item.id})` : item.id}
+              </div>
             </div>
           </div>
           <Button
+            className="shrink-0"
             onClick={() => setUnblurAllMediaInConfirmation((prev) => !prev)}
           >
             {unblurAllMediaInConfirmation ? 'Blur All' : 'Unblur All'}
@@ -701,16 +756,17 @@ export default function NCMECReviewUser(
         <div className="!my-4 divider" />
         <div className="text-base font-bold">Media</div>
         {selectedMediaConfirmationGrid}
-        {selectedThreadsWithMessages.length > 0
-          ? `
-        <div className="!my-4 divider" />
-        <div className="text-base font-bold">Messages</div>
-        ${selectedThreadsWithMessages.map((thread) => (
-            <div key={thread.threadId}>
-              {thread.threadId}: {thread.reportedContent.length} reported
-            </div>
-          ))}
-        ` : undefined}
+        {selectedThreadsWithMessages.length > 0 ? (
+          <>
+            <div className="!my-4 divider" />
+            <div className="text-base font-bold">Messages</div>
+            {selectedThreadsWithMessages.map((thread) => (
+              <div key={thread.threadId}>
+                {thread.threadId}: {thread.reportedContent.length} reported
+              </div>
+            ))}
+          </>
+        ) : null}
 
         <div className="!my-4 divider" />
         <div className="flex flex-col gap-2">
@@ -730,23 +786,67 @@ export default function NCMECReviewUser(
           </select>
         </div>
         <div className="flex flex-col gap-2">
-          <label
-            htmlFor="escalateToHighPriority"
-            className="text-base font-bold"
-          >
-            Escalate as High Priority (optional)
+          <label className="flex items-center gap-2 text-base font-bold">
+            <input
+              type="checkbox"
+              checked={escalateChecked}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setEscalateChecked(next);
+                if (!next) {
+                  setEscalateToHighPriority('');
+                }
+              }}
+            />
+            Escalate as High Priority
+          </label>
+          {escalateChecked ? (
+            <>
+              <label
+                htmlFor="escalateToHighPriority"
+                className="text-sm font-medium"
+              >
+                Reason for escalation (required)
+              </label>
+              <textarea
+                id="escalateToHighPriority"
+                maxLength={3000}
+                value={escalateToHighPriority}
+                onChange={(e) => setEscalateToHighPriority(e.target.value)}
+                placeholder="e.g. immediate risk to child."
+                className="min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                rows={3}
+              />
+              <div className="flex items-center justify-between">
+                {escalateMissingReason ? (
+                  <span className="text-xs text-red-600">
+                    A reason is required when escalating.
+                  </span>
+                ) : (
+                  <span />
+                )}
+                <span className="text-xs text-slate-500">
+                  {escalateToHighPriority.length}/3000 characters
+                </span>
+              </div>
+            </>
+          ) : null}
+        </div>
+        <div className="flex flex-col gap-2">
+          <label htmlFor="ncmecAdditionalInfo" className="text-base font-bold">
+            Additional details (optional)
           </label>
           <textarea
-            id="escalateToHighPriority"
+            id="ncmecAdditionalInfo"
             maxLength={3000}
-            value={escalateToHighPriority}
-            onChange={(e) => setEscalateToHighPriority(e.target.value)}
-            placeholder="e.g. immediate risk to child. Supplying a value will escalate the report."
+            value={additionalInfo}
+            onChange={(e) => setAdditionalInfo(e.target.value)}
+            placeholder="Any other context/notes to be added to the report."
             className="min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
             rows={3}
           />
           <span className="text-xs text-slate-500">
-            {escalateToHighPriority.length}/3000 characters
+            {additionalInfo.length}/3000 characters
           </span>
         </div>
       </div>
@@ -790,6 +890,33 @@ export default function NCMECReviewUser(
     mediaInDetailViewItem?.__typename === 'ContentItem'
       ? getFieldValueForRole(mediaInDetailViewItem, 'threadId')
       : undefined;
+
+  // "None" counts as reviewed but not reported.
+  const reviewedCount = selectedMedia.length;
+  const reportedCount = selectedMedia.filter(
+    (media) => media.category !== 'None',
+  ).length;
+  // Cap the minimum at the job's media count so it's always achievable.
+  const effectiveMinToReview = Math.min(
+    Math.max(mediaReviewMinToReview, 1),
+    allMediaItemsWithUrls.length,
+  );
+  const reviewThresholdMet =
+    mediaReviewRequirement === GQLNcmecMediaReviewRequirement.Minimum
+      ? reviewedCount >= effectiveMinToReview
+      : reviewedCount === allMediaItemsWithUrls.length;
+  // A report can't be empty: require at least one reported item.
+  const canSendReport = reviewThresholdMet && reportedCount > 0;
+  const sendDisabledReason = !reviewThresholdMet
+    ? mediaReviewRequirement === GQLNcmecMediaReviewRequirement.Minimum
+      ? `Please review at least ${effectiveMinToReview} ${
+          effectiveMinToReview === 1 ? 'piece' : 'pieces'
+        } of media before sending a report to NCMEC.`
+      : 'Please make a decision on every piece of media in this job before sending a report to NCMEC.'
+    : reportedCount === 0
+      ? 'Select a category for at least one piece of media to include it in the report before sending to NCMEC.'
+      : '';
+
   return (
     <div
       className="flex flex-col items-start outline-none"
@@ -800,7 +927,8 @@ export default function NCMECReviewUser(
           e.repeat ||
           sendReportModalVisible ||
           deselectAndIgnoreModalVisible ||
-          isLabelSelectorInInspectedMediaVisible
+          isLabelSelectorInInspectedMediaVisible ||
+          isTypingInEditableElement(e.target)
         ) {
           return;
         } else if (moveToQueueMenuVisible) {
@@ -869,9 +997,8 @@ export default function NCMECReviewUser(
                 setDeselectAndIgnoreModalVisible
               }
               isAnyMediaSelected={selectedMedia.length > 0}
-              isAllMediaSelected={
-                selectedMedia.length === allMediaItemsWithUrls.length
-              }
+              canSendReport={canSendReport}
+              sendDisabledReason={sendDisabledReason}
               submitDecision={props.submitDecision}
               moveToQueueMenuVisible={moveToQueueMenuVisible}
               setMoveToQueueMenuVisible={setMoveToQueueMenuVisible}
@@ -968,13 +1095,13 @@ export default function NCMECReviewUser(
             threadId={mediaInDetailViewThread?.id}
             threadInfo={
               threadInfo?.partialItems.__typename ===
-                'PartialItemsSuccessResponse'
+              'PartialItemsSuccessResponse'
                 ? (threadInfo.partialItems.items.find(
-                  (it) =>
-                    it.__typename === 'ThreadItem' &&
-                    it.id === mediaInDetailViewThread?.id &&
-                    it.type.id === mediaInDetailViewThread?.typeId,
-                ) as GQLThreadItem)
+                    (it) =>
+                      it.__typename === 'ThreadItem' &&
+                      it.id === mediaInDetailViewThread?.id &&
+                      it.type.id === mediaInDetailViewThread?.typeId,
+                  ) as GQLThreadItem)
                 : undefined
             }
             threadLoading={threadLoading}
@@ -983,9 +1110,11 @@ export default function NCMECReviewUser(
             <div className="self-start pt-2">
               <CopyTextComponent
                 value={erroredMedia.map((it) => it.id).join(',')}
-                displayValue={`${erroredMedia.length} video${erroredMedia.length === 1 ? '' : 's'
-                  } or image${erroredMedia.length === 1 ? '' : 's'
-                  } failed to load. Click here to copy a list of the IDs that failed to load.`}
+                displayValue={`${erroredMedia.length} video${
+                  erroredMedia.length === 1 ? '' : 's'
+                } or image${
+                  erroredMedia.length === 1 ? '' : 's'
+                } failed to load. Click here to copy a list of the IDs that failed to load.`}
                 isError={true}
               />
             </div>

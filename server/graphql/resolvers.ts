@@ -1,11 +1,11 @@
 import { mergeResolvers } from '@graphql-tools/merge';
 import { type GraphQLFieldResolver } from 'graphql';
-import { type PassportContext } from 'graphql-passport';
 
 import { type GQLServices } from '../api.js';
 import { type DataSources } from '../iocContainer/index.js';
-import { type GraphQLUserParent } from './datasources/userKyselyPersistence.js';
+import { UserPermission } from '../services/userManagementService/index.js';
 import { CoopError, isCoopErrorOfType } from '../utils/errors.js';
+import { type GraphQLUserParent } from './datasources/userKyselyPersistence.js';
 import {
   type GQLInviteUserToken,
   type GQLMutationResolvers,
@@ -18,30 +18,32 @@ import { resolvers as authenticationResolvers } from './modules/authentication.j
 import { resolvers as backtestResolvers } from './modules/backtest.js';
 import { resolvers as contentTypeResolvers } from './modules/contentType.js';
 import { resolvers as genericResolvers } from './modules/generic.js';
+import { resolvers as hashBankResolvers } from './modules/hashBanks/resolvers.js';
 import { resolvers as insightsResolvers } from './modules/insights.js';
 import { resolvers as integrationResolvers } from './modules/integration.js';
 import { resolvers as investigationResolvers } from './modules/investigation.js';
 import { resolvers as itemTypeResolvers } from './modules/itemType.js';
 import { resolvers as locationBankResolvers } from './modules/locationBank.js';
 import { resolvers as manualReviewToolResolvers } from './modules/manualReviewTool.js';
-import { resolvers as hashBankResolvers } from './modules/hashBanks/resolvers.js';
 import { resolvers as ncmecResolvers } from './modules/ncmec.js';
 import { resolvers as orgResolvers } from './modules/org.js';
 import { resolvers as policyResolvers } from './modules/policy.js';
 import { resolvers as reportingResolvers } from './modules/reporting.js';
 import { resolvers as reportingRulesResolvers } from './modules/reportingRule.js';
 import { resolvers as retroactionResolvers } from './modules/retroaction.js';
+import { resolvers as rolesResolvers } from './modules/roles.js';
+import { resolvers as roomActionModule } from './modules/roomAction.js';
 import { resolvers as routingRulesResolvers } from './modules/routingRule.js';
 import { resolvers as ruleResolvers } from './modules/rule.js';
 import { resolvers as signalResolvers } from './modules/signal.js';
 import { resolvers as spotTestResolvers } from './modules/spotTest.js';
 import { resolvers as textBankResolvers } from './modules/textBank.js';
 import { resolvers as userResolvers } from './modules/user.js';
-import { gqlErrorResult, gqlSuccessResult } from './utils/gqlResult.js';
 import { forbiddenError, unauthenticatedError } from './utils/errors.js';
+import { gqlErrorResult, gqlSuccessResult } from './utils/gqlResult.js';
+import { type PassportGqlContext } from './utils/passportContext.js';
 
-// eslint-disable-next-line @typescript-eslint/no-restricted-types
-export type Context = PassportContext<GraphQLUserParent, {}> & {
+export type Context = PassportGqlContext & {
   dataSources: DataSources;
   services: GQLServices;
 };
@@ -72,9 +74,8 @@ const Query: GQLQueryResolvers = {
   },
   async inviteUserToken(_, { token }, { dataSources }) {
     try {
-      const inviteUserToken = await dataSources.orgAPI.getInviteUserToken(
-        token,
-      );
+      const inviteUserToken =
+        await dataSources.orgAPI.getInviteUserToken(token);
       return gqlSuccessResult(
         { tokenData: inviteUserToken as unknown as GQLInviteUserToken },
         'InviteUserTokenSuccessResponse',
@@ -99,13 +100,19 @@ const Query: GQLQueryResolvers = {
     }
 
     try {
-      // TODO: this response type actually isn't right; remove cast and fix errors.
+      // TODO: this response type actually isn't right; remove the cast below
+      // and fix the underlying mismatch in getAllRuleInsights' return shape.
+      /* eslint-disable @typescript-eslint/no-explicit-any -- see TODO above */
       return (await context.dataSources.ruleAPI.getAllRuleInsights(
         user.orgId,
       )) as any;
+      /* eslint-enable @typescript-eslint/no-explicit-any */
     } catch (e) {
       // eslint-disable-next-line no-console
-      console.error('allRuleInsights: warehouse query failed:', (e as Error).message);
+      console.error(
+        'allRuleInsights: warehouse query failed:',
+        (e as Error).message,
+      );
       return null;
     }
   },
@@ -118,7 +125,10 @@ const Query: GQLQueryResolvers = {
       return true;
     } catch (e) {
       // eslint-disable-next-line no-console
-      console.error('isWarehouseAvailable: warehouse health check failed:', (e as Error).message);
+      console.error(
+        'isWarehouseAvailable: warehouse health check failed:',
+        (e as Error).message,
+      );
       return false;
     }
   },
@@ -169,8 +179,10 @@ const Mutation: GQLMutationResolvers = {
       throw unauthenticatedError('Authenticated user required');
     }
 
-    if (!user.getPermissions().includes('MANAGE_ORG')) {
-      throw forbiddenError('User does not have permission to generate password reset tokens');
+    if (!user.getPermissions().includes(UserPermission.MANAGE_USERS)) {
+      throw forbiddenError(
+        'User does not have permission to generate password reset tokens',
+      );
     }
 
     const token =
@@ -204,7 +216,7 @@ const Mutation: GQLMutationResolvers = {
       throw unauthenticatedError('Authenticated user required');
     }
 
-    if (!user.getPermissions().includes('MANAGE_ORG')) {
+    if (!user.getPermissions().includes(UserPermission.MANAGE_USERS)) {
       throw forbiddenError('User does not have permission to invite users');
     }
 
@@ -220,7 +232,7 @@ const Mutation: GQLMutationResolvers = {
       throw unauthenticatedError('Authenticated user required');
     }
 
-    if (!user.getPermissions().includes('MANAGE_ORG')) {
+    if (!user.getPermissions().includes(UserPermission.MANAGE_USERS)) {
       throw forbiddenError('User does not have permission to delete invites');
     }
 
@@ -232,7 +244,7 @@ const Mutation: GQLMutationResolvers = {
       throw unauthenticatedError('Authenticated user required');
     }
 
-    if (!user.getPermissions().includes('MANAGE_ORG')) {
+    if (!user.getPermissions().includes(UserPermission.MANAGE_USERS)) {
       throw forbiddenError('User does not have permission to approve users');
     }
 
@@ -244,19 +256,17 @@ const Mutation: GQLMutationResolvers = {
       throw unauthenticatedError('Authenticated user required');
     }
 
-    if (!user.getPermissions().includes('MANAGE_ORG')) {
+    if (!user.getPermissions().includes(UserPermission.MANAGE_USERS)) {
       throw forbiddenError('User does not have permission to reject users');
     }
 
     return context.dataSources.userAPI.rejectUser(id, user.orgId);
   },
-  async requestDemo(_, params, context) {
-    return context.dataSources.orgAPI.requestDemo(params.input);
-  },
 };
 
 export default mergeResolvers([
   { Query, Mutation, SignUpResponse },
+  roomActionModule,
   actionResolvers,
   actionStatisticsResolvers,
   apiKeyResolvers,
@@ -277,6 +287,7 @@ export default mergeResolvers([
   reportingResolvers,
   reportingRulesResolvers,
   retroactionResolvers,
+  rolesResolvers,
   routingRulesResolvers,
   ruleResolvers,
   signalResolvers,

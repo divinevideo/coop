@@ -1,7 +1,7 @@
 import { type Route } from '../utils/route-helpers.js';
 import ActionRoutes from './action/ActionRoutes.js';
+import ConcordRoutes from './concord/index.js';
 import ContentRoutes from './content/ContentRoutes.js';
-import GDPRRoutes from './gdpr/gdprRoutes.js';
 import IntegrationLogosRoutes from './integration_logos/IntegrationLogosRoutes.js';
 import ItemRoutes from './items/ItemRoutes.js';
 import PoliciesRoutes from './policies/PoliciesRoutes.js';
@@ -20,12 +20,12 @@ export type Controller = {
 };
 
 export default {
+  Concord: ConcordRoutes,
   Items: ItemRoutes,
   Content: ContentRoutes,
   Reporting: ReportingRoutes,
   Policies: PoliciesRoutes,
   UserScores: UserScoresRoutes,
   Actions: ActionRoutes,
-  GDPR: GDPRRoutes,
   IntegrationLogos: IntegrationLogosRoutes,
 } satisfies { [key: string]: Controller };
