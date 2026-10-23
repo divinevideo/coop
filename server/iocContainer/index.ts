@@ -236,6 +236,7 @@ import { getUsableCoreCount } from '../utils/cpu-helpers.js';
 import { jsonStringify, type JsonOf } from '../utils/encoding.js';
 import { logErrorJson, logJson } from '../utils/logging.js';
 import { __throw, assertUnreachable } from '../utils/misc.js';
+import { reconnectOnReadonly } from '../utils/redis.js';
 import SafeTracer from '../utils/SafeTracer.js';
 import {
   isNonEmptyArray,
@@ -528,6 +529,7 @@ export default async function getBottle() {
           // Required by BullMQ: its workers use blocking Redis commands
           // that would otherwise be misinterpreted as timed-out requests.
           maxRetriesPerRequest: null,
+          reconnectOnError: reconnectOnReadonly,
           port: parseInt(process.env.REDIS_PORT ?? '6379'),
           host: safeGetEnvVar('REDIS_HOST'),
           ...(isEnvTrue('REDIS_TLS')
