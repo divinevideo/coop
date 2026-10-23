@@ -4,7 +4,7 @@ Divine's moderation review surface. Fork of [roostorg/coop](https://github.com/r
 
 ## Cross-Repo Coordination
 
-This repo provides the staff review surface for Divine moderation. Load the shared Divine context and review guidance through `AGENTS.md` before cross-repository work. The existing relay-manager pipeline and the separate Concord room integration coexist; preserve their distinct item types and delivery contracts.
+Before cross-repository work, read `~/code/divine-context/AGENT_CONTEXT.md` and `~/code/divine-context/PR_REVIEW.md`. The existing relay-manager pipeline and the separate Concord room integration coexist; preserve their distinct item types and delivery contracts.
 
 ## Architecture
 
@@ -28,9 +28,9 @@ The separate room pipeline uses `concord_message` and `concord_member` item type
 
 ## Deployment
 
-The chat candidate ports the integration onto fixed upstream Coop 1.0.2. `divine/concord-image-artifacts.py` builds and verifies a complete source-bound server, worker, migrator and client image set; the client uses `divine/coop-client-source/Dockerfile`. Protected publication requires reviewed source in main and explicit publication authorization. Existing local candidate receipts are not registry deployment digests.
+The room integration uses fixed upstream Coop 1.0.2 source. `divine/concord-image-artifacts.py` builds and verifies a complete source-bound server, worker, migrator and client image set; the client uses `divine/coop-client-source/Dockerfile`. `.github/workflows/publish-concord-source.yaml` requires reviewed source in main and explicit publication authorization. Local image IDs are not registry deployment digests.
 
-The legacy client-only workflow and official-image deployment are separate from this candidate. Do not deploy the room changes by mixing new source-built components with older application/database inputs. K8s manifests live in `divine-iac-coreconfig/k8s/applications/coop/`; source readiness, registry publication and production activation are separate steps.
+The legacy client-only workflow repackages official upstream assets and does not contain the room UI. Do not deploy the room changes by mixing new source-built components with older application/database inputs. K8s manifests live in `divine-iac-coreconfig/k8s/applications/coop/`; source readiness, registry publication and production activation are separate steps.
 
 ## Staging Dependencies
 
