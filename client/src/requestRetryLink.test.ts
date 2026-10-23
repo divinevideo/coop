@@ -1,6 +1,7 @@
 import {
   ApolloLink,
   execute,
+  gql,
   Observable,
   type FetchResult,
 } from '@apollo/client';
@@ -10,9 +11,30 @@ import { GQLBulkActionExecutionDocument } from './graphql/generated';
 import { requestRetryLink } from './requestRetryLink';
 
 afterEach(() => vi.useRealTimers());
-test.each([true, false])(
-  'transport retries respect room first-attempt certainty: room=%s',
-  async (roomOperationAttempt) => {
+const query = gql`
+  query RetryableRead {
+    me {
+      id
+    }
+  }
+`;
+
+test.each([
+  { document: query, roomOperationAttempt: false, attempts: 3 },
+  { document: query, roomOperationAttempt: true, attempts: 1 },
+  {
+    document: GQLBulkActionExecutionDocument,
+    roomOperationAttempt: false,
+    attempts: 1,
+  },
+  {
+    document: GQLBulkActionExecutionDocument,
+    roomOperationAttempt: true,
+    attempts: 1,
+  },
+])(
+  'lost responses preserve operation safety: $attempts attempt(s), room=$roomOperationAttempt',
+  async ({ document, roomOperationAttempt, attempts }) => {
     vi.useFakeTimers();
     const transport = vi.fn(
       () =>
@@ -22,11 +44,11 @@ test.each([true, false])(
     );
     const failed = vi.fn();
     execute(ApolloLink.from([requestRetryLink(), new ApolloLink(transport)]), {
-      query: GQLBulkActionExecutionDocument,
+      query: document,
       context: { roomOperationAttempt },
     }).subscribe({ error: failed });
     await vi.runAllTimersAsync();
-    expect(transport).toHaveBeenCalledTimes(roomOperationAttempt ? 1 : 3);
+    expect(transport).toHaveBeenCalledTimes(attempts);
     expect(failed).toHaveBeenCalledTimes(1);
   },
 );
