@@ -35,6 +35,7 @@ import {
 } from '../../../graphql/generated';
 import { userHasPermissions } from '../../../routing/permissions';
 import { filterNullOrUndefined } from '../../../utils/collections';
+import { queueDeletionError } from './queueDeletionError';
 
 gql`
   query ManualReviewQueues {
@@ -207,10 +208,7 @@ export default function ManualReviewQueuesDashboard() {
     fetchPolicy: 'no-cache',
     pollInterval: 5000,
   });
-  const [deleteReviewQueue] = useGQLDeleteManualReviewQueueMutation({
-    onError: () => {},
-    onCompleted: async () => refetch(),
-  });
+  const [deleteReviewQueue] = useGQLDeleteManualReviewQueueMutation();
   const [addFavoriteMRTQueue] = useGQLAddFavoriteMrtQueueMutation({
     onCompleted: async () => refetch(),
   });
@@ -299,13 +297,18 @@ export default function ManualReviewQueuesDashboard() {
   const [deleteAllJobsModalInfo, setDeleteAllJobsModalInfo] =
     useState<DeleteAllJobsModalInfo | null>(null);
   const [deleteAllJobsConfirmText, setDeleteAllJobsConfirmText] = useState('');
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [purgeError, setPurgeError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [purging, setPurging] = useState(false);
+  useEffect(() => {
+    setDeleteError(null);
+  }, [modalInfo?.id, modalInfo?.visible]);
   useEffect(() => {
     setDeleteAllJobsConfirmText('');
+    setPurgeError(null);
   }, [deleteAllJobsModalInfo?.id, deleteAllJobsModalInfo?.visible]);
-  const [deleteAllJobsFromQueue] = useGQLDeleteAllJobsFromQueueMutation({
-    onError: () => {},
-    onCompleted: async () => refetch(),
-  });
+  const [deleteAllJobsFromQueue] = useGQLDeleteAllJobsFromQueueMutation();
   const [selectedTab, setSelectedTab] =
     useState<MRTQueuesDashboardTab>('DEFAULT');
   const startReviewing = useCallback(
@@ -322,7 +325,59 @@ export default function ManualReviewQueuesDashboard() {
     },
     [navigate],
   );
-  const onCancel = () => setModalInfo(null);
+  const onCancel = () => {
+    if (!deleting) setModalInfo(null);
+  };
+
+  const onDeleteReviewQueue = async (id: string) => {
+    if (deleting) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      const result = await deleteReviewQueue({ variables: { id } });
+      if (
+        result.errors?.length ||
+        result.data?.deleteManualReviewQueue !== true
+      ) {
+        setDeleteError(queueDeletionError(undefined));
+        return;
+      }
+      setModalInfo(null);
+      // Query failures are displayed by the dashboard's existing error boundary.
+      await refetch();
+    } catch (error) {
+      setDeleteError(queueDeletionError(error));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const onPurgeQueue = async () => {
+    if (purging || !deleteAllJobsModalInfo || !deleteAllJobsConfirmEnabled)
+      return;
+    setPurging(true);
+    setPurgeError(null);
+    try {
+      const result = await deleteAllJobsFromQueue({
+        variables: { queueId: deleteAllJobsModalInfo.id },
+      });
+      const response = result.data?.deleteAllJobsFromQueue;
+      if (
+        result.errors?.length ||
+        response?.__typename !== 'DeleteAllJobsFromQueueSuccessResponse' ||
+        response._ !== true
+      ) {
+        setPurgeError(queueDeletionError(undefined));
+        return;
+      }
+      setDeleteAllJobsModalInfo(null);
+      await refetch();
+    } catch (error) {
+      setPurgeError(queueDeletionError(error));
+    } finally {
+      setPurging(false);
+    }
+  };
 
   const labelForTab = (tab: MRTQueuesDashboardTab) => {
     switch (tab) {
@@ -373,18 +428,14 @@ export default function ManualReviewQueuesDashboard() {
         {
           title: 'Cancel',
           onClick: () => setDeleteAllJobsModalInfo(null),
+          disabled: purging,
           type: 'secondary',
         },
         {
           title: 'Confirm',
-          disabled: !deleteAllJobsConfirmEnabled,
-          onClick: () => {
-            if (!deleteAllJobsConfirmEnabled) return;
-            deleteAllJobsFromQueue({
-              variables: { queueId: deleteAllJobsModalInfo!.id },
-            });
-            setDeleteAllJobsModalInfo(null);
-          },
+          disabled: purging || !deleteAllJobsConfirmEnabled,
+          loading: purging,
+          onClick: onPurgeQueue,
         },
       ]}
     >
@@ -408,6 +459,7 @@ export default function ManualReviewQueuesDashboard() {
           aria-label="Type the queue name to confirm deletion"
           autoFocus
         />
+        {purgeError && <div role="alert">{purgeError}</div>}
       </div>
     </CoopModal>
   );
@@ -424,13 +476,15 @@ export default function ManualReviewQueuesDashboard() {
         {
           title: 'Cancel',
           onClick: onCancel,
+          disabled: deleting,
           type: 'secondary',
         },
         {
           title: 'Delete',
+          disabled: deleting,
+          loading: deleting,
           onClick: () => {
-            onDeleteReviewQueue(modalInfo!.id);
-            setModalInfo(null);
+            void onDeleteReviewQueue(modalInfo!.id);
           },
           type: 'primary',
         },
@@ -439,14 +493,10 @@ export default function ManualReviewQueuesDashboard() {
     >
       Are you sure you want to delete this queue? This will delete all jobs
       inside of this queue as well. You can't undo this action.
+      {deleteError && <div role="alert">{deleteError}</div>}
     </CoopModal>
   );
 
-  const onDeleteReviewQueue = (id: string) => {
-    deleteReviewQueue({
-      variables: { id },
-    });
-  };
   const onAddFavoriteQueue = useCallback(
     (queueId: string) => {
       addFavoriteMRTQueue({

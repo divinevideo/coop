@@ -46,7 +46,14 @@ test.each(['accepted', 'unavailable'])(
 
 test('appeal queue metadata selects appeal dequeue and passes the recorded recovery scope', async () => {
   const recorded = { job: { id: 'recorded-appeal' }, lockToken: 'lock' };
-  const next = { job: { id: 'fresh-appeal' }, lockToken: 'new-lock' };
+  const next = {
+    job: {
+      id: 'fresh-appeal',
+      payload: { item: { itemId: 'item', itemTypeIdentifier: { id: 'type' } } },
+    },
+    lockToken: 'new-lock',
+  };
+  const getPartialItem = jest.fn(async () => null);
   const dequeueAppeal = jest
     .fn()
     .mockResolvedValueOnce(recorded)
@@ -67,6 +74,7 @@ test('appeal queue metadata selects appeal dequeue and passes the recorded recov
         dequeueNextJobWithLock: dequeueDefault,
       },
       jobDecisioning: { retryRecordedRoomDecision: retry },
+      partialItemsService: { getPartialItem },
     },
   ) as ManualReviewToolService;
   await expect(
@@ -78,6 +86,11 @@ test('appeal queue metadata selects appeal dequeue and passes the recorded recov
   ).resolves.toEqual(next);
   expect(dequeueDefault).not.toHaveBeenCalled();
   expect(dequeueAppeal).toHaveBeenCalledTimes(2);
+  expect(getPartialItem).toHaveBeenCalledTimes(1);
+  expect(getPartialItem).toHaveBeenCalledWith('synthetic', {
+    id: 'item',
+    typeId: 'type',
+  });
   expect(retry).toHaveBeenCalledWith(
     expect.objectContaining({ jobId: 'recorded-appeal', isAppealsQueue: true }),
   );

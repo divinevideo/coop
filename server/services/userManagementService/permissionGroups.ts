@@ -116,7 +116,7 @@ const MANUAL_REVIEW_GROUP: PermissionGroup = {
       permission: UserPermission.MANUALLY_ACTION_CONTENT,
       label: 'Manually Action Content',
       description:
-        'Can run bulk-actioning jobs and take direct moderation action',
+        'Can run bulk-actioning jobs and take direct moderation action, including room message removal with room queue and Access authorization. Room bans and unbans remain role-limited.',
     },
     {
       permission: UserPermission.VIEW_CHILD_SAFETY_DATA,

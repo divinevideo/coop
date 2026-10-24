@@ -4,6 +4,6 @@ server/signals/text_matching/fuzzy_matching/homoglyphReplacements.*
 .dockerignore
 .github/pull_request_template.md
 
-# Preserve the exact bytes of already-deployed migrations (append-only history).
+# Exclude historical Scylla migrations from automatic formatting.
 db/src/scripts/scylla/2025.12.03T00.00.00.initial-schema.cjs
 db/src/scripts/scylla/2025.12.03T00.00.01.change-compression-to-zstd.cjs

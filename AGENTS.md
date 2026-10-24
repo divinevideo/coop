@@ -21,11 +21,19 @@ Node **24** (`.nvmrc`). Running on Node 20 produces `EBADENGINE` warnings and ca
 
 Reference files: `README.md` (getting started), `server/bin/README.md` (utility scripts), `docs/` (architecture, ADRs).
 
+For complete local setup, including database creation, client configuration, and worker startup, follow `docs/development/local.md`.
+
 ## Design
 
 - **API:** REST + GraphQL (Apollo Server); client uses Apollo Client with InMemoryCache; server resolvers live in `server/graphql/resolvers/`.
 - **GraphQL authoring:** Inline in resolver files with `/* GraphQL */` comment markers — codegen discovers queries this way. Searching for `gql` or `graphql` alone misses most of it.
 - **GraphQL codegen:** `npm run generate` (from root) regenerates `client/src/graphql/generated.ts` and `server/graphql/generated.ts`. **Never hand-edit** either `generated.ts`. **Never hand-merge** either `generated.ts` during a rebase/merge — pick one side with `git checkout --ours|--theirs <file>`, then run `npm run generate`. Hand-merging produces output that parses but drifts from the schema.
+- **Adding a built-in `SignalType`:** update all four mirrored definitions:
+  1. `server/services/signalsService/types/SignalType.ts` — the type and `integrationForSignalType`.
+  2. `server/services/signalsService/types/SignalArgsByType.ts` — `SignalArgsByType` and `RuntimeSignalArgsByType`.
+  3. `server/graphql/modules/signal.ts` — the SDL `SignalType` enum; its coverage test checks the mirror.
+  4. `client/src/models/signal.ts` — the `integrationForSignalType` switch.
+     Then run `npm run generate` from the root. Updating fewer than four definitions can leave a signal missing from the dashboard.
 - **Data model:** Use Knex query builder for Postgres; ClickHouse via raw SQL in `server/clickhouse/`; Scylla via Cassandra driver.
 - **Dependency injection:** Server uses BottleJS DI (wired in `server/iocContainer/`). Register services in `iocContainer`, don't export singletons from service files. Consumers receive dependencies via DI rather than importing directly. Bypassing `iocContainer` will work at runtime but breaks test mocking patterns.
 
@@ -43,13 +51,20 @@ npm install
 (cd server && npm install)
 (cd db && npm install)
 
-# Populate .env files for /server and /db, then run migrations
+# Configure /client, /server and /db using docs/development/local.md and the
+# approved local credential workflow. Create databases before migrations.
+npm run db:create -- --env staging --db api-server-pg
+npm run db:create -- --env staging --db scylla
+npm run db:create -- --env staging --db clickhouse
+
 npm run db:update -- --env staging --db api-server-pg
 npm run db:update -- --env staging --db scylla
 npm run db:update -- --env staging --db clickhouse
 
-# Create organization and admin user
-npm run create-org
+# Inspect org/admin creation requirements before supplying values:
+# --name, --email, --website, --firstName, --lastName and --password are required.
+# Use the approved credential workflow for the password, not a literal example.
+npm run create-org -- --help
 
 # Start dev servers (separate terminals recommended)
 npm run client:start        # React dev server
@@ -57,7 +72,7 @@ npm run server:start        # Express + GraphQL API
 npm run generate:watch      # (optional) watch GraphQL changes
 ```
 
-Client: http://localhost:3001 · Server: http://localhost:3000
+Client: http://localhost:3000 · Server: http://localhost:8080 (unless overridden by local configuration).
 
 ## Testing
 
@@ -87,7 +102,7 @@ If tests fail with database errors, check migration logs via `docker compose log
 
 ## CI
 
-CI runs entirely via GitHub Actions (`.github/workflows/apply_pr_checks.yaml`). All PR checks are defined as `docker compose` services so you can reproduce any CI job locally. Run them in your shell (paste-as-is — each command's exit code matches the corresponding CI step's exit code):
+CI runs via GitHub Actions (`.github/workflows/apply_pr_checks.yaml`). Application checks use `docker compose` services; formatting runs on the host. Reproduce the checks below with their declared commands:
 
 ```bash
 docker compose run --rm codegen-check
@@ -96,6 +111,7 @@ docker compose run --rm backend npm run build
 docker compose run --rm client npm run lint
 docker compose run --rm client npm run build
 docker compose run --rm test
+npm run prettier
 ```
 
 Individual checks:
@@ -107,6 +123,7 @@ Individual checks:
 | `check_api_server` (build)               | `docker compose run --rm backend npm run build` |
 | `run_frontend_checks_if_changed` (lint)  | `docker compose run --rm client npm run lint`   |
 | `run_frontend_checks_if_changed` (build) | `docker compose run --rm client npm run build`  |
+| `check_formatting`                       | `npm run prettier`                              |
 | `check_api_server` (test)                | `docker compose run --rm test`                  |
 
 Tear down:
@@ -134,7 +151,7 @@ Note: `check_migration_order` runs only in GitHub Actions — it's GitHub-specif
 
 ## Code style
 
-- **TypeScript:** ESLint + Prettier (configs in `.eslintrc.cjs` and `.prettierrc` per package). Run `npm run lint` and `npm run format` from root.
+- **TypeScript:** ESLint uses package configs; Prettier uses the shared root `.prettierrc`. Run `npm run lint` and `npm run format` from root.
 - **Naming:** Use camelCase for variables/functions; PascalCase for components/classes; SCREAMING_SNAKE_CASE for constants.
 - **GraphQL:** Type-safe resolvers and queries via codegen; never hand-edit `generated.ts`.
 - **Imports:** Absolute imports configured via `tsconfig.json` paths; prefer `@/` prefix over relative paths where configured.

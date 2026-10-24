@@ -39,6 +39,7 @@ vi.mock('@/graphql/generated', function () {
             'concord_ban_member',
             'concord_unban_member',
             'concord_remove_message',
+            'ordinary_action',
           ].map((name) => ({
             id: name,
             name,
@@ -55,13 +56,16 @@ vi.mock('antd', function () {
     function MockSelect({
       children,
       onChange,
+      className,
     }: {
       children: React.ReactNode;
       onChange: (values: string[]) => void;
+      className?: string;
     }) {
       return (
         <select
           aria-label="Action"
+          className={className}
           onChange={(event) => onChange([event.target.value])}
         >
           {children}
@@ -117,13 +121,75 @@ vi.mock('@/webpages/dashboard/components/CoopModal', function () {
   };
 });
 vi.mock('@/webpages/dashboard/components/PolicyDropdown', () => ({
-  default: () => null,
+  default: ({ className }: { className: string }) => (
+    <div data-testid="policy-control" className={className} />
+  ),
 }));
 vi.mock('@/components/ActionParametersModal', () => ({
   default: () => null,
   defaultValuesForParameters: () => ({}),
 }));
 vi.mock('./ConcordEnforcementStatus', () => ({ default: () => null }));
+
+test('action controls wrap without losing the submit button and retain audit-note guidance', () => {
+  render(<ItemAction itemIdentifier={{ id: 'item', typeId: 'room' }} />);
+  const action = screen.getByLabelText('Action');
+  expect(action.className).toContain('max-w-full');
+  expect(action.closest('.flex-row')?.className).toContain('flex-wrap');
+  expect(action.closest('.flex-row')?.className).toContain('items-end');
+  expect(screen.getByTestId('policy-control').className).toContain(
+    'max-w-full',
+  );
+  fireEvent.change(action, { target: { value: 'ordinary_action' } });
+  expect(
+    screen.getByLabelText('Note (optional)').getAttribute('placeholder'),
+  ).toBe(
+    'Why are you taking this action? This note will be recorded in the audit log and included in any configured webhook payload.',
+  );
+});
+
+test('room notes are visibly required while ordinary notes remain optional', () => {
+  render(<ItemAction itemIdentifier={{ id: 'item', typeId: 'room' }} />);
+  fireEvent.change(screen.getByLabelText('Action'), {
+    target: { value: 'concord_remove_message' },
+  });
+  expect(
+    screen.getByLabelText('Note (required)').getAttribute('maxlength'),
+  ).toBe('2048');
+  expect(
+    (screen.getByText('Submit Actions') as HTMLButtonElement).disabled,
+  ).toBe(true);
+  fireEvent.change(screen.getByLabelText('Note (required)'), {
+    target: { value: 'Reason' },
+  });
+  expect(
+    (screen.getByText('Submit Actions') as HTMLButtonElement).disabled,
+  ).toBe(false);
+  fireEvent.change(screen.getByLabelText('Action'), {
+    target: { value: 'ordinary_action' },
+  });
+  expect(
+    screen.getByLabelText('Note (optional)').getAttribute('maxlength'),
+  ).toBe('5000');
+});
+
+test('ordinary action failure retains upstream server-log and policy guidance', async () => {
+  hooks.submit.mockImplementation(async (options) => {
+    options.onCompleted({
+      bulkExecuteActions: { results: [{ success: false }] },
+    });
+    return {};
+  });
+  render(<ItemAction itemIdentifier={{ id: 'item', typeId: 'room' }} />);
+  fireEvent.change(screen.getByLabelText('Action'), {
+    target: { value: 'ordinary_action' },
+  });
+  fireEvent.click(screen.getByText('Submit Actions'));
+  expect(
+    (await screen.findByText(/Check server logs for details/)).textContent,
+  ).toContain('If your org requires a policy');
+});
+
 beforeEach(() => {
   const ids = new Map<string, string>();
   hooks.begin.mockImplementation(async ({ variables }) => {
@@ -170,7 +236,7 @@ test.each([true, false])(
     fireEvent.change(screen.getByLabelText('Action'), {
       target: { value: 'concord_ban_member' },
     });
-    fireEvent.change(screen.getByLabelText('Note (optional)'), {
+    fireEvent.change(screen.getByLabelText('Note (required)'), {
       target: { value: 'Reason' },
     });
     fireEvent.click(screen.getByText('Submit Actions'));
@@ -219,7 +285,7 @@ test('overlapping old success cannot erase a replacement operation', async () =>
   fireEvent.change(screen.getByLabelText('Action'), {
     target: { value: 'concord_ban_member' },
   });
-  fireEvent.change(screen.getByLabelText('Note (optional)'), {
+  fireEvent.change(screen.getByLabelText('Note (required)'), {
     target: { value: 'Reason' },
   });
   fireEvent.click(screen.getByText('Submit Actions'));
@@ -261,7 +327,7 @@ test('loading disables submit even when explicit input validation is satisfied',
   fireEvent.change(screen.getByLabelText('Action'), {
     target: { value: 'concord_ban_member' },
   });
-  fireEvent.change(screen.getByLabelText('Note (optional)'), {
+  fireEvent.change(screen.getByLabelText('Note (required)'), {
     target: { value: 'Reason' },
   });
   expect(
@@ -291,7 +357,7 @@ test.each(['ban_member', 'unban_member', 'remove_message'])(
     fireEvent.change(screen.getByLabelText('Action'), {
       target: { value: `concord_${action}` },
     });
-    fireEvent.change(screen.getByLabelText('Note (optional)'), {
+    fireEvent.change(screen.getByLabelText('Note (required)'), {
       target: { value: 'Reason' },
     });
     fireEvent.click(screen.getByText('Submit Actions'));
@@ -307,7 +373,7 @@ function selectRoom() {
   fireEvent.change(screen.getByLabelText('Action'), {
     target: { value: 'concord_ban_member' },
   });
-  fireEvent.change(screen.getByLabelText('Note (optional)'), {
+  fireEvent.change(screen.getByLabelText('Note (required)'), {
     target: { value: 'Reason' },
   });
 }
@@ -325,13 +391,13 @@ test('lost begin response retains the nonce across remount and only exact claims
   first.unmount();
   render(<ItemAction itemIdentifier={item} />);
   selectRoom();
-  fireEvent.change(screen.getByLabelText('Note (optional)'), {
+  fireEvent.change(screen.getByLabelText('Note (required)'), {
     target: { value: 'Changed reason' },
   });
   fireEvent.click(screen.getByText('Submit Actions'));
   await screen.findByText(/changed inputs cannot replace/);
   expect(hooks.begin).toHaveBeenCalledTimes(1);
-  fireEvent.change(screen.getByLabelText('Note (optional)'), {
+  fireEvent.change(screen.getByLabelText('Note (required)'), {
     target: { value: 'Reason' },
   });
   fireEvent.click(screen.getByText('Submit Actions'));
@@ -455,7 +521,7 @@ test('existing legacy operation reaches lookup-only delivery without beginning a
 test('oversized reason is rejected before saving a nonce or beginning', async () => {
   render(<ItemAction itemIdentifier={{ id: 'item', typeId: 'room' }} />);
   selectRoom();
-  fireEvent.change(screen.getByLabelText('Note (optional)'), {
+  fireEvent.change(screen.getByLabelText('Note (required)'), {
     target: { value: 'x'.repeat(2049) },
   });
   fireEvent.click(screen.getByText('Submit Actions'));

@@ -18,6 +18,11 @@ def provision(gql, origin, reviewers):
         https_origin(origin)
     if not reviewers or any(not isinstance(x, str) or not x for x in reviewers):
         raise ValueError('Explicit room reviewers are required')
+    invoker = gql('query { me { id } }').get('me')
+    if not invoker or not isinstance(invoker.get('id'), str) or not invoker['id']:
+        raise ValueError('Authenticated provisioning user unavailable')
+    # Queue creation already grants access to the authenticated invoking user.
+    queue_reviewers = list(dict.fromkeys(x for x in reviewers if x != invoker['id']))
     def state():
         value = gql(QUERY)['myOrg']
         if not value: raise ValueError('Organization unavailable')
@@ -32,7 +37,7 @@ def provision(gql, origin, reviewers):
     fields = [{'name': 'case_id', 'type': 'STRING', 'required': True}, {'name': 'room', 'type': 'STRING', 'required': True}]
     member = ensure('itemTypes', 'concord_member', 'createUserItemType', 'CreateUserItemTypeInput', 'MutateUserTypeSuccessResponse', {'description': 'Reported community member. Actions affect this community only.', 'fields': fields, 'fieldRoles': {'displayName': 'room', 'createdAt': None, 'profileIcon': None, 'backgroundImage': None, 'isDeleted': None}})
     message = ensure('itemTypes', 'concord_message', 'createContentItemType', 'CreateContentItemTypeInput', 'MutateContentTypeSuccessResponse', {'description': 'Reported room message. Evidence is fetched on demand and expires at the enforcement service.', 'fields': fields + [{'name': 'author', 'type': 'RELATED_ITEM', 'required': True}], 'fieldRoles': {'displayName': 'room', 'creatorId': 'author', 'threadId': None, 'parentId': None, 'createdAt': None, 'isDeleted': None}})
-    queue = ensure('mrtQueues', 'Room Review', 'createManualReviewQueue', 'CreateManualReviewQueueInput', 'MutateManualReviewQueueSuccessResponse', {'description': 'Public community reports; independent relay, Concord and Discord delivery status.', 'autoCloseJobs': False, 'isAppealsQueue': False, 'hiddenActionIds': [], 'userIds': reviewers})
+    queue = ensure('mrtQueues', 'Room Review', 'createManualReviewQueue', 'CreateManualReviewQueueInput', 'MutateManualReviewQueueSuccessResponse', {'description': 'Public community reports; independent relay, Concord and Discord delivery status.', 'autoCloseJobs': False, 'isAppealsQueue': False, 'hiddenActionIds': [], 'userIds': queue_reviewers})
     for item_type in [message, member]:
         ensure('routingRules', f'concord rooms {item_type} -> Room Review', 'createRoutingRule', 'CreateRoutingRuleInput', 'MutateRoutingRuleSuccessResponse', {'conditionSet': {'conditions': [], 'conjunction': 'AND'}, 'destinationQueueId': queue, 'itemTypeIds': [item_type], 'status': 'LIVE'})
     for name, description, types in [

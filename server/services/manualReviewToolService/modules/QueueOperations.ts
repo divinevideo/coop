@@ -23,6 +23,7 @@ import {
 import {
   CoopError,
   ErrorType,
+  makeBadRequestError,
   makeUnauthorizedError,
   type ErrorInstanceData,
 } from '../../../utils/errors.js';
@@ -115,6 +116,13 @@ export type QueueOperationsErrorType =
 // because queues are/will be actually sharded across redis instances for
 // scaling by orgId, so you need the orgId to find the queue.
 type QueueKey = { orgId: string; queueId: string };
+
+/** Only a definitively unacquired advisory fence permits best-effort fallback. */
+class RoomMutationLockNotAcquiredError extends Error {
+  constructor(scope: 'queue' | 'job') {
+    super(`Room ${scope} mutation in progress; retry`);
+  }
+}
 
 /**
  * This class handles everything that MRT does directly with queues: CRUDing
@@ -1133,6 +1141,8 @@ export default class QueueOperations {
                 locked: boolean;
               }>`SELECT pg_try_advisory_xact_lock_shared(hashtextextended(${queueKey}, 0)) AS locked`;
         const result = await queueLock.execute(tx);
+        if (result.rows[0]?.locked === false)
+          throw new RoomMutationLockNotAcquiredError('queue');
         if (!result.rows[0]?.locked)
           throw new Error('Room queue mutation in progress; retry');
         if (jobId !== undefined) {
@@ -1147,6 +1157,8 @@ export default class QueueOperations {
           }>`SELECT pg_try_advisory_xact_lock(hashtextextended(${key}, 0)) AS locked`.execute(
             tx,
           );
+          if (jobLock.rows[0]?.locked === false)
+            throw new RoomMutationLockNotAcquiredError('job');
           if (!jobLock.rows[0]?.locked)
             throw new Error('Room job mutation in progress; retry');
         }
@@ -1201,8 +1213,12 @@ export default class QueueOperations {
       .limit(1)
       .executeTakeFirst();
     if (roomDecision)
-      throw new Error(
+      throw makeBadRequestError(
         'Room queue has recorded history; an explicit teardown plan is required before bulk deletion',
+        {
+          pointer: '/manual-review-queues/recorded-room-history',
+          shouldErrorSpan: false,
+        },
       );
   }
 
@@ -1235,8 +1251,8 @@ export default class QueueOperations {
    * locked, atomically completes it with `invokerUserId` as the lock
    * token (per the `lockToken === userId` convention) so a reviewer
    * deleting a job they themselves dequeued succeeds without stealing
-   * another reviewer's lock. Returns `false` on token mismatch so
-   * callers can fall back to scrubbing.
+   * another reviewer's lock. Returns `false` on token mismatch or advisory
+   * fence contention so callers can fall back to scrubbing.
    */
   async removeJobAllowingInvokerLock(opts: {
     orgId: string;
@@ -1281,7 +1297,10 @@ export default class QueueOperations {
         }
       },
       jobId,
-    );
+    ).catch((error: unknown) => {
+      if (error instanceof RoomMutationLockNotAcquiredError) return false;
+      throw error;
+    });
   }
 
   async deleteAllJobsFromQueue(opts: {

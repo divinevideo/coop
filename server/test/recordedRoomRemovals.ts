@@ -251,6 +251,52 @@ export async function checkRecordedRoomLookupBoundary(
       ),
     ).toBe(false);
   }
+  for (const directLocator of [false, true]) {
+    const rowId = randomUUID();
+    const request = await recordedRemoval(pgQuery, false, rowId);
+    const mismatchedJobId = `aXRlbQ:${Buffer.from(randomUUID()).toString('base64url')}`;
+    await sql`UPDATE manual_review_tool.manual_review_decisions
+      SET job_payload = jsonb_set(job_payload, '{id}', ${jsonStringify(mismatchedJobId)}::jsonb)
+      WHERE id = ${rowId}`.execute(pgQuery);
+    // Compute the queried execution from payload B, not row A. Without the
+    // row/payload identity guard every remaining source/target check matches.
+    const executionId = roomExecutionId({
+      ...request,
+      correlationId: `mrt-decision:${mismatchedJobId}`,
+    });
+    const locator = directLocator ? { manualReviewDecisionId: rowId } : {};
+    await expect(
+      stopRoomAutomation(pgQuery, deps, {
+        orgId: config.orgId,
+        actorId: actor.id,
+        executionId,
+        ...locator,
+        reason: 'Reject row A claiming payload job B',
+      }),
+    ).rejects.toThrow('Unknown room execution');
+    expect(
+      await pgQuery
+        .selectFrom('concord_integration.room_execution_state')
+        .select('execution_id')
+        .where('org_id', '=', config.orgId)
+        .where('execution_id', '=', executionId)
+        .execute(),
+    ).toEqual([]);
+
+    // Positive A/A control uses the same row, target and locator mode.
+    await sql`UPDATE manual_review_tool.manual_review_decisions
+      SET job_payload = jsonb_set(job_payload, '{id}', ${jsonStringify(request.correlationId.slice('mrt-decision:'.length))}::jsonb)
+      WHERE id = ${rowId}`.execute(pgQuery);
+    expect(
+      await stopRoomAutomation(pgQuery, deps, {
+        orgId: config.orgId,
+        actorId: actor.id,
+        executionId: roomExecutionId(request),
+        ...locator,
+        reason: 'Valid row A and payload job A',
+      }),
+    ).toMatchObject({ automationStopped: true, acceptanceUnknown: true });
+  }
 }
 
 export async function checkRecordedRoomLookupBudget(

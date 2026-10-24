@@ -63,7 +63,9 @@ export default function ItemAction(props: {
       const anyFailed = results.some((r) => r.success === false);
       if (anyFailed) {
         setModalBody(
-          'One or more actions failed. The callback URL may have returned an error. If your org requires a policy for decisions, select a policy and try again.',
+          'One or more actions failed. Check server logs for details. ' +
+            'If the action posts to a callback URL, the URL may have returned an error. ' +
+            'If your org requires a policy for decisions, select a policy and try again.',
         );
       } else {
         setModalBody(
@@ -387,6 +389,9 @@ export default function ItemAction(props: {
   const activeParamsAction = paramsModal.open
     ? eligibleActionsById.get(paramsModal.actionId)
     : undefined;
+  const roomNoteRequired = selectedActionIds.some((id) =>
+    eligibleActionsById.get(id)?.name.startsWith('concord_'),
+  );
 
   return (
     <div className="flex flex-col">
@@ -394,11 +399,11 @@ export default function ItemAction(props: {
       <div className="flex flex-col items-start mb-2">
         <div className="text-base font-semibold">{title}</div>
       </div>
-      <div className="flex flex-row gap-4">
+      <div className="flex flex-row flex-wrap items-end gap-4">
         <div className="flex flex-col items-start">
           <div>
             <Select
-              className="w-80"
+              className="w-80 max-w-full"
               mode="multiple"
               maxTagCount={1}
               placeholder="Select action"
@@ -419,7 +424,7 @@ export default function ItemAction(props: {
         <div className="flex flex-col items-start">
           <div>
             <PolicyDropdown
-              className="w-80"
+              className="w-80 max-w-full"
               policies={policiesMemo}
               maxTagCount={1}
               onChange={policiesDropdownOnChange}
@@ -439,10 +444,7 @@ export default function ItemAction(props: {
             loading ||
             preparing ||
             selectedActionIds.length === 0 ||
-            (selectedActionIds.some((id) =>
-              eligibleActionsById.get(id)?.name.startsWith('concord_'),
-            ) &&
-              !moderatorNote.trim())
+            (roomNoteRequired && !moderatorNote.trim())
           }
         />
       </div>
@@ -478,13 +480,13 @@ export default function ItemAction(props: {
             htmlFor="item-action-moderator-note"
             className="mb-1 text-sm font-medium text-gray-700"
           >
-            Note (optional)
+            {roomNoteRequired ? 'Note (required)' : 'Note (optional)'}
           </label>
           <Input.TextArea
             id="item-action-moderator-note"
-            placeholder="Why are you taking this action? Sent to the action's webhook as `actorNote`."
+            placeholder="Why are you taking this action? This note will be recorded in the audit log and included in any configured webhook payload."
             rows={2}
-            maxLength={5000}
+            maxLength={roomNoteRequired ? 2048 : 5000}
             value={moderatorNote}
             onChange={(e) => setModeratorNote(e.target.value)}
           />

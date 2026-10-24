@@ -275,7 +275,9 @@ test.each(paths)(
     const submission = f.submit().catch((error: unknown) => error);
     try {
       await gate.entered.wait;
-      await expect(f.remove()).rejects.toThrow('mutation in progress');
+      if (path === 'direct' || path === 'same-invoker')
+        await expect(f.remove()).resolves.toBe(false);
+      else await expect(f.remove()).rejects.toThrow('mutation in progress');
       expect(await f.exists()).toBe(true);
       expect(await f.recorded()).toHaveLength(0);
       gate.resume.release();

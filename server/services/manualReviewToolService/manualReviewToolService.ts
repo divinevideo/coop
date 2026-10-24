@@ -1234,8 +1234,7 @@ export class ManualReviewToolService {
         queueId,
       });
 
-    let shouldBeAutoActioned =
-      !queue?.isAppealsQueue && (queue?.autoCloseJobs ?? false);
+    let shouldBeAutoActioned = queue?.autoCloseJobs ?? false;
     const getNext = queue?.isAppealsQueue
       ? this.queueOps.dequeueNextAppealJobWithLock.bind(this.queueOps)
       : this.queueOps.dequeueNextJobWithLock.bind(this.queueOps);

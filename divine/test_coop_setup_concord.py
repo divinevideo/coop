@@ -10,6 +10,7 @@ class ProvisionTest(unittest.TestCase):
         state = {'itemTypes': [{'id': 'existing', 'name': 'nostr_event'}], 'mrtQueues': [{'id': 'existing-queue', 'name': 'General Review'}], 'routingRules': [], 'actions': [{'id': 'global', 'name': 'Ban-User'}]}
         mutations = []
         def gql(query, variables=None):
+            if query == 'query { me { id } }': return {'me': {'id': 'synthetic-admin'}}
             if query.startswith('query'): return {'myOrg': state}
             value = variables['input']
             key = next(k for k in ('createContentItemType','createUserItemType','createManualReviewQueue','createRoutingRule','createAction') if k in query)
@@ -36,6 +37,30 @@ class ProvisionTest(unittest.TestCase):
                 self.assertIs(action['parameters'][0]['defaultValue'], False)
                 self.assertIn('entire Discord server', action['parameters'][0]['description'])
         for route in state['routingRules']: self.assertEqual(route['destinationQueueId'], queue['id'])
+
+    def test_queue_reviewers_are_unique_and_exclude_invoking_admin(self):
+        cases = [
+            (['reviewer-a', 'reviewer-a', 'reviewer-b'], ['reviewer-a', 'reviewer-b']),
+            (['synthetic-admin', 'reviewer-a', 'synthetic-admin', 'reviewer-a'], ['reviewer-a']),
+            (['synthetic-admin'], []),
+        ]
+        for reviewers, expected in cases:
+            with self.subTest(reviewers=reviewers):
+                state = {'itemTypes': [], 'mrtQueues': [], 'routingRules': [], 'actions': []}
+                def gql(query, variables=None):
+                    if query == 'query { me { id } }': return {'me': {'id': 'synthetic-admin'}}
+                    if query.startswith('query'): return {'myOrg': state}
+                    value = variables['input']
+                    key = next(k for k in ('createContentItemType', 'createUserItemType', 'createManualReviewQueue', 'createRoutingRule', 'createAction') if k in query)
+                    collection = {'createContentItemType': 'itemTypes', 'createUserItemType': 'itemTypes', 'createManualReviewQueue': 'mrtQueues', 'createRoutingRule': 'routingRules', 'createAction': 'actions'}[key]
+                    if key == 'createManualReviewQueue':
+                        # Model the server appending its authenticated invoker.
+                        effective_users = value['userIds'] + ['synthetic-admin']
+                        self.assertEqual(len(effective_users), len(set(effective_users)))
+                    state[collection].append(dict(value, id=f'{collection}-{len(state[collection])}'))
+                    return {key: {'__typename': {'createContentItemType': 'MutateContentTypeSuccessResponse', 'createUserItemType': 'MutateUserTypeSuccessResponse', 'createManualReviewQueue': 'MutateManualReviewQueueSuccessResponse', 'createRoutingRule': 'MutateRoutingRuleSuccessResponse', 'createAction': 'MutateActionSuccessResponse'}[key]}}
+                setup.provision(gql, 'https://moderation.example', reviewers)
+                self.assertEqual(state['mrtQueues'][0]['userIds'], expected)
 
     def test_missing_staff_and_invalid_origin_fail_without_mutation(self):
         for origin, reviewers in [('http://example.invalid',['staff']), ('https://example.invalid/path',['staff']), ('https://example.invalid',[])]:
