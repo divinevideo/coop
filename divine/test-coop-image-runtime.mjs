@@ -330,7 +330,17 @@ try {
       org_id: orgId,
       queue_id: queue.id,
       reviewer_id: user.id,
-      job_payload: { id: jobId, roomDeliveryRequired: true },
+      job_payload: {
+        id: jobId,
+        roomDeliveryRequired: true,
+        payload: {
+          kind: 'DEFAULT',
+          item: {
+            itemId: removal.itemId,
+            itemTypeIdentifier: { id: removal.itemTypeId },
+          },
+        },
+      },
       decision_components: [
         { type: 'CUSTOM_ACTION', actions: [{ id: removal.actionId }] },
       ],
