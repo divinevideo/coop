@@ -332,6 +332,7 @@ try {
       reviewer_id: user.id,
       job_payload: {
         id: jobId,
+        orgId,
         roomDeliveryRequired: true,
         payload: {
           kind: 'DEFAULT',

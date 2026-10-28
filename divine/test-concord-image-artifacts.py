@@ -393,9 +393,35 @@ class Artifacts(unittest.TestCase):
         self.assertNotEqual(result['images'][0]['digest'], self.manifest['images'][0]['config_digest'])
 
     def test_registry_error_is_not_treated_as_absent(self):
-        with patch.object(a, 'run', side_effect=a.subprocess.CalledProcessError(1, ['docker'], stderr=b'unauthorized')):
+        tag = self.manifest['images'][0]['tag']
+        for diagnostic in (b'unauthorized', b'credential helper executable not found', b'registry endpoint lookup: not found',
+                           ('ERROR: ' + tag + '-other: not found').encode(),
+                           ('ERROR: ' + tag + ': not found while resolving endpoint').encode()):
+            with self.subTest(diagnostic=diagnostic):
+                calls = []
+                def failed_read(args):
+                    calls.append(args)
+                    raise a.subprocess.CalledProcessError(1, args, stderr=diagnostic)
+                with patch.object(a, 'run', side_effect=failed_read):
+                    with self.assertRaises(a.subprocess.CalledProcessError):
+                        a.publish(self.root, SHA, HARNESS, self.write(), self.contract, SHA)
+                # No load/tag/push, or later image inspection, after uncertainty.
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][:5], ['docker', 'buildx', 'imagetools', 'inspect', '--raw'])
+
+    def test_registry_absence_requires_an_explicit_signal_for_the_requested_reference(self):
+        tag = self.manifest['images'][0]['tag']
+        # buildx 0.37.0 against a public GHCR repository returned the exact
+        # reference form below for a newly generated nonexistent tag.
+        for diagnostic in (b'manifest unknown', (tag + ': not found').encode(),
+                           ('ERROR: ' + tag + ': not found\n').encode(),
+                           ('ERROR: ' + tag + ': manifest unknown\n').encode()):
+            with self.subTest(diagnostic=diagnostic):
+                with patch.object(a, 'run', side_effect=a.subprocess.CalledProcessError(1, ['docker'], stderr=diagnostic)):
+                    self.assertIsNone(a.remote_config(tag))
+        with patch.object(a, 'run', side_effect=a.subprocess.CalledProcessError(125, ['docker'], stderr=(tag + ': not found').encode())):
             with self.assertRaises(a.subprocess.CalledProcessError):
-                a.publish(self.root, SHA, HARNESS, self.write(), self.contract, SHA)
+                a.remote_config(tag)
 
     def test_missing_lifecycle_contract(self):
         self.contract['migrations'] = {p: h for p, h in self.migrations.items() if 'lifecycle' not in p}

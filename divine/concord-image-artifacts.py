@@ -299,9 +299,12 @@ def remote_config(tag):
         raw = run(['docker', 'buildx', 'imagetools', 'inspect', '--raw', tag])
     except subprocess.CalledProcessError as error:
         # A failed read is not proof of absence. Require the registry's explicit
-        # not-found response before treating the immutable source tag as unused.
+        # manifest-unknown or exact-reference resolver response before treating
+        # the immutable source tag as unused. Generic "not found" diagnostics
+        # can describe a local helper or endpoint failure instead.
         stderr = (error.stderr or b'').decode() if isinstance(error.stderr, bytes) else (error.stderr or '')
-        if 'manifest unknown' in stderr.lower() or 'not found' in stderr.lower():
+        diagnostic = stderr.strip().removeprefix('ERROR: ')
+        if error.returncode == 1 and diagnostic in ('manifest unknown', tag + ': manifest unknown', tag + ': not found'):
             return None
         raise
     if '@sha256:' in tag:
