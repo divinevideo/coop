@@ -1,16 +1,56 @@
 /* eslint-disable max-lines */
 import { type Exception } from '@opentelemetry/api';
-import { type ItemIdentifier } from '@roostorg/types';
+import { type ItemIdentifier } from '@roostorg/coop-types';
+import { type Kysely } from 'kysely';
 import { type JsonObject, type ReadonlyDeep } from 'type-fest';
 
 import { type Dependencies } from '../iocContainer/index.js';
 import { inject } from '../iocContainer/utils.js';
+import { accessVerifier } from '../routes/concord/access.js';
+import { roomAttemptNotRecorded } from '../routes/concord/attemptOutcome.js';
+import { roomActor } from '../routes/concord/authorization.js';
+import { deliverManualRoomOperation } from '../routes/concord/manualRoomDelivery.js';
+import {
+  beginManualRoomOperation,
+  getManualRoomOperation,
+  manualRoomRequest,
+  retirePreparedManualRoomOperation,
+  type ManualOperationAccess,
+} from '../routes/concord/manualRoomOperations.js';
+import { prepareReversalMemberIntent } from '../routes/concord/memberIntentIdentity.js';
+import {
+  deliverMemberIntent,
+  memberIntentFingerprint,
+  prepareMemberIntent,
+  registerMemberIntents,
+  type MemberDeliveryOutcome,
+  type MemberIntentPg,
+} from '../routes/concord/memberIntents.js';
+import {
+  closeRoomExecution,
+  listRoomNeedsAttention,
+  stopRoomAutomation,
+} from '../routes/concord/roomDispositions.js';
+import {
+  deliverMrtRemoval,
+  storedRoomRemoval,
+} from '../routes/concord/roomRemovalDelivery.js';
+import {
+  isServerRoomOperationId,
+  loadConcordConfig,
+  roomAction,
+  roomExecutionId,
+  validateRoomActionPermission,
+  validRoomReason,
+  type RoomDecisionInput,
+} from '../routes/concord/service.js';
 import {
   type ActionExecutionCorrelationId,
   type ActionExecutionSourceType,
   type MatchingRule,
   type Policy,
 } from '../services/analyticsLoggers/index.js';
+import { makeSyntheticUserSubmission } from '../services/itemInvestigationService/index.js';
 import {
   getFieldValueForRole,
   itemSubmissionToItemSubmissionWithTypeIdentifier,
@@ -24,6 +64,7 @@ import {
 import { asyncIterableToArray } from '../utils/collections.js';
 import { getSourceType, type CorrelationId } from '../utils/correlationIds.js';
 import { jsonStringify } from '../utils/encoding.js';
+import { makeKyselyTransactionWithRetry } from '../utils/kyselyTransactionWithRetry.js';
 import { assertUnreachable, safePick, withRetries } from '../utils/misc.js';
 import { type RuleEnvironment } from './RuleEngine.js';
 
@@ -71,14 +112,16 @@ export type ActionResult<T extends ActionTargetItem> = {
   actionId: string;
   targetItem: T;
   success: boolean;
+  queueComplete?: boolean;
+  roomOutcome?: MemberDeliveryOutcome;
 };
 
 export function getUserFromActionTarget(it: ActionTargetItem) {
   return it.itemType.kind === 'USER'
     ? { id: it.itemId, typeId: it.itemType.id }
     : isFullSubmission(it)
-    ? it.creator
-    : undefined;
+      ? it.creator
+      : undefined;
 }
 
 /**
@@ -100,8 +143,8 @@ export function getUserFromActionTargetItem(it: ActionTargetItem) {
   return it.itemType.kind === 'USER'
     ? { id: it.itemId, typeId: it.itemType.id }
     : isFullSubmission(it)
-    ? it.creator
-    : undefined;
+      ? it.creator
+      : undefined;
 }
 
 /**
@@ -121,7 +164,205 @@ class ActionPublisher {
     private ncmecService: Dependencies['NcmecService'],
     private itemInvestigationService: Dependencies['ItemInvestigationService'],
     private userStrikeService: Dependencies['UserStrikeService'],
+    private getItemTypeEventuallyConsistent: Dependencies['getItemTypeEventuallyConsistent'],
+    private userAPIDataSource?: Dependencies['UserAPIDataSource'],
+    private readonly memberIntentPg?: Kysely<MemberIntentPg>,
   ) {}
+
+  async recordManualRoomIntent(
+    input: RoomDecisionInput,
+    callbackUrl: string | null | undefined,
+  ) {
+    if (!input.correlationId.startsWith('manual-action-run:'))
+      throw new Error('Manual staff operation required');
+    if (!this.memberIntentPg || !this.userAPIDataSource)
+      throw new Error('Membership intent storage unavailable');
+    const config = loadConcordConfig(process.env);
+    if (callbackUrl !== config.origin + '/v1/decisions')
+      throw new Error('Membership callback configuration unavailable');
+    const prior = await this.memberIntentPg
+      .selectFrom('concord_integration.member_intents')
+      .selectAll()
+      .where('org_id', '=', input.orgId)
+      .where('source_id', '=', input.correlationId)
+      .executeTakeFirst();
+    if (prior) {
+      // A duplicate operation must preserve its original target and payload even after case expiry.
+      if (
+        prior.fingerprint !==
+        memberIntentFingerprint(
+          input.priorDecisionId
+            ? input
+            : { ...input, caseId: input.caseId || prior.case_id || undefined },
+          prior.target_key,
+        )
+      )
+        throw new Error('Membership execution intent conflict');
+      return;
+    }
+    if (!validRoomReason(input.note))
+      throw roomAttemptNotRecorded(new Error('Invalid room reason'));
+    validateRoomActionPermission(
+      await this.roomDependencies(config).getActor(
+        input.actorId ?? '',
+        input.orgId,
+      ),
+      input.actionName,
+      input.parameters ?? {},
+    );
+    const operationId = input.correlationId.slice('manual-action-run:'.length);
+    if (!isServerRoomOperationId(operationId, roomAction(input.actionName))) {
+      // Recovery of accepted legacy operations is lookup-only in the publisher.
+      return;
+    }
+    const request = await manualRoomRequest(
+      this.memberIntentPg,
+      this.roomDependencies(config),
+      input,
+    );
+    if (roomAction(input.actionName) === 'remove_message') return;
+    const prepared = await (
+      request.priorDecisionId
+        ? prepareReversalMemberIntent
+        : prepareMemberIntent
+    )(config, this.roomDependencies(config), request).catch(
+      (error: unknown) => {
+        // No registration transaction has started for this attempt.
+        throw roomAttemptNotRecorded(error);
+      },
+    );
+    await makeKyselyTransactionWithRetry(this.memberIntentPg)(async (tx) =>
+      registerMemberIntents(tx, [prepared]),
+    );
+  }
+
+  async beginRoomOperation(input: {
+    orgId: string;
+    actorId: string;
+    clientNonce: string;
+    request: Omit<RoomDecisionInput, 'correlationId'>;
+  }) {
+    if (!this.memberIntentPg)
+      throw new Error('Room receipt storage unavailable');
+    const config = loadConcordConfig(process.env);
+    return beginManualRoomOperation(
+      this.memberIntentPg,
+      config,
+      this.roomDependencies(config),
+      input,
+    );
+  }
+  async roomOperationStatus(access: ManualOperationAccess) {
+    if (!this.memberIntentPg)
+      throw new Error('Room receipt storage unavailable');
+    return getManualRoomOperation(
+      this.memberIntentPg,
+      this.roomDependencies(loadConcordConfig(process.env)),
+      access,
+    );
+  }
+  async retireRoomOperation(
+    access: ManualOperationAccess & { reason: string },
+  ) {
+    if (!this.memberIntentPg)
+      throw new Error('Room receipt storage unavailable');
+    return retirePreparedManualRoomOperation(
+      this.memberIntentPg,
+      this.roomDependencies(loadConcordConfig(process.env)),
+      access,
+    );
+  }
+
+  async authorizeRoomAccess(input: {
+    orgId: string;
+    actorId: string;
+    token?: string;
+    origin?: string;
+    mutation: boolean;
+  }) {
+    const config = loadConcordConfig(process.env);
+    const actor = await this.roomDependencies(config).getActor(
+      input.actorId,
+      input.orgId,
+    );
+    await accessVerifier(config, this.fetchHTTP)(input.token, actor.email);
+    if (input.mutation && input.origin !== config.coopOrigin)
+      throw new Error('Same-origin staff request required');
+  }
+  async roomNeedsAttention(input: {
+    orgId: string;
+    actorId: string;
+    cursor?: string;
+    limit: number;
+  }) {
+    if (!this.memberIntentPg) throw new Error('Room storage unavailable');
+    return listRoomNeedsAttention(
+      this.memberIntentPg,
+      this.roomDependencies(loadConcordConfig(process.env)),
+      input,
+    );
+  }
+  async roomDisposition(
+    input: {
+      orgId: string;
+      actorId: string;
+      executionId: string;
+      manualReviewDecisionId?: string;
+      reason: string;
+    },
+    close: boolean,
+  ) {
+    if (!this.memberIntentPg) throw new Error('Room storage unavailable');
+    return (close ? closeRoomExecution : stopRoomAutomation)(
+      this.memberIntentPg,
+      this.roomDependencies(loadConcordConfig(process.env)),
+      input,
+    );
+  }
+  async reverseRoomDecision(input: {
+    orgId: string;
+    actorId: string;
+    clientNonce: string;
+    request: Omit<RoomDecisionInput, 'correlationId'>;
+  }) {
+    if (!this.memberIntentPg) throw new Error('Room storage unavailable');
+    const status = await this.beginRoomOperation(input);
+    const request = {
+      ...input.request,
+      correlationId: `manual-action-run:${status.operationId}`,
+    };
+    await this.recordManualRoomIntent(
+      request,
+      loadConcordConfig(process.env).origin + '/v1/decisions',
+    );
+    await deliverManualRoomOperation(
+      this.memberIntentPg,
+      loadConcordConfig(process.env),
+      this.roomDependencies(loadConcordConfig(process.env)),
+      request,
+    );
+    return this.roomOperationStatus({
+      orgId: input.orgId,
+      actorId: input.actorId,
+      operationId: status.operationId,
+    });
+  }
+
+  private roomDependencies(config: ReturnType<typeof loadConcordConfig>) {
+    return {
+      fetchHTTP: this.fetchHTTP,
+      getActor: async (id: string, orgId: string) =>
+        roomActor(
+          {
+            UserAPIDataSource: this.userAPIDataSource!,
+            ManualReviewToolService: this.manualReviewToolService,
+          },
+          config,
+          id,
+          orgId,
+        ),
+    };
+  }
 
   /**
    * Publishes a set of actions.
@@ -169,7 +410,23 @@ class ActionPublisher {
       actorId,
       actorEmail,
       actorNote,
+      decisionReason,
     } = executionContext;
+
+    // Resolve the action user once and reuse it for both `creator` and the
+    // strike total. Only needed when a CUSTOM_ACTION webhook will carry them.
+    const hasWebhook = triggeredActions.some(
+      (it) => it.action.actionType === ActionType.CUSTOM_ACTION,
+    );
+    const { user: actionUser, isDirect: isDirectUser } = hasWebhook
+      ? await this.resolveActionUser(orgId, targetItem)
+      : { user: undefined, isDirect: false };
+    const userStrikeCount = await this.getUserStrikeCountForWebhook(
+      orgId,
+      actionUser,
+      isDirectUser,
+      triggeredActions,
+    );
 
     // Apply user strikes from the actions that were triggered.
     // we do this without awaiting to not block the action publishing
@@ -233,11 +490,18 @@ class ActionPublisher {
                 reportedItems,
                 relatedRules,
                 customMrtApiParamDecisionPayload,
-                actorNote,
+                actorNote ??
+                  (action.name.startsWith('concord_')
+                    ? executionContext.decisionReason
+                    : undefined),
+                decisionReason,
+                userStrikeCount,
+                actionUser,
+                actorId,
               );
             },
           );
-          const success = await (async () => {
+          const outcome = await (async () => {
             try {
               return await publishActionWithRetries();
             } catch (e) {
@@ -245,6 +509,17 @@ class ActionPublisher {
             }
           })();
 
+          const success =
+            typeof outcome === 'boolean'
+              ? outcome
+              : outcome.outcome === 'accepted';
+          const queueComplete =
+            typeof outcome === 'boolean'
+              ? outcome
+              : outcome.outcome === 'accepted' ||
+                outcome.outcome === 'refused' ||
+                outcome.outcome === 'stopped' ||
+                !outcome.acceptanceUnknown;
           await this.actionExecutionLogger.logActionExecutions({
             executions: [
               {
@@ -267,9 +542,7 @@ class ActionPublisher {
                 // Audit-trail context: persist what the moderator supplied
                 // alongside the action itself so reviewers can see why and
                 // with what values it ran (PR 3 for #377).
-                parameterValues: customMrtApiParamDecisionPayload as
-                  | Record<string, unknown>
-                  | undefined,
+                parameterValues: customMrtApiParamDecisionPayload,
                 actorNote,
               },
             ],
@@ -279,12 +552,88 @@ class ActionPublisher {
 
           return {
             success,
+            queueComplete,
+            ...(typeof outcome === 'boolean' ? {} : { roomOutcome: outcome }),
             targetItem: executionContext.targetItem,
             actionId: action.id,
           };
         },
       ),
     ]);
+  }
+
+  /**
+   * Resolves the user a webhook action concerns, once per batch. `isDirect` is
+   * true when the target resolves the way the strike service resolves it (USER
+   * target or a full submission's creator); for identifier-only CONTENT we fall
+   * back to fetching the latest submission's creator (`isDirect` false).
+   * Best-effort: a failed fetch yields no user rather than throwing.
+   */
+  private async resolveActionUser(
+    orgId: string,
+    targetItem: ActionTargetItem,
+  ): Promise<{ user: ItemIdentifier | undefined; isDirect: boolean }> {
+    const directUser = getUserFromActionTargetItem(targetItem);
+    if (directUser) {
+      return { user: directUser, isDirect: true };
+    }
+    if (targetItem.itemType.kind !== 'CONTENT') {
+      return { user: undefined, isDirect: false };
+    }
+    if (isFullSubmission(targetItem)) {
+      return { user: targetItem.creator, isDirect: false };
+    }
+    try {
+      const submission = (
+        await this.itemInvestigationService.getItemByIdentifier({
+          orgId,
+          itemIdentifier: {
+            id: targetItem.itemId,
+            typeId: targetItem.itemType.id,
+          },
+          latestSubmissionOnly: true,
+        })
+      )?.latestSubmission;
+      return { user: submission?.creator, isDirect: false };
+    } catch {
+      return { user: undefined, isDirect: false };
+    }
+  }
+
+  /**
+   * The user's cumulative strike total after this event (current total + strikes
+   * this event applies), for CUSTOM_ACTION webhooks. The applied delta is only
+   * added when the user resolved directly (`isDirect`) — i.e. when the strike
+   * service actually applies a strike. Best-effort; undefined when unresolvable.
+   */
+  private async getUserStrikeCountForWebhook<
+    T extends ActionExecutionCorrelationId,
+  >(
+    orgId: string,
+    user: ItemIdentifier | undefined,
+    isDirect: boolean,
+    triggeredActions: Omit<
+      Omit<ActionExecutionData<T>, 'action'> & { action: Action },
+      'orgId' | 'correlationId' | 'targetItem'
+    >[],
+  ): Promise<number | undefined> {
+    if (!user) {
+      return undefined;
+    }
+    try {
+      const currentTotal = await this.userStrikeService.getUserStrikeValue(
+        orgId,
+        user,
+      );
+      const appliedStrikes = isDirect
+        ? (this.userStrikeService.findMostSeverePolicyViolationFromActions(
+            triggeredActions,
+          )?.userStrikeCount ?? 0)
+        : 0;
+      return currentTotal + appliedStrikes;
+    } catch {
+      return undefined;
+    }
   }
 
   async publishAction(
@@ -303,7 +652,11 @@ class ActionPublisher {
       string | boolean | unknown
     >,
     actorNote?: string,
-  ): Promise<boolean> {
+    decisionReason?: string,
+    userStrikeCount?: number,
+    creator?: ItemIdentifier,
+    actorId?: string,
+  ): Promise<boolean | MemberDeliveryOutcome> {
     return this.tracer.addActiveSpan(
       { resource: 'actionPublisher', operation: 'publishAction' },
       // eslint-disable-next-line complexity
@@ -327,12 +680,179 @@ class ActionPublisher {
             })
           )?.latestSubmission;
         };
+
+        // USER target with no record: synthesize a minimal submission from
+        // the id. Returns undefined for non-USER targets — MRT needs the
+        // real content submission, so it must fail loudly for CONTENT.
+        const getFullItemOrSyntheticUserForUserTarget = async () => {
+          const fullItem = await getFullItem();
+          if (fullItem) {
+            return fullItem;
+          }
+          if (targetItem.itemType.kind !== 'USER') {
+            return undefined;
+          }
+          const userItemType = await this.getItemTypeEventuallyConsistent({
+            orgId,
+            typeSelector: { id: targetItem.itemType.id },
+          });
+          if (!userItemType || userItemType.kind !== 'USER') {
+            return undefined;
+          }
+          return makeSyntheticUserSubmission(targetItem.itemId, userItemType);
+        };
+
+        // NCMEC fallback: USER target → synthetic user (as above); CONTENT
+        // target → resolve the creator via ACTION_EXECUTIONS and synthesize a
+        // user submission keyed on the creator id. THREAD has no single
+        // owner, so we refuse.
+        const getFullItemOrSyntheticUserForNcmec = async () => {
+          const userTarget = await getFullItemOrSyntheticUserForUserTarget();
+          if (userTarget) {
+            return userTarget;
+          }
+          if (targetItem.itemType.kind !== 'CONTENT') {
+            return undefined;
+          }
+          const inferred =
+            await this.itemInvestigationService.synthesizeUserItemFromContentTarget(
+              {
+                orgId,
+                itemId: targetItem.itemId,
+                itemTypeId: targetItem.itemType.id,
+              },
+            );
+          return inferred?.latestSubmission;
+        };
         const actionSource = getSourceType(
           correlationId,
         ) as ActionExecutionSourceType;
         try {
           switch (action.actionType) {
             case ActionType.CUSTOM_ACTION:
+              if (action.name.startsWith('concord_')) {
+                const config = loadConcordConfig(process.env);
+                if (
+                  action.callbackUrl !== config.origin + '/v1/decisions' ||
+                  !this.userAPIDataSource
+                )
+                  return false;
+                const kind = roomAction(action.name);
+                const isMembership =
+                  kind === 'ban_member' || kind === 'unban_member';
+                const recorded =
+                  isMembership && this.memberIntentPg
+                    ? await this.memberIntentPg
+                        .selectFrom('concord_integration.member_intents')
+                        .selectAll()
+                        .where('org_id', '=', orgId)
+                        .where(
+                          'execution_id',
+                          '=',
+                          roomExecutionId({
+                            orgId,
+                            correlationId: String(correlationId),
+                            actionId: action.id,
+                            itemId: targetItem.itemId,
+                            itemTypeId: targetItem.itemType.id,
+                          } as RoomDecisionInput),
+                        )
+                        .executeTakeFirst()
+                    : undefined;
+                const receipt =
+                  String(correlationId).startsWith('manual-action-run:') &&
+                  this.memberIntentPg
+                    ? await this.memberIntentPg
+                        .selectFrom(
+                          'concord_integration.room_manual_operations',
+                        )
+                        .selectAll()
+                        .where('org_id', '=', orgId)
+                        .where(
+                          'operation_id',
+                          '=',
+                          String(correlationId).slice(
+                            'manual-action-run:'.length,
+                          ),
+                        )
+                        .executeTakeFirst()
+                    : undefined;
+                const removal =
+                  !isMembership &&
+                  this.memberIntentPg &&
+                  String(correlationId).startsWith('mrt-decision:')
+                    ? await storedRoomRemoval(
+                        this.memberIntentPg,
+                        orgId,
+                        roomExecutionId({
+                          orgId,
+                          correlationId: String(correlationId),
+                          actionId: action.id,
+                          itemId: targetItem.itemId,
+                          itemTypeId: targetItem.itemType.id,
+                        } as RoomDecisionInput),
+                      )
+                    : undefined;
+                const item =
+                  recorded || receipt || removal
+                    ? undefined
+                    : await getFullItem();
+                const caseId =
+                  recorded?.case_id ??
+                  receipt?.case_id ??
+                  removal?.request_payload.caseId ??
+                  item?.data.case_id;
+                if (typeof caseId !== 'string') return false;
+                const input: RoomDecisionInput = {
+                  orgId,
+                  actionId: action.id,
+                  actionName: action.name,
+                  itemId: targetItem.itemId,
+                  itemTypeId: targetItem.itemType.id,
+                  itemTypeName: targetItem.itemType.name,
+                  caseId,
+                  correlationId: String(correlationId),
+                  actorId,
+                  note: actorNote,
+                  parameters:
+                    customMrtApiParamDecisionPayload?.discordGuildConfirmed ===
+                    undefined
+                      ? {}
+                      : {
+                          discordGuildConfirmed:
+                            customMrtApiParamDecisionPayload.discordGuildConfirmed,
+                        },
+                };
+                if (String(correlationId).startsWith('manual-action-run:')) {
+                  if (!this.memberIntentPg)
+                    throw new Error('Room receipt storage unavailable');
+                  return await deliverManualRoomOperation(
+                    this.memberIntentPg,
+                    config,
+                    this.roomDependencies(config),
+                    input,
+                  );
+                }
+                if (isMembership) {
+                  if (!this.memberIntentPg)
+                    throw new Error('Membership intent storage unavailable');
+                  return await deliverMemberIntent(
+                    this.memberIntentPg,
+                    config,
+                    this.roomDependencies(config),
+                    input,
+                  );
+                } else {
+                  if (!this.memberIntentPg)
+                    throw new Error('Room disposition storage unavailable');
+                  return await deliverMrtRemoval(
+                    this.memberIntentPg,
+                    config,
+                    this.roomDependencies(config),
+                    input,
+                  );
+                }
+              }
               const customHeaders = action.callbackUrlHeaders;
               const customBody = action.callbackUrlBody;
 
@@ -356,6 +876,13 @@ class ActionPublisher {
                 // can't collide with a user-defined parameter named
                 // `actorNote`. Omitted from the body entirely when absent.
                 ...(actorNote !== undefined ? { actorNote } : {}),
+                ...(creator !== undefined ? { creator } : {}),
+                // The moderator's decision reason, top-level for the same
+                // collision-safety reason as `actorNote`. Omitted when absent.
+                ...(decisionReason !== undefined ? { decisionReason } : {}),
+                // The user's cumulative strike total after this event. Omitted
+                // when there's no resolvable user.
+                ...(userStrikeCount !== undefined ? { userStrikeCount } : {}),
               };
 
               const response = await this.fetchHTTP({
@@ -391,11 +918,14 @@ class ActionPublisher {
               }
 
               return true;
-            case ActionType.ENQUEUE_TO_MRT:
-              const fullItemForMrt = await getFullItem();
+            case ActionType.ENQUEUE_TO_MRT: {
+              const fullItemForMrt =
+                await getFullItemOrSyntheticUserForUserTarget();
               if (!fullItemForMrt) {
                 throw new Error(
-                  "Actions without full item submissions can't be enqueued to MRT yet",
+                  `Cannot enqueue to MRT: no submission record for ${targetItem.itemType.kind} ` +
+                    `item ${targetItem.itemId} (type ${targetItem.itemType.id}). ` +
+                    `POST the item to the items endpoint first.`,
                 );
               }
 
@@ -432,11 +962,15 @@ class ActionPublisher {
               });
 
               return true;
-            case ActionType.ENQUEUE_TO_NCMEC:
-              const fullItemForNcmec = await getFullItem();
+            }
+            case ActionType.ENQUEUE_TO_NCMEC: {
+              const fullItemForNcmec =
+                await getFullItemOrSyntheticUserForNcmec();
               if (!fullItemForNcmec) {
                 throw new Error(
-                  "Actions without full item submissions can't be enqueued to NCMEC yet",
+                  `Cannot enqueue to NCMEC: no submission record for ${targetItem.itemType.kind} ` +
+                    `item ${targetItem.itemId} (type ${targetItem.itemType.id}). ` +
+                    `POST the item to the items endpoint first.`,
                 );
               }
 
@@ -465,6 +999,7 @@ class ActionPublisher {
               });
 
               return true;
+            }
             case ActionType.ENQUEUE_AUTHOR_TO_MRT:
               const fullItemForAuthor = await getFullItem();
               if (
@@ -575,6 +1110,23 @@ class ActionPublisher {
           }
         } catch (e) {
           span.recordException(e as Exception);
+          // Log to stderr so operators see action failures without having
+          // to pull traces. Identifiers only, no item `data`.
+          // eslint-disable-next-line no-console
+          console.error(
+            jsonStringify({
+              event: 'actionPublisher.publishAction.failed',
+              orgId,
+              actionId: action.id,
+              actionName: action.name,
+              actionType: action.actionType,
+              itemId: targetItem.itemId,
+              itemTypeId: targetItem.itemType.id,
+              itemTypeKind: targetItem.itemType.kind,
+              correlationId,
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          );
           return false;
         }
       },
@@ -592,6 +1144,9 @@ export default inject(
     'NcmecService',
     'ItemInvestigationService',
     'UserStrikeService',
+    'getItemTypeEventuallyConsistent',
+    'UserAPIDataSource',
+    'KyselyPg',
   ],
   ActionPublisher,
 );

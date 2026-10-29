@@ -1,19 +1,24 @@
 /* eslint-disable max-lines */
 
 import { type Exception } from '@opentelemetry/api';
-import { makeEnumLike } from '@roostorg/types';
-
+import { makeEnumLike } from '@roostorg/coop-types';
 import { type Kysely } from 'kysely';
+import { type JsonObject } from 'type-fest';
 import { uid } from 'uid';
 
 import { inject, type Dependencies } from '../../iocContainer/index.js';
-import { type Backtest } from '../../models/rules/BacktestModel.js';
+import { safeGetEnvInt } from '../../iocContainer/utils.js';
 import { type ActionCountsInput } from '../../services/actionStatisticsService/index.js';
 import { type AggregationClause } from '../../services/aggregationsService/index.js';
 import { type ConditionSetWithResultAsLogged } from '../../services/analyticsLoggers/index.js';
 import { type CombinedPg } from '../../services/combinedDbTypes.js';
 import {
+  makeRuleHasRunningBacktestsError,
+  makeRuleIsMissingContentTypeError,
+  makeRuleNameExistsError,
+  parseStoredParameters,
   RuleType,
+  validateActionParameterValues,
   type Condition,
   type ConditionInput,
   type ConditionSet,
@@ -22,24 +27,30 @@ import {
   type RuleStatus,
 } from '../../services/moderationConfigService/index.js';
 import {
-  makeRuleHasRunningBacktestsError,
-  makeRuleIsMissingContentTypeError,
-  makeRuleNameExistsError,
-} from '../../services/moderationConfigService/index.js';
-import {
   isSignalId,
   signalIsExternal,
   type SignalId,
 } from '../../services/signalsService/index.js';
 import {
-  type DataWarehousePublicSchema,
   warehouseDateToDate,
+  type DataWarehousePublicSchema,
 } from '../../storage/dataWarehouse/warehouseSchema.js';
 import { toCorrelationId } from '../../utils/correlationIds.js';
-import { jsonParse, jsonStringify, tryJsonParse } from '../../utils/encoding.js';
-import { makeNotFoundError } from '../../utils/errors.js';
+import {
+  jsonParse,
+  jsonStringify,
+  tryJsonParse,
+} from '../../utils/encoding.js';
+import { makeBadRequestError, makeNotFoundError } from '../../utils/errors.js';
+import { isUniqueViolationError } from '../../utils/kysely.js';
+import {
+  makeKyselyTransactionWithRetry,
+  type KyselyTransactionWithRetry,
+} from '../../utils/kyselyTransactionWithRetry.js';
+import { logErrorJson } from '../../utils/logging.js';
 import { assertUnreachable } from '../../utils/misc.js';
 import { takeLast } from '../../utils/sql.js';
+import { DAY_MS } from '../../utils/time.js';
 import {
   type NonEmptyString,
   type RequiredWithoutNull,
@@ -56,9 +67,11 @@ import {
   type GQLUpdateContentRuleInput,
   type GQLUpdateUserRuleInput,
 } from '../generated.js';
+import { unauthenticatedError } from '../utils/errors.js';
 import { oneOfInputToTaggedUnion } from '../utils/inputHelpers.js';
 import { type CursorInfo, type Edge } from '../utils/paginationHandler.js';
 import { buildGraphqlRuleParent } from './buildGraphqlRuleParent.js';
+import { locationAreaInputToLocationArea } from './LocationBankApi.js';
 import {
   kyselyCancelRunningBacktestsForRule,
   kyselyCreateRule,
@@ -66,18 +79,12 @@ import {
   kyselyHasRunningBacktestsForRule,
   kyselyListBacktestsForRule,
   kyselyUpdateRule,
+  type GraphQLBacktestParent,
 } from './ruleKyselyPersistence.js';
 import {
-  type GraphQLUserParent,
   kyselyUserFindByIdAndOrg,
+  type GraphQLUserParent,
 } from './userKyselyPersistence.js';
-import { locationAreaInputToLocationArea } from './LocationBankApi.js';
-import { unauthenticatedError } from '../utils/errors.js';
-import { isUniqueViolationError } from '../../utils/kysely.js';
-import {
-  makeKyselyTransactionWithRetry,
-  type KyselyTransactionWithRetry,
-} from '../../utils/kyselyTransactionWithRetry.js';
 
 /**
  * Normalize the GraphQL `expirationTime` input scalar into a shape our
@@ -323,7 +330,10 @@ class RuleAPI {
   }
 
   async getGraphQLRuleFromId(id: string, orgId: string) {
-    const plain = await this.moderationConfigService.getRuleByIdAndOrg(id, orgId);
+    const plain = await this.moderationConfigService.getRuleByIdAndOrg(
+      id,
+      orgId,
+    );
     if (plain == null) {
       throw unauthenticatedError('User not authenticated to fetch this rule');
     }
@@ -363,6 +373,46 @@ class RuleAPI {
     );
   }
 
+  // Validates configured parameter values against each action's spec and
+  // returns the `actionId -> values` map persistence expects. Throws (surfaced
+  // to the admin) on invalid values; ignores entries for unattached actions.
+  private async buildRuleActionParametersMap(
+    orgId: string,
+    actionIds: readonly string[],
+    actionParameters:
+      | readonly { actionId: string; parameters: unknown }[]
+      | null
+      | undefined,
+  ): Promise<ReadonlyMap<string, JsonObject> | undefined> {
+    if (actionIds.length === 0) {
+      return undefined;
+    }
+    const paramsByActionId = new Map(
+      (actionParameters ?? []).map((it) => [it.actionId, it.parameters]),
+    );
+    const actions = await this.moderationConfigService.getActions({
+      orgId,
+      ids: [...actionIds],
+    });
+    const out = new Map<string, JsonObject>();
+    for (const action of actions) {
+      const spec = parseStoredParameters(
+        action.actionType === 'CUSTOM_ACTION'
+          ? action.customMrtApiParams
+          : null,
+      );
+      if (spec.length === 0) {
+        continue;
+      }
+      const rawValues = paramsByActionId.get(action.id) ?? null;
+      const validated = validateActionParameterValues(spec, rawValues);
+      if (Object.keys(validated).length > 0) {
+        out.set(action.id, validated as JsonObject);
+      }
+    }
+    return out.size > 0 ? out : undefined;
+  }
+
   private async createRule(
     input:
       | (GQLCreateContentRuleInput & { ruleType: typeof RuleType.CONTENT })
@@ -376,6 +426,7 @@ class RuleAPI {
       status,
       conditionSet,
       actionIds,
+      actionParameters,
       policyIds,
       tags,
       ruleType,
@@ -383,6 +434,12 @@ class RuleAPI {
       expirationTime,
       parentId,
     } = input;
+
+    const actionParametersMap = await this.buildRuleActionParametersMap(
+      orgId,
+      actionIds,
+      actionParameters,
+    );
 
     const contentTypeIds: readonly string[] =
       input.ruleType === RuleType.CONTENT ? input.contentTypeIds : [];
@@ -414,6 +471,7 @@ class RuleAPI {
           ruleType,
           parentId,
           actionIds,
+          actionParameters: actionParametersMap,
           policyIds,
           contentTypeIds,
         });
@@ -468,6 +526,7 @@ class RuleAPI {
       status,
       conditionSet,
       actionIds,
+      actionParameters,
       policyIds,
       tags,
       ruleType,
@@ -520,6 +579,20 @@ class RuleAPI {
       await this.validateSignalsAllowedInAutomatedRules(conditionSet, orgId);
     }
 
+    // Parameters are persisted alongside the action attachments, so updating
+    // them without also setting actionIds would silently drop them.
+    if (actionParameters != null && actionIds == null) {
+      throw makeBadRequestError(
+        'actionParameters can only be updated when actionIds is also provided',
+        { shouldErrorSpan: true },
+      );
+    }
+    const actionParametersMap = await this.buildRuleActionParametersMap(
+      orgId,
+      actionIds ?? [],
+      actionParameters,
+    );
+
     // Before we actually send any updates (which will happen as soon as we call
     // setXXX to set the associations), we need to make sure that there are no
     // active backtests for this rule because, if there are, we should fail the
@@ -536,10 +609,9 @@ class RuleAPI {
     // use SERIALIZABLE to make the update + backtest cancelation logically
     // linearizable w/r/t concurrently started backtests, but that's overkill.
     try {
-      await this.kysely
-        .transaction()
-        .setIsolationLevel('repeatable read')
-        .execute(async (trx) => {
+      await this.kyselyTransactionWithRetry(
+        { isolationLevel: 'repeatable read' },
+        async (trx) => {
           await kyselyUpdateRule(trx, {
             id,
             orgId,
@@ -556,35 +628,41 @@ class RuleAPI {
             expirationTime: normalizeExpirationInput(expirationTime),
             parentId,
             actionIds: actionIds ?? undefined,
+            actionParameters: actionParametersMap,
             policyIds: policyIds ?? undefined,
             contentTypeIds: contentTypeIds ?? undefined,
           });
           if (cancelRunningBacktests) {
             await kyselyCancelRunningBacktestsForRule(trx, id);
           }
-        });
+        },
+      );
     } catch (e) {
       throw isUniqueViolationError(e)
         ? makeRuleNameExistsError({ shouldErrorSpan: true })
         : e;
     }
 
-    const plain = await this.moderationConfigService.getRuleByIdAndOrg(id, orgId, {
-      readFromReplica: false,
-    });
+    const plain = await this.moderationConfigService.getRuleByIdAndOrg(
+      id,
+      orgId,
+      {
+        readFromReplica: false,
+      },
+    );
     if (plain == null) {
       throw new Error('Rule was updated but could not be reloaded');
     }
     return buildGraphqlRuleParent(plain, this.graphQlRuleParentDeps);
   }
 
-  async deleteRule(opts: { id: string; orgId: string }) {
+  async deleteRule(opts: { id: string; orgId: string }): Promise<boolean> {
     const { id, orgId } = opts;
 
     try {
-      await this.kysely.transaction().execute(async (trx) => {
-        await kyselyDeleteRule(trx, id, orgId);
-      });
+      return await this.kyselyTransactionWithRetry(async (trx) =>
+        kyselyDeleteRule(trx, id, orgId),
+      );
     } catch (exception) {
       const activeSpan = this.tracer.getActiveSpan();
       if (activeSpan?.isRecording()) {
@@ -592,32 +670,58 @@ class RuleAPI {
       }
       return false;
     }
-    return true;
   }
 
   async getAllRuleInsights(orgId: string) {
-    const results = await Promise.allSettled([
-      this.actionStats.getActionedSubmissionCountsByDay(orgId),
-      this.actionStats.getActionedSubmissionCountsByPolicyByDay(orgId),
-      this.actionStats.getActionedSubmissionCountsByTagByDay(orgId),
-      this.actionStats.getActionedSubmissionCountsByActionByDay(orgId),
-      this.ruleInsights.getContentSubmissionCountsByDay(orgId),
-    ]);
+    // Each of these scans ACTION_EXECUTIONS over the lookback window. Run them
+    // sequentially so peak ClickHouse memory is one query's worth rather than
+    // all five at once, and bound the window (env-tunable, default 90 days) so
+    // a memory-constrained instance scans far less than a full year. The client
+    // filters further client-side and defaults to a one-week view.
+    const lookbackDays = safeGetEnvInt(
+      'CLICKHOUSE_RULE_INSIGHTS_LOOKBACK_DAYS',
+      90,
+    );
+    const startAt = new Date(Date.now() - lookbackDays * DAY_MS);
 
-    const valueOrEmpty = <T>(
-      r: PromiseSettledResult<readonly T[]>,
-    ): readonly T[] => (r.status === 'fulfilled' ? r.value : []);
+    const runSafely = async <T>(
+      fn: () => Promise<readonly T[]>,
+    ): Promise<readonly T[]> => {
+      try {
+        return await fn();
+      } catch (err) {
+        // eslint-disable-next-line no-restricted-syntax
+        logErrorJson({ message: 'rule insights query failed', error: err });
+        return [];
+      }
+    };
+
+    const actionedSubmissionsByDay = await runSafely(async () =>
+      this.actionStats.getActionedSubmissionCountsByDay(orgId, startAt),
+    );
+    const actionedSubmissionsByPolicyByDay = await runSafely(async () =>
+      this.actionStats.getActionedSubmissionCountsByPolicyByDay(orgId, startAt),
+    );
+    const actionedSubmissionsByTagByDay = await runSafely(async () =>
+      this.actionStats.getActionedSubmissionCountsByTagByDay(orgId, startAt),
+    );
+    const actionedSubmissionsByActionByDay = await runSafely(async () =>
+      this.actionStats.getActionedSubmissionCountsByActionByDay(orgId, startAt),
+    );
+    const totalSubmissionsByDay = await runSafely(
+      async () =>
+        this.ruleInsights.getContentSubmissionCountsByDay(
+          orgId,
+          startAt,
+        ) as Promise<readonly { date: string; count: number }[]>,
+    );
 
     return {
-      actionedSubmissionsByDay: valueOrEmpty(results[0]),
-      actionedSubmissionsByPolicyByDay: valueOrEmpty(results[1]),
-      actionedSubmissionsByTagByDay: valueOrEmpty(results[2]),
-      actionedSubmissionsByActionByDay: valueOrEmpty(results[3]),
-      totalSubmissionsByDay: valueOrEmpty(
-        results[4] as PromiseSettledResult<
-          readonly { date: string; count: number }[]
-        >,
-      ),
+      actionedSubmissionsByDay,
+      actionedSubmissionsByPolicyByDay,
+      actionedSubmissionsByTagByDay,
+      actionedSubmissionsByActionByDay,
+      totalSubmissionsByDay,
     };
   }
 
@@ -670,7 +774,7 @@ class RuleAPI {
   async createBacktest(
     _input: GQLCreateBacktestInput,
     _user: GraphQLUserParent,
-  ): Promise<Backtest> {
+  ): Promise<GraphQLBacktestParent> {
     throw new Error(
       'createBacktest is temporarily disabled (TODO BACKTEST_RETROACTION: no UI / env to validate).',
     );
@@ -735,9 +839,7 @@ class RuleAPI {
     // have to use our helper that implements "takeLast" in SQL.
     const finalQuery =
       takeFrom === 'start'
-        ? filteredResultsQuery
-            .orderBy('ts', desiredSort.order)
-            .limit(count)
+        ? filteredResultsQuery.orderBy('ts', desiredSort.order).limit(count)
         : takeLast(this.warehouse, filteredResultsQuery, [desiredSort], count);
 
     const results = await finalQuery.execute();
@@ -751,7 +853,7 @@ class RuleAPI {
         itemTypeId: it.itemTypeId,
         userId: it.userId ?? undefined,
         userTypeId: it.userTypeId ?? undefined,
-        content: (it.content ?? '') as string,
+        content: it.content ?? '',
         result: it.result ? jsonParse(it.result) : null,
         environment: it.environment as RuleStatus,
         passed: it.passed,

@@ -1,15 +1,19 @@
-import type { ItemIdentifier } from '@roostorg/types';
+import type { ItemIdentifier } from '@roostorg/coop-types';
 
-import {
-  type ContentApiRequestRecord,
-  type ContentApiRequestCountRecord,
-  type ContentApiImageCountRecord,
-  type ContentApiRequestQueryOptions,
-  type IContentApiRequestsAdapter,
-} from './IContentApiRequestsAdapter.js';
 import type { IDataWarehouse } from '../../../storage/dataWarehouse/IDataWarehouse.js';
 import type SafeTracer from '../../../utils/SafeTracer.js';
+import { SIX_MONTHS_MS } from '../../../utils/time.js';
 import { formatClickhouseQuery } from '../utils/clickhouseSql.js';
+import {
+  type ContentApiImageCountRecord,
+  type ContentApiRequestByIpRecord,
+  type ContentApiRequestCountRecord,
+  type ContentApiRequestQueryOptions,
+  type ContentApiRequestRecord,
+  type IContentApiRequestsAdapter,
+  type InferredUserIdentityFromCreatorsInput,
+  type InferredUserIdentityFromCreatorsRecord,
+} from './IContentApiRequestsAdapter.js';
 
 interface ClickhouseContentApiRow {
   item_data: unknown;
@@ -21,14 +25,22 @@ interface ClickhouseContentApiRow {
   item_type_schema_variant: string;
 }
 
+interface ClickhouseContentApiByIpRow extends ClickhouseContentApiRow {
+  item_id: string;
+  item_type_id: string;
+}
+
 interface CountRow {
   date: string;
   count: number;
 }
 
-export class ClickhouseContentApiRequestsAdapter
-  implements IContentApiRequestsAdapter
-{
+interface ClickhouseInferredUserRow {
+  ts: string;
+  item_creator_type_id: string | null;
+}
+
+export class ClickhouseContentApiRequestsAdapter implements IContentApiRequestsAdapter {
   constructor(
     private readonly warehouse: IDataWarehouse,
     private readonly tracer: SafeTracer,
@@ -39,12 +51,10 @@ export class ClickhouseContentApiRequestsAdapter
     item: ItemIdentifier,
     options?: ContentApiRequestQueryOptions,
   ): Promise<ReadonlyArray<ContentApiRequestRecord>> {
-    const { latestOnly = false, lookbackWindowMs = 6 * 30 * 24 * 60 * 60 * 1000 } =
+    const { latestOnly = false, lookbackWindowMs = SIX_MONTHS_MS } =
       options ?? {};
 
-    const lookbackStart = new Date(
-      Date.now() - Math.max(1, lookbackWindowMs),
-    );
+    const lookbackStart = new Date(Date.now() - Math.max(1, lookbackWindowMs));
     const lookbackStartDate = lookbackStart.toISOString().slice(0, 10);
 
     const conditions = [
@@ -55,12 +65,7 @@ export class ClickhouseContentApiRequestsAdapter
       'ds >= toDate(?)',
     ];
 
-    const params: unknown[] = [
-      orgId,
-      item.id,
-      item.typeId,
-      lookbackStartDate,
-    ];
+    const params: unknown[] = [orgId, item.id, item.typeId, lookbackStartDate];
 
     const sql = `
       SELECT
@@ -80,6 +85,65 @@ export class ClickhouseContentApiRequestsAdapter
     const rows = (await this.query(sql, params)) as ClickhouseContentApiRow[];
 
     return rows.map<ContentApiRequestRecord>((row) => ({
+      submissionId: row.submission_id,
+      itemData: row.item_data,
+      itemTypeVersion: row.item_type_version,
+      itemTypeSchemaVariant: row.item_type_schema_variant,
+      itemCreatorId: row.item_creator_id,
+      itemCreatorTypeId: row.item_creator_type_id,
+      occurredAt: new Date(row.ts),
+    }));
+  }
+
+  async getSuccessfulRequestsByIpAddress(
+    orgId: string,
+    ipAddress: string,
+    options?: ContentApiRequestQueryOptions,
+  ): Promise<ReadonlyArray<ContentApiRequestByIpRecord>> {
+    const { lookbackWindowMs = SIX_MONTHS_MS, limit } = options ?? {};
+
+    const lookbackStart = new Date(Date.now() - Math.max(1, lookbackWindowMs));
+    const lookbackStartDate = lookbackStart.toISOString().slice(0, 10);
+
+    // Bound the result set so a high-volume IP can't pull an unbounded number of
+    // rows into memory. Only apply when the caller asks for a positive cap.
+    const hasLimit =
+      typeof limit === 'number' && Number.isFinite(limit) && limit > 0;
+
+    const sql = `
+      SELECT
+        item_id,
+        item_type_id,
+        item_data,
+        submission_id,
+        ts,
+        item_creator_id,
+        item_creator_type_id,
+        item_type_version,
+        item_type_schema_variant
+      FROM analytics.CONTENT_API_REQUESTS
+      WHERE org_id = ?
+        AND event = 'REQUEST_SUCCEEDED'
+        AND item_ip_address = ?
+        AND item_ip_address != ''
+        AND ds >= toDate(?)
+      ORDER BY ts DESC
+      ${hasLimit ? 'LIMIT ?' : ''}
+    `;
+
+    const params: unknown[] = [orgId, ipAddress, lookbackStartDate];
+    if (hasLimit) {
+      params.push(Math.floor(limit));
+    }
+
+    const rows = (await this.query(
+      sql,
+      params,
+    )) as ClickhouseContentApiByIpRow[];
+
+    return rows.map<ContentApiRequestByIpRecord>((row) => ({
+      itemId: row.item_id,
+      itemTypeId: row.item_type_id,
       submissionId: row.submission_id,
       itemData: row.item_data,
       itemTypeVersion: row.item_type_version,
@@ -154,16 +218,56 @@ export class ClickhouseContentApiRequestsAdapter
     }));
   }
 
+  async findInferredUserIdentityFromCreators(
+    input: InferredUserIdentityFromCreatorsInput,
+  ): Promise<InferredUserIdentityFromCreatorsRecord | null> {
+    const { orgId, itemId, lookbackWindowMs = SIX_MONTHS_MS } = input;
+
+    const lookbackStart = new Date(Date.now() - Math.max(1, lookbackWindowMs));
+    const lookbackStartDate = lookbackStart.toISOString().slice(0, 10);
+
+    const sql = `
+      SELECT
+        ts,
+        item_creator_type_id
+      FROM analytics.CONTENT_API_REQUESTS
+      WHERE org_id = ?
+        AND event = 'REQUEST_SUCCEEDED'
+        AND ds >= toDate(?)
+        AND lower(item_creator_id) = lower(?)
+        AND item_creator_type_id IS NOT NULL
+        AND item_creator_type_id != ''
+      ORDER BY ts DESC
+      LIMIT 1
+    `;
+
+    const rows = await this.query<ClickhouseInferredUserRow>(sql, [
+      orgId,
+      lookbackStartDate,
+      itemId,
+    ]);
+
+    if (rows.length === 0) {
+      return null;
+    }
+
+    const row = rows[0];
+    if (!row.item_creator_type_id) {
+      return null;
+    }
+
+    return {
+      itemTypeId: row.item_creator_type_id,
+      lastSeenAt: new Date(row.ts),
+    };
+  }
+
   private async query<T>(
     statement: string,
     params: readonly unknown[],
   ): Promise<readonly T[]> {
     const formatted = formatClickhouseQuery(statement, params);
-    const result = await this.warehouse.query(
-      formatted,
-      this.tracer,
-    );
+    const result = await this.warehouse.query(formatted, this.tracer);
     return result as readonly T[];
   }
 }
-

@@ -7,21 +7,23 @@ import {
 } from '../condition_evaluator/conditionSet.js';
 import { type Dependencies } from '../iocContainer/index.js';
 import { inject } from '../iocContainer/utils.js';
-import { type PlainRuleWithLatestVersion } from '../models/rules/ruleTypes.js';
 import { evaluateAggregationRuntimeArgsForItem } from '../services/aggregationsService/index.js';
+import { type RuleExecutionCorrelationId } from '../services/analyticsLoggers/index.js';
 import { type ItemSubmission } from '../services/itemProcessingService/index.js';
 import {
-  type Action,
   ConditionCompletionOutcome,
-  type ConditionSet,
+  resolveConfiguredActionParameterValues,
   RuleStatus,
+  type Action,
+  type ConditionSet,
+  type PlainRuleWithLatestVersion,
 } from '../services/moderationConfigService/index.js';
-import { type RuleExecutionCorrelationId } from '../services/analyticsLoggers/index.js';
 import {
   type CorrelationId,
   type CorrelationIdType,
 } from '../utils/correlationIds.js';
 import { equalLengthZip } from '../utils/fp-helpers.js';
+import { logErrorJson } from '../utils/logging.js';
 import { safePick } from '../utils/misc.js';
 import type SafeTracer from '../utils/SafeTracer.js';
 import {
@@ -49,6 +51,46 @@ export enum RuleEnvironment {
   BACKTEST = 'BACKTEST',
   MANUAL = 'MANUAL',
   RETROACTION = 'RETROACTION',
+}
+
+/**
+ * Resolves the configured parameter values to send for each action triggered by
+ * a set of rules, keyed by action id. Actions are deduped across rules (we only
+ * publish each action once), so when several rules attach the same action the
+ * first non-empty configuration wins. Actions that resolve to no values are
+ * omitted so the publisher can skip the payload entirely.
+ */
+export function resolveConfiguredParametersByActionId(
+  actionsWithParametersByRule: Iterable<
+    readonly {
+      action: { id: string; actionType: string; customMrtApiParams?: unknown };
+      parameters: unknown;
+    }[]
+  >,
+): Map<string, Record<string, unknown>> {
+  const configuredParametersByActionId = new Map<
+    string,
+    Record<string, unknown>
+  >();
+  for (const actionsWithParameters of actionsWithParametersByRule) {
+    for (const { action, parameters } of actionsWithParameters) {
+      if (configuredParametersByActionId.has(action.id)) {
+        continue;
+      }
+      const resolved = resolveConfiguredActionParameterValues({
+        customMrtApiParams:
+          action.actionType === 'CUSTOM_ACTION'
+            ? action.customMrtApiParams
+            : null,
+        rawValues: parameters,
+        actionId: action.id,
+      });
+      if (resolved !== undefined && Object.keys(resolved).length > 0) {
+        configuredParametersByActionId.set(action.id, resolved);
+      }
+    }
+  }
+  return configuredParametersByActionId;
 }
 
 /**
@@ -100,25 +142,19 @@ class RuleEngine {
     executionsCorrelationId: RuleExecutionCorrelationId,
     sync: boolean = false,
   ) {
-    // enabledRules can be null when the contentType can't be found.
-    // getEnabledRulesForContentTypeEventuallyConsistent has `null` in its
-    // return type primarily in case the contentTypeId points to a content type
-    // that doesn't exist. However, even though we know that the contentTypeId
-    // is for a content type that does exist (because we have the full
-    // ContentType model object), we still must handle `null` b/c it could be
-    // that contentType was _just_ created and can't be seen yet by
-    // getEnabledRulesForContentTypeEventuallyConsistent, which, as the name
-    // implies, is eventually consistent.
+    // enabledRules will be an empty array when the contentType can't be found
+    // or has no rules attached. getEnabledRulesForItemTypeEventuallyConsistent
+    // is, as the name implies, eventually consistent, so a content type that
+    // was just created may not yet be visible.
     const enabledRules =
-      (await this.getEnabledRulesForItemTypeEventuallyConsistent(
+      await this.getEnabledRulesForItemTypeEventuallyConsistent(
         itemSubmission.itemType.id,
-      )) ?? [];
+      );
 
     const [liveRules, backgroundRules] = partition(
       enabledRules,
       (rule) => rule.status === RuleStatus.LIVE,
     );
-
 
     const evaluationContext = this.makeRuleExecutionContext({
       orgId: itemSubmission.itemType.orgId,
@@ -220,7 +256,6 @@ class RuleEngine {
       ),
     );
 
-
     const rulesToResults = new Map(equalLengthZip(rules, ruleResults));
 
     const passingRules = [...rulesToResults.entries()]
@@ -229,21 +264,35 @@ class RuleEngine {
 
     const actionableRules = passingRules;
 
-    const actionableRulesToActions = new Map(
+    const actionableRulesToActionsWithParameters = new Map(
       await Promise.all(
-        actionableRules.map(
-          async (rule) => {
-            const actions = (await this.getRuleActionsEventuallyConsistent({
+        actionableRules.map(async (rule) => {
+          const actionsWithParameters =
+            await this.getRuleActionsEventuallyConsistent({
               orgId: evaluationContext.org.id,
               ruleId: rule.id,
-            })) satisfies readonly ReadonlyDeep<Action>[] as readonly Action[];
-            
-            
-            return [rule, actions] as const;
-          }
-        ),
+            });
+          return [rule, actionsWithParameters] as const;
+        }),
       ),
     );
+
+    const actionableRulesToActions = new Map(
+      [...actionableRulesToActionsWithParameters.entries()].map(
+        ([rule, actionsWithParameters]) =>
+          [
+            rule,
+            actionsWithParameters.map(
+              (it) => it.action,
+            ) satisfies readonly ReadonlyDeep<Action>[] as readonly Action[],
+          ] as const,
+      ),
+    );
+
+    const configuredParametersByActionId =
+      resolveConfiguredParametersByActionId(
+        actionableRulesToActionsWithParameters.values(),
+      );
 
     // NB: while we only run _deduped_ actions, we record the actions and
     // update the rule action run counts as though no deduping took place,
@@ -254,24 +303,34 @@ class RuleEngine {
       rules.map((it) => it.id),
     );
 
-    const logRuleExecutionsPromise = this.ruleExecutionLogger.logRuleExecutions(
-      [...rulesToResults.entries()].map(([rule, result]) => ({
-        orgId: org.id,
-        rule: {
-          id: rule.id,
-          name: rule.name,
-          version: rule.latestVersion.version,
-          tags: rule.tags,
-        },
-        ruleInput,
-        environment,
-        result: result.conditionResults,
-        correlationId: executionsCorrelationId,
-        passed: result.passed,
-        policies: policiesByRule[rule.id] ?? [],
-      })),
-      sync,
-    );
+    // Catch at construction; awaited below via Promise.all.
+    const logRuleExecutionsPromise = this.ruleExecutionLogger
+      .logRuleExecutions(
+        [...rulesToResults.entries()].map(([rule, result]) => ({
+          orgId: org.id,
+          rule: {
+            id: rule.id,
+            name: rule.name,
+            version: rule.latestVersion.version,
+            tags: rule.tags,
+          },
+          ruleInput,
+          environment,
+          result: result.conditionResults,
+          correlationId: executionsCorrelationId,
+          passed: result.passed,
+          policies: policiesByRule[rule.id] ?? [],
+        })),
+        sync,
+      )
+      .catch((err) => {
+        this.tracer.logActiveSpanFailedIfAny(err);
+        // eslint-disable-next-line no-restricted-syntax
+        logErrorJson({
+          message: `logRuleExecutions failed orgId=${org.id} environment=${environment} correlationId=${executionsCorrelationId}`,
+          error: err,
+        });
+      });
 
     if (!shouldRunActions) {
       await logRuleExecutionsPromise;
@@ -290,6 +349,8 @@ class RuleEngine {
           return {
             action,
             ruleEnvironment: environment,
+            customMrtApiParamDecisionPayload:
+              configuredParametersByActionId.get(action.id),
             matchingRules: [...actionableRulesToActions.entries()].flatMap(
               ([rule, actions]) =>
                 actions.includes(action)
@@ -328,9 +389,9 @@ class RuleEngine {
       ? this.recordRuleActionLimitUsage(
           actionableRules.map((it) => it.id),
         ).catch(() => {
-          // This query sometimes fails from a Sequelize Acquire Connection
-          // timeout. While we're debugging the root cause of that further,
-          // swallow the error rather than crashing the process.
+          // This query sometimes fails from a connection-pool acquire timeout.
+          // While we're debugging the root cause further, swallow the error
+          // rather than crashing the process.
         })
       : undefined;
 
@@ -396,7 +457,6 @@ class RuleEngine {
       );
     }
   }
-
 }
 
 export default inject(

@@ -49,3 +49,6 @@ ncmec-reports/
 # in-place sed backups (sed -i.b) from local mutation testing
 *.sh.b
 *.sh.bak
+
+# Local implementation and verification artifacts
+.superpowers/

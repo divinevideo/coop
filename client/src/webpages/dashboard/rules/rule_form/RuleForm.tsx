@@ -1,5 +1,22 @@
 import { Label } from '@/coop-ui/Label';
 import { Switch } from '@/coop-ui/Switch';
+import {
+  GQLAction,
+  GQLConditionConjunction,
+  GQLRuleStatus,
+  GQLSignal,
+  GQLUserPermission,
+  namedOperations,
+  useGQLContentRuleFormConfigQuery,
+  useGQLCreateContentRuleMutation,
+  useGQLCreateUserRuleMutation,
+  useGQLDeleteRuleMutation,
+  useGQLMatchingBankIdsQuery,
+  useGQLRuleQuery,
+  useGQLUpdateContentRuleMutation,
+  useGQLUpdateUserRuleMutation,
+  type GQLRuleActionParameterValuesInput,
+} from '@/graphql/generated';
 import CopyAlt from '@/icons/lni/Web and Technology/copy-alt.svg?react';
 import TrashCan from '@/icons/lni/Web and Technology/trash-can.svg?react';
 import { DownOutlined, PlusOutlined, UpOutlined } from '@ant-design/icons';
@@ -21,23 +38,8 @@ import FormSectionHeader from '../../components/FormSectionHeader';
 import NameDescriptionInput from '../../components/NameDescriptionInput';
 import PolicyDropdown from '../../components/PolicyDropdown';
 import SubmitButton from '../../components/SubmitButton';
+import { defaultValuesForParameters } from '@/components/ActionParametersModal';
 
-import {
-  GQLAction,
-  GQLConditionConjunction,
-  GQLRuleStatus,
-  GQLUserPermission,
-  namedOperations,
-  useGQLContentRuleFormConfigQuery,
-  useGQLCreateContentRuleMutation,
-  useGQLCreateUserRuleMutation,
-  useGQLDeleteRuleMutation,
-  useGQLMatchingBankIdsQuery,
-  useGQLRuleQuery,
-  useGQLUpdateContentRuleMutation,
-  useGQLUpdateUserRuleMutation,
-} from '../../../../graphql/generated';
-import { CoreSignal } from '../../../../models/signal';
 import { userHasPermissions } from '../../../../routing/permissions';
 import useRouteQueryParams from '../../../../routing/useRouteQueryParams';
 import { DAY, HOUR, MONTH, WEEK } from '../../../../utils/time';
@@ -48,6 +50,9 @@ import {
   RuleFormConditionSet,
   RuleFormLeafCondition,
 } from '../types';
+import RuleActionParametersEditor, {
+  type ParameterizedActionOption,
+} from './RuleActionParametersEditor';
 import RuleFormCondition from './RuleFormCondition';
 import {
   reducer,
@@ -172,6 +177,7 @@ export const ITEM_TYPE_FRAGMENT = gql`
         profileIcon
         backgroundImage
         isDeleted
+        ipAddress
       }
     }
     ... on ContentItemType {
@@ -182,6 +188,7 @@ export const ITEM_TYPE_FRAGMENT = gql`
         createdAt
         creatorId
         isDeleted
+        ipAddress
       }
     }
     ... on ThreadItemType {
@@ -190,6 +197,7 @@ export const ITEM_TYPE_FRAGMENT = gql`
         createdAt
         creatorId
         isDeleted
+        ipAddress
       }
     }
   }
@@ -382,6 +390,22 @@ const RULE_FIELD_FRAGMENT = gql`
         id
         name
         description
+        parameters {
+          name
+          displayName
+          description
+          type
+          required
+          options {
+            value
+            label
+          }
+          min
+          max
+          maxLength
+          defaultValue
+        }
+        configuredParameters
         itemTypes {
           ... on ItemTypeBase {
             id
@@ -393,6 +417,7 @@ const RULE_FIELD_FRAGMENT = gql`
         id
         name
         description
+        configuredParameters
         itemTypes {
           ... on ItemTypeBase {
             id
@@ -404,6 +429,7 @@ const RULE_FIELD_FRAGMENT = gql`
         id
         name
         description
+        configuredParameters
         itemTypes {
           ... on ItemTypeBase {
             id
@@ -415,6 +441,7 @@ const RULE_FIELD_FRAGMENT = gql`
         id
         name
         description
+        configuredParameters
         itemTypes {
           ... on ItemTypeBase {
             id
@@ -452,6 +479,21 @@ export const ACTION_FRAGMENT = gql`
       id
       name
       description
+      parameters {
+        name
+        displayName
+        description
+        type
+        required
+        options {
+          value
+          label
+        }
+        min
+        max
+        maxLength
+        defaultValue
+      }
       itemTypes {
         ... on ItemTypeBase {
           id
@@ -617,6 +659,38 @@ export default function RuleForm() {
   );
   const policies = contentRuleFormConfigQueryData?.myOrg?.policies;
 
+  // Only CustomActions carry a parameter spec; these drive the per-action
+  // parameter-value editor shown beneath the action selector.
+  const parameterizedActions = useMemo<ParameterizedActionOption[]>(
+    () =>
+      allActions.flatMap((action) =>
+        action.__typename === 'CustomAction' &&
+        (action.parameters?.length ?? 0) > 0
+          ? [
+              {
+                id: action.id,
+                name: action.name,
+                parameters: action.parameters ?? [],
+              },
+            ]
+          : [],
+      ),
+    [allActions],
+  );
+
+  // Seed configured values from the rule being edited (or duplicated).
+  const initialActionParameters = useMemo<
+    Record<string, Record<string, unknown>>
+  >(() => {
+    const out: Record<string, Record<string, unknown>> = {};
+    for (const action of rule?.actions ?? []) {
+      if ('configuredParameters' in action && action.configuredParameters) {
+        out[action.id] = action.configuredParameters as Record<string, unknown>;
+      }
+    }
+    return out;
+  }, [rule]);
+
   const {
     loading: matchingBanksQueryLoading,
     error: matchingBanksQueryError,
@@ -639,7 +713,6 @@ export default function RuleForm() {
   const [state, dispatch] = useReducer(reducer, initialState);
 
   const [form] = useForm();
-  
 
   const onDeleteRule = (id: string) => {
     deleteRule({
@@ -674,7 +747,7 @@ export default function RuleForm() {
             rule.__typename === 'ContentRule' ? rule.itemTypes : [],
           conditionSet: rule.conditionSet,
           allActions,
-          allSignals: allSignals satisfies readonly CoreSignal[],
+          allSignals: allSignals satisfies readonly GQLSignal[],
           policyIds: rule.policies.map((it) => it.id),
           tags: (rule.tags ?? []).filter((tag) => tag) as string[],
           maxDailyActions: rule.maxDailyActions ?? null,
@@ -901,6 +974,27 @@ export default function RuleForm() {
   ]);
   const isUserRule = state.ruleType === RuleType.USER;
 
+  // GraphQL input for selected parameterized actions, seeding spec defaults for
+  // any the author didn't edit so the server validates a complete payload.
+  const buildActionParametersInput = (
+    values: any,
+  ): GQLRuleActionParameterValuesInput[] => {
+    const selected: string[] = values.actions ?? [];
+    const configured: Record<
+      string,
+      Record<string, unknown>
+    > = values.actionParameters ?? {};
+    return parameterizedActions
+      .filter((action) => selected.includes(action.id))
+      .map((action) => ({
+        actionId: action.id,
+        parameters: (configured[action.id] ??
+          defaultValuesForParameters(
+            action.parameters,
+          )) as GQLRuleActionParameterValuesInput['parameters'],
+      }));
+  };
+
   const onCreateContentRule = async (values: any) => {
     dispatch({ type: RuleFormReducerActionType.DisableSubmitButton });
     createContentRule({
@@ -912,10 +1006,13 @@ export default function RuleForm() {
           contentTypeIds: values.itemTypes,
           conditionSet: serializeConditionSet(state.conditionSet),
           actionIds: values.actions,
+          actionParameters: buildActionParametersInput(values),
           policyIds: state.policyIds,
           tags: state.tags,
           maxDailyActions: state.maxDailyActions,
-          expirationTime: state.expirationTime ? format(state.expirationTime, 'yyyy-MM-dd HH:mm') : undefined,
+          expirationTime: state.expirationTime
+            ? format(state.expirationTime, 'yyyy-MM-dd HH:mm')
+            : undefined,
         },
       },
       refetchQueries: [namedOperations.Query.Rules],
@@ -936,10 +1033,13 @@ export default function RuleForm() {
           contentTypeIds: values.itemTypes,
           conditionSet: serializeConditionSet(state.conditionSet),
           actionIds: values.actions,
+          actionParameters: buildActionParametersInput(values),
           policyIds: state.policyIds,
           tags: state.tags,
           maxDailyActions: state.maxDailyActions,
-          expirationTime: state.expirationTime ? format(state.expirationTime, 'yyyy-MM-dd HH:mm') : undefined,
+          expirationTime: state.expirationTime
+            ? format(state.expirationTime, 'yyyy-MM-dd HH:mm')
+            : undefined,
         },
       },
       refetchQueries: [
@@ -959,10 +1059,13 @@ export default function RuleForm() {
           status: values.status,
           conditionSet: serializeConditionSet(state.conditionSet),
           actionIds: values.actions,
+          actionParameters: buildActionParametersInput(values),
           policyIds: state.policyIds,
           tags: state.tags,
           maxDailyActions: state.maxDailyActions,
-          expirationTime: state.expirationTime ? format(state.expirationTime, 'yyyy-MM-dd HH:mm') : undefined,
+          expirationTime: state.expirationTime
+            ? format(state.expirationTime, 'yyyy-MM-dd HH:mm')
+            : undefined,
         },
       },
       refetchQueries: [namedOperations.Query.Rules],
@@ -982,10 +1085,13 @@ export default function RuleForm() {
           status: values.status,
           conditionSet: serializeConditionSet(state.conditionSet),
           actionIds: values.actions,
+          actionParameters: buildActionParametersInput(values),
           policyIds: state.policyIds,
           tags: state.tags,
           maxDailyActions: state.maxDailyActions,
-          expirationTime: state.expirationTime ? format(state.expirationTime, 'yyyy-MM-dd HH:mm') : undefined,
+          expirationTime: state.expirationTime
+            ? format(state.expirationTime, 'yyyy-MM-dd HH:mm')
+            : undefined,
         },
       },
       refetchQueries: [
@@ -1011,7 +1117,7 @@ export default function RuleForm() {
           (id: string) => allItemTypes.find((itemType) => itemType.id === id)!,
         ),
         allActions,
-        allSignals: allSignals satisfies readonly CoreSignal[],
+        allSignals: allSignals satisfies readonly GQLSignal[],
         form,
       },
     });
@@ -1447,6 +1553,23 @@ export default function RuleForm() {
             ))}
         </Select>
       </Form.Item>
+      <Form.Item
+        noStyle
+        shouldUpdate={(prev, cur) => prev.actions !== cur.actions}
+      >
+        {() => (
+          <Form.Item
+            name="actionParameters"
+            noStyle
+            initialValue={initialActionParameters}
+          >
+            <RuleActionParametersEditor
+              actions={parameterizedActions}
+              selectedActionIds={form.getFieldValue('actions') ?? []}
+            />
+          </Form.Item>
+        )}
+      </Form.Item>
     </div>
   );
 
@@ -1647,10 +1770,17 @@ export default function RuleForm() {
       />
       {!state.expirationEnabled && <div style={{ height: '12px' }} />}
       {state.expirationEnabled && (
-        <div className="flex flex-wrap items-center mt-2 gap-1" style={{ width: '80%' }}>
+        <div
+          className="flex flex-wrap items-center mt-2 gap-1"
+          style={{ width: '80%' }}
+        >
           <input
             type="datetime-local"
-            value={state.expirationTime ? format(state.expirationTime, "yyyy-MM-dd'T'HH:mm") : ''}
+            value={
+              state.expirationTime
+                ? format(state.expirationTime, "yyyy-MM-dd'T'HH:mm")
+                : ''
+            }
             className="mr-4 h-8 px-3 py-1 border border-solid border-slate-300 rounded-lg text-sm text-slate-700 focus:border-coop-blue focus:outline-none"
             onChange={(e) =>
               dispatch({
@@ -1716,14 +1846,14 @@ export default function RuleForm() {
                 !canEditLiveRules
                   ? "To edit Live rules, ask your organization's admin to upgrade your role to Rules Manager or Admin."
                   : !canEditNonLiveRules
-                  ? "To edit rules, ask your organization's admin to upgrade your role to Rules Manager or Admin."
-                  : !actionsSelected
-                  ? 'Please select at least one action.'
-                  : hasInvalidThreshold
-                  ? 'At least one threshold has an invalid input.'
-                  : !conditionsValid
-                  ? 'This rule only has user-based conditions, but rules must contain at least one content-based condition.'
-                  : undefined
+                    ? "To edit rules, ask your organization's admin to upgrade your role to Rules Manager or Admin."
+                    : !actionsSelected
+                      ? 'Please select at least one action.'
+                      : hasInvalidThreshold
+                        ? 'At least one threshold has an invalid input.'
+                        : !conditionsValid
+                          ? 'This rule only has user-based conditions, but rules must contain at least one content-based condition.'
+                          : undefined
               }
               disabledTooltipPlacement="bottomLeft"
             />
@@ -1884,8 +2014,8 @@ export default function RuleForm() {
                   ? 'Create User Rule'
                   : 'Create Rule'
                 : isUserRule
-                ? 'Update User Rule'
-                : 'Update Rule';
+                  ? 'Update User Rule'
+                  : 'Update Rule';
             })()}
             // topRightButton={ruleTypeSelector}
           />

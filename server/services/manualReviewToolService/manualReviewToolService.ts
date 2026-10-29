@@ -1,19 +1,20 @@
 /* eslint-disable max-lines */
 
 import { SpanStatusCode } from '@opentelemetry/api';
-import { type ItemIdentifier } from '@roostorg/types';
+import { type ItemIdentifier } from '@roostorg/coop-types';
 import { type Kysely } from 'kysely';
 import _ from 'lodash';
 import { type Opaque } from 'type-fest';
 
 import { type Dependencies } from '../../iocContainer/index.js';
 import { type ConsumerDirectives } from '../../lib/cache/index.js';
-import {
-  type Invoker,
-  type UserPermission,
-} from '../../models/types/permissioning.js';
+import { type PreparedMemberIntent } from '../../routes/concord/memberIntents.js';
+import { type StaffActor } from '../../routes/concord/service.js';
 import { jsonStringify } from '../../utils/encoding.js';
-import { isCoopErrorOfType } from '../../utils/errors.js';
+import {
+  isCoopErrorOfType,
+  makeUnauthorizedError,
+} from '../../utils/errors.js';
 import { isUniqueViolationError } from '../../utils/kysely.js';
 import type { OmitEach, ReplaceDeep } from '../../utils/typescript-types.js';
 import {
@@ -25,10 +26,18 @@ import { type ItemSubmissionWithTypeIdentifier } from '../itemProcessingService/
 import { type ModerationConfigService } from '../moderationConfigService/index.js';
 import { type PartialItemsService } from '../partialItemsService/index.js';
 import {
+  UserPermission,
+  type Invoker,
+} from '../userManagementService/index.js';
+import {
   type UserScore,
   type UserStatisticsService,
 } from '../userStatisticsService/userStatisticsService.js';
-import { type ManualReviewToolServicePg } from './dbTypes.js';
+import {
+  type ClearReportsDisposition,
+  type ClearReportsScope,
+  type ManualReviewToolServicePg,
+} from './dbTypes.js';
 import AppealsJobRouting from './modules/AppealsJobRouting.js';
 import CommentOperations from './modules/CommentOperations.js';
 import DecisionAnalytics, {
@@ -40,6 +49,7 @@ import DecisionAnalytics, {
   type TimeToActionInput,
 } from './modules/DecisionAnalytics.js';
 import JobDecisioning, {
+  type CustomActionDecisionComponent,
   type OnRecordDecisionInput,
   type SubmitDecisionInput,
 } from './modules/JobDecisioning.js';
@@ -58,9 +68,16 @@ import ManualReviewToolSettings from './modules/ManualReviewToolSettings.js';
 import QueueOperations, {
   type ManualReviewQueue,
 } from './modules/QueueOperations.js';
+import ReporterInvalidation, {
+  type InvalidateReportsFromReporterInput,
+  type InvalidateReportsFromReporterResult,
+} from './modules/ReporterInvalidation.js';
 import SkipOperations, {
   type SkippedJobCountInput,
 } from './modules/SkipOperations.js';
+import UserReportSweep, {
+  type ClearOtherReportsResult,
+} from './modules/UserReportSweep.js';
 
 // An id that's unique across all jobs ever added to any queue (pending or not).
 // This is the id that's passed into the MRT Service by callers to identify a
@@ -95,6 +112,12 @@ export type ManualReviewAppealJob = {
 };
 
 export type ManualReviewJobOrAppeal = ManualReviewJob | ManualReviewAppealJob;
+
+export function isReportJob(
+  job: ManualReviewJobOrAppeal,
+): job is ManualReviewJob {
+  return job.payload.kind !== 'APPEAL';
+}
 
 // Old MRT jobs (created before roughly Sept 2023) included this
 // "LegacyItemWithTypeIdentifier" type in their payloads, rather than including
@@ -283,6 +306,8 @@ export class ManualReviewToolService {
   private readonly manualReviewToolSettings: ManualReviewToolSettings;
   private readonly commentOps: CommentOperations;
   private readonly skipOps: SkipOperations;
+  private readonly reporterInvalidation: ReporterInvalidation;
+  private readonly userReportSweep: UserReportSweep;
 
   constructor(
     readonly redis: Dependencies['IORedis'],
@@ -300,6 +325,10 @@ export class ManualReviewToolService {
       input: ManualReviewJobInput | ManualReviewAppealJobInput,
       queueId: string,
     ) => Promise<void>,
+    getRoomActor?: (id: string, orgId: string) => Promise<StaffActor>,
+    prepareRoomIntents?: (
+      input: OnRecordDecisionInput,
+    ) => Promise<PreparedMemberIntent[]>,
   ) {
     this.queueOps = new QueueOperations(
       pgQuery,
@@ -325,6 +354,7 @@ export class ManualReviewToolService {
       ruleEvaluator,
       //routingRuleExecutionLogger,
     );
+    this.manualReviewToolSettings = new ManualReviewToolSettings(pgQuery);
     this.jobDecisioning = new JobDecisioning(
       this.queueOps,
       pgQuery,
@@ -332,12 +362,24 @@ export class ManualReviewToolService {
       onRecordDecision,
       moderationConfigService,
       this.tracer,
+      this.manualReviewToolSettings,
+      getRoomActor,
+      prepareRoomIntents,
     );
     this.jobRendering = new JobRendering(pgQuery);
     this.decisionAnalytics = new DecisionAnalytics(pgQueryReadReplica);
-    this.manualReviewToolSettings = new ManualReviewToolSettings(pgQuery);
     this.commentOps = new CommentOperations(pgQuery);
     this.skipOps = new SkipOperations(pgQuery);
+    this.reporterInvalidation = new ReporterInvalidation(
+      this.queueOps,
+      this.tracer,
+    );
+    this.userReportSweep = new UserReportSweep(
+      this.queueOps,
+      this.jobDecisioning,
+      moderationConfigService,
+      this.tracer,
+    );
   }
 
   /**
@@ -355,7 +397,7 @@ export class ManualReviewToolService {
   async enqueue(input: ManualReviewJobInput, queueId?: string) {
     const MAX_ENQUEUE_ATTEMPTS = 5;
 
-    await this.tracer.addActiveSpan(
+    return this.tracer.addActiveSpan(
       {
         resource: 'mrtService',
         operation: 'enqueue',
@@ -477,14 +519,13 @@ export class ManualReviewToolService {
                 item_id: job.payload.item.itemId,
                 item_type_id: job.payload.item.itemTypeIdentifier.id,
                 queue_id: targetQueueForNewJob,
-                // We use the Source Info from the input argument to account
-                // for the case that we are in fact updating a job which was
-                // never inserted into this table and did not have enqueue source
-                // info, but the updated job will.
                 enqueue_source_info: input.enqueueSourceInfo,
                 policy_ids: input.policyIds,
                 created_at: new Date(),
               })
+              // Re-enqueues (merged reports) re-run this path; keep the
+              // original row.
+              .onConflict((oc) => oc.column('id').doNothing())
               .execute()
               .catch(() => {}); // don't throw if logging fails
 
@@ -520,6 +561,7 @@ export class ManualReviewToolService {
           const { targetQueueForNewJob } = enqueueResult;
           this.onEnqueue(input, targetQueueForNewJob).catch(() => {});
         }
+        return enqueueResult;
       },
     );
   }
@@ -553,9 +595,8 @@ export class ManualReviewToolService {
             `No item type for org ${input.orgId} with ID ${input.payload.item.itemTypeIdentifier.id}`,
           );
         }
-        const enrichedJobPayload = await this.jobEnrichment.enrichAppealPayload(
-          input,
-        );
+        const enrichedJobPayload =
+          await this.jobEnrichment.enrichAppealPayload(input);
 
         const attemptAppealEnqueue = async (): Promise<
           | { job: ManualReviewAppealJob; targetQueueForNewJob: string }
@@ -603,6 +644,7 @@ export class ManualReviewToolService {
                 policy_ids: input.policyIds,
                 created_at: new Date(),
               })
+              .onConflict((oc) => oc.column('id').doNothing())
               .execute()
               .catch(() => {}); // don't throw if logging fails
 
@@ -688,10 +730,10 @@ export class ManualReviewToolService {
           ? _.uniqBy(
               [
                 ...('itemThreadContentItems' in newJob
-                  ? newJob.itemThreadContentItems ?? []
+                  ? (newJob.itemThreadContentItems ?? [])
                   : []),
                 ...('itemThreadContentItems' in existingJob
-                  ? existingJob.itemThreadContentItems ?? []
+                  ? (existingJob.itemThreadContentItems ?? [])
                   : []),
               ],
               (it) => jsonStringify([it.itemId, it.itemTypeIdentifier.id]),
@@ -704,10 +746,10 @@ export class ManualReviewToolService {
           ? _.uniqBy(
               [
                 ...('reportedItems' in newJob
-                  ? newJob.reportedItems ?? []
+                  ? (newJob.reportedItems ?? [])
                   : []),
                 ...('reportedItems' in existingJob
-                  ? existingJob.reportedItems ?? []
+                  ? (existingJob.reportedItems ?? [])
                   : []),
               ],
               (it) => jsonStringify([it.id, it.typeId]),
@@ -789,24 +831,44 @@ export class ManualReviewToolService {
    * @param input - An object containing the id of the routing rule to be deleted.
    * @returns A promise that resolves to a boolean indicating the success of the operation.
    */
-  async deleteRoutingRule(input: { id: string; isAppealsRule?: boolean }) {
+  async deleteRoutingRule(input: {
+    id: string;
+    orgId: string;
+    isAppealsRule?: boolean;
+  }) {
     return input.isAppealsRule
-      ? this.appealsJobRouting.deleteAppealsRoutingRule({ id: input.id })
-      : this.jobRouting.deleteRoutingRule({ id: input.id });
+      ? this.appealsJobRouting.deleteAppealsRoutingRule({
+          id: input.id,
+          orgId: input.orgId,
+        })
+      : this.jobRouting.deleteRoutingRule({
+          id: input.id,
+          orgId: input.orgId,
+        });
   }
 
-  async addAccessibleQueuesForUser(
-    userId: string,
-    queueIds: readonly string[],
-  ) {
-    return this.queueOps.addAccessibleQueuesForUser([userId], queueIds);
+  async addAccessibleQueuesForUser(opts: {
+    orgId: string;
+    userId: string;
+    queueIds: readonly string[];
+  }) {
+    return this.queueOps.addAccessibleQueuesForUser({
+      orgId: opts.orgId,
+      userIds: [opts.userId],
+      queueIds: opts.queueIds,
+    });
   }
 
-  async removeAccessibleQueuesForUser(
-    userId: string,
-    queueIds: readonly string[],
-  ) {
-    return this.queueOps.removeAccessibleQueuesForUser(userId, queueIds);
+  async removeAccessibleQueuesForUser(opts: {
+    orgId: string;
+    userId: string;
+    queueIds: readonly string[];
+  }) {
+    return this.queueOps.removeAccessibleQueuesForUser({
+      orgId: opts.orgId,
+      userId: opts.userId,
+      queueIds: opts.queueIds,
+    });
   }
 
   /**
@@ -838,6 +900,9 @@ export class ManualReviewToolService {
     invokedBy: Invoker;
     isAppealsQueue: boolean;
     autoCloseJobs?: boolean;
+    clearReportsDisposition?: ClearReportsDisposition | null;
+    clearReportsScope?: ClearReportsScope;
+    clearReportsTriggerActionIds?: readonly string[];
   }): Promise<ManualReviewQueue> {
     return this.queueOps.createManualReviewQueue(input);
   }
@@ -851,8 +916,100 @@ export class ManualReviewToolService {
     actionIdsToHide: readonly string[];
     actionIdsToUnhide: readonly string[];
     autoCloseJobs?: boolean;
+    clearReportsDisposition?: ClearReportsDisposition | null;
+    clearReportsScope?: ClearReportsScope;
+    clearReportsTriggerActionIds?: readonly string[];
   }): Promise<ManualReviewQueue> {
     return this.queueOps.updateManualReviewQueue(input);
+  }
+
+  async getClearReportsTriggerActionsForQueue(opts: {
+    orgId: string;
+    queueId: string;
+  }): Promise<string[]> {
+    return this.queueOps.getClearReportsTriggerActionsForQueue(opts);
+  }
+
+  /**
+   * Post-decision hook for "clear all other reports for a user".
+   * Runs the sweep only if the queue's trigger actions intersect the decision's
+   * custom actions.
+   */
+  async maybeClearOtherReportsForUser(opts: {
+    orgId: string;
+    actionedJob: ManualReviewJob;
+    actionedQueueId: string;
+    customActions: readonly CustomActionDecisionComponent[];
+    reviewerId: string;
+    reviewerEmail: string;
+    decisionReason?: string;
+  }): Promise<ClearOtherReportsResult | undefined> {
+    const {
+      orgId,
+      actionedJob,
+      actionedQueueId,
+      customActions,
+      reviewerId,
+      reviewerEmail,
+      decisionReason,
+    } = opts;
+
+    if (customActions.length === 0) {
+      return undefined;
+    }
+
+    const queue =
+      await this.queueOps.getQueueForOrgAndDangerouslyBypassPermissioning({
+        orgId,
+        queueId: actionedQueueId,
+      });
+    const disposition = queue?.clearReportsDisposition;
+    const scope = queue?.clearReportsScope;
+    if (
+      queue == null ||
+      queue.isAppealsQueue ||
+      disposition == null ||
+      scope == null
+    ) {
+      return undefined;
+    }
+
+    const triggerActionIds =
+      await this.queueOps.getClearReportsTriggerActionsForQueue({
+        queueId: actionedQueueId,
+        orgId,
+      });
+    if (triggerActionIds.length === 0) {
+      return undefined;
+    }
+
+    // Narrow each component to only the trigger actions, so a SAME_ACTION
+    // disposition re-applies just the configured action(s) and not other
+    // actions that happened to be part of the same decision.
+    const triggerActionIdSet = new Set(triggerActionIds);
+    const matchingCustomActions = customActions
+      .map((component) => ({
+        ...component,
+        actions: component.actions.filter((action) =>
+          triggerActionIdSet.has(action.id),
+        ),
+      }))
+      .filter((component) => component.actions.length > 0);
+    if (matchingCustomActions.length === 0) {
+      return undefined;
+    }
+
+    return this.userReportSweep.clearOtherReportsForUser({
+      orgId,
+      actionedJob,
+      actionedQueueId,
+      disposition,
+      scope,
+      triggerCustomActions: matchingCustomActions,
+      reviewerId,
+      reviewerEmail,
+      decisionReason,
+    });
   }
 
   async getDefaultQueueIdForOrg(orgId: string) {
@@ -1078,12 +1235,43 @@ export class ManualReviewToolService {
       });
 
     let shouldBeAutoActioned = queue?.autoCloseJobs ?? false;
-    let job = await this.queueOps.dequeueNextJobWithLock({
-      orgId,
-      queueId,
-      lockToken: userId,
-    });
-    if (!shouldBeAutoActioned || !job) {
+    const getNext = queue?.isAppealsQueue
+      ? this.queueOps.dequeueNextAppealJobWithLock.bind(this.queueOps)
+      : this.queueOps.dequeueNextJobWithLock.bind(this.queueOps);
+    const dequeue = async () => {
+      let next = await getNext({
+        orgId,
+        queueId,
+        lockToken: userId,
+      });
+      // Dequeue also resumes persisted room intent; a new reviewer need not
+      // reconstruct another reviewer's exact recorded reason and parameters.
+      while (next) {
+        let resumed: boolean;
+        try {
+          resumed = await this.jobDecisioning.retryRecordedRoomDecision({
+            orgId,
+            queueId,
+            jobId: next.job.id,
+            lockToken: next.lockToken,
+            reviewerId: userId,
+            ...(queue?.isAppealsQueue ? { isAppealsQueue: true } : {}),
+          });
+        } catch {
+          return { job: next, recoveryPending: true };
+        }
+        if (!resumed) break;
+        next = await getNext({
+          orgId,
+          queueId,
+          lockToken: userId,
+        });
+      }
+      return { job: next, recoveryPending: false };
+    };
+    const initial = await dequeue();
+    let job = initial.job;
+    if (initial.recoveryPending || !shouldBeAutoActioned || !job) {
       return job;
     }
 
@@ -1130,7 +1318,10 @@ export class ManualReviewToolService {
       } else {
         await this.submitDecision({
           queueId,
-          reportHistory: job.job.payload.reportHistory,
+          reportHistory:
+            'reportHistory' in job.job.payload
+              ? job.job.payload.reportHistory
+              : [],
           jobId: job.job.id,
           lockToken: job.lockToken,
           automaticCloseDecision: {
@@ -1141,13 +1332,10 @@ export class ManualReviewToolService {
           orgId,
         });
 
-        job = await this.queueOps.dequeueNextJobWithLock({
-          orgId,
-          queueId,
-          lockToken: userId,
-        });
+        const next = await dequeue();
+        job = next.job;
 
-        if (!job) {
+        if (next.recoveryPending || !job) {
           return job;
         }
       }
@@ -1163,16 +1351,62 @@ export class ManualReviewToolService {
     return this.queueOps.deleteAllJobsFromQueue(opts);
   }
 
+  /**
+   * Strips every entry sent by `reporter` from the `reportHistory` and
+   * `reportedForReasons` of every pending MRT job in the org. A job whose
+   * history empties out is removed if it was enqueued purely from a user
+   * report. One-shot with no persistent blocklist. See issue #404.
+   */
+  async invalidateReportsFromReporter(
+    input: InvalidateReportsFromReporterInput,
+  ): Promise<InvalidateReportsFromReporterResult> {
+    // Also gated at the GraphQL resolver; re-checked here for in-process
+    // callers such as server bin scripts.
+    if (!input.invokedBy.permissions.includes(UserPermission.EDIT_MRT_QUEUES)) {
+      throw makeUnauthorizedError(
+        'You do not have permission to invalidate reports',
+        { shouldErrorSpan: true },
+      );
+    }
+    // Bind the sweep to the caller's own org.
+    if (input.invokedBy.orgId !== input.orgId) {
+      throw makeUnauthorizedError(
+        'You do not have permission to invalidate reports for this org',
+        { shouldErrorSpan: true },
+      );
+    }
+    return this.reporterInvalidation.invalidateReportsFromReporter(input);
+  }
+
   async submitDecision(
     opts: OmitEach<SubmitDecisionInput, 'jobId'> & { jobId: string },
   ) {
     // As submitDecision is a public method, we assume the passed in jobId is an
     // external id (which are the only kind that should leave the mrt service).
-    return this.jobDecisioning.submitDecision(opts as SubmitDecisionInput);
+    const queue =
+      await this.queueOps.getQueueForOrgAndDangerouslyBypassPermissioning({
+        orgId: opts.orgId,
+        queueId: opts.queueId,
+      });
+    return this.jobDecisioning.submitDecision({
+      ...opts,
+      isAppealsQueue: queue?.isAppealsQueue ?? false,
+    } as SubmitDecisionInput);
   }
 
   async getNcmecDecisions(opts: { startDate: Date; endDate: Date }) {
     return this.jobDecisioning.getNcmecDecisions(opts);
+  }
+
+  async getNcmecDecisionsForOrg(opts: { orgId: string; limit?: number }) {
+    return this.jobDecisioning.getNcmecDecisionsForOrg(opts);
+  }
+
+  async getNcmecDecisionByIdForOrg(opts: {
+    orgId: string;
+    decisionId: string;
+  }) {
+    return this.jobDecisioning.getNcmecDecisionByIdForOrg(opts);
   }
 
   async upsertDefaultSettings(opts: { orgId: string }) {
@@ -1191,8 +1425,57 @@ export class ManualReviewToolService {
     return this.manualReviewToolSettings.getRequiresDecisionReason(orgId);
   }
 
+  async getRequiresDecisionReasonOnIgnore(orgId: string) {
+    return this.manualReviewToolSettings.getRequiresDecisionReasonOnIgnore(
+      orgId,
+    );
+  }
+
   async getPreviewJobsViewEnabled(orgId: string) {
     return this.manualReviewToolSettings.getPreviewJobsViewEnabled(orgId);
+  }
+
+  async getIgnoreCallbackUrl(orgId: string) {
+    return this.manualReviewToolSettings.getIgnoreCallbackUrl(orgId);
+  }
+
+  async updateRequiresPolicyForDecisions(orgId: string, enabled: boolean) {
+    return this.manualReviewToolSettings.updateRequiresPolicyForDecisions(
+      orgId,
+      enabled,
+    );
+  }
+
+  async updateRequiresDecisionReason(orgId: string, enabled: boolean) {
+    return this.manualReviewToolSettings.updateRequiresDecisionReason(
+      orgId,
+      enabled,
+    );
+  }
+
+  async updateRequiresDecisionReasonOnIgnore(orgId: string, enabled: boolean) {
+    return this.manualReviewToolSettings.updateRequiresDecisionReasonOnIgnore(
+      orgId,
+      enabled,
+    );
+  }
+
+  async updateHideSkipButtonForNonAdmins(orgId: string, enabled: boolean) {
+    return this.manualReviewToolSettings.updateHideSkipButtonForNonAdmins(
+      orgId,
+      enabled,
+    );
+  }
+
+  async updatePreviewJobsViewEnabled(orgId: string, enabled: boolean) {
+    return this.manualReviewToolSettings.updatePreviewJobsViewEnabled(
+      orgId,
+      enabled,
+    );
+  }
+
+  async updateIgnoreCallbackUrl(orgId: string, url: string | null) {
+    return this.manualReviewToolSettings.updateIgnoreCallbackUrl(orgId, url);
   }
 
   async getJobComments(opts: { orgId: string; jobId: string }) {

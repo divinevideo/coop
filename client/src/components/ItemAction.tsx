@@ -1,25 +1,35 @@
-import ActionParametersModal, {
-  defaultValuesForParameters,
-} from '@/components/ActionParametersModal';
-import { type ActionParameterValues } from '@/components/ActionParameterInputs';
-import { type JsonObject } from 'type-fest';
 import {
-  type GQLActionParameter,
   namedOperations,
+  useGQLBeginItemRoomOperationMutation,
   useGQLBulkActionExecutionMutation,
   useGQLBulkActionsFormDataQuery,
+  useGQLRoomOperationActorQuery,
+  type GQLActionParameter,
 } from '@/graphql/generated';
 import { stripTypename } from '@/graphql/inputHelpers';
-import { ItemIdentifier } from '@roostorg/types';
 import Pencil from '@/icons/lni/Education/pencil.svg?react';
+import { ItemIdentifier } from '@roostorg/coop-types';
 import { Button, Input, Select } from 'antd';
 import orderBy from 'lodash/orderBy';
 import { useCallback, useMemo, useState } from 'react';
+import { type JsonObject } from 'type-fest';
 
+import { type ActionParameterValues } from '@/components/ActionParameterInputs';
+import ActionParametersModal, {
+  defaultValuesForParameters,
+} from '@/components/ActionParametersModal';
 import { selectFilterByLabelOption } from '@/webpages/dashboard/components/antDesignUtils';
 import CoopButton from '@/webpages/dashboard/components/CoopButton';
 import CoopModal from '@/webpages/dashboard/components/CoopModal';
 import PolicyDropdown from '@/webpages/dashboard/components/PolicyDropdown';
+
+import ConcordEnforcementStatus from './ConcordEnforcementStatus';
+import {
+  beginRoomOperation,
+  completeRoomOperation,
+  prepareRoomOperation,
+  rememberRoomReceipt,
+} from './roomOperation';
 
 const { Option } = Select;
 
@@ -40,6 +50,9 @@ export default function ItemAction(props: {
   const { itemIdentifier, title = 'Take action on this item' } = props;
 
   const { data: queryData } = useGQLBulkActionsFormDataQuery();
+  const { data: roomActor } = useGQLRoomOperationActorQuery();
+  const [prepareReceipt] = useGQLBeginItemRoomOperationMutation();
+  const [preparing, setPreparing] = useState(false);
   const [bulkAction, { loading }] = useGQLBulkActionExecutionMutation({
     refetchQueries: [
       namedOperations.Query.ItemActionHistory,
@@ -50,10 +63,20 @@ export default function ItemAction(props: {
       const anyFailed = results.some((r) => r.success === false);
       if (anyFailed) {
         setModalBody(
-          'One or more actions failed. The callback URL may have returned an error. If your org requires a policy for decisions, select a policy and try again.',
+          'One or more actions failed. Check server logs for details. ' +
+            'If the action posts to a callback URL, the URL may have returned an error. ' +
+            'If your org requires a policy for decisions, select a policy and try again.',
         );
       } else {
-        setModalBody('Actions submitted successfully.');
+        setModalBody(
+          eligibleActions.some(
+            (action) =>
+              selectedActionIds.includes(action.id) &&
+              action.name.startsWith('concord_'),
+          )
+            ? 'Room request processed. Check Room enforcement for its recorded outcome and verified delivery.'
+            : 'Actions submitted successfully.',
+        );
       }
       setShowModal(true);
     },
@@ -76,7 +99,9 @@ export default function ItemAction(props: {
   const [moderatorNote, setModeratorNote] = useState<string>('');
 
   const eligibleActions: EligibleAction[] = (queryData?.myOrg?.actions ?? [])
-    .filter((it) => it.itemTypes.map((t) => t.id).includes(itemIdentifier.typeId))
+    .filter((it) =>
+      it.itemTypes.map((t) => t.id).includes(itemIdentifier.typeId),
+    )
     .map((it) => ({
       id: it.id,
       name: it.name,
@@ -191,61 +216,194 @@ export default function ItemAction(props: {
     [],
   );
 
-  const buttonOnClick = useCallback(
-    async () =>
-      bulkAction({
-        variables: {
-          input: {
-            itemTypeId: itemIdentifier.typeId,
-            actionIds: selectedActionIds,
-            itemIds: [itemIdentifier.id],
-            policyIds: selectedPolicyIds,
-            // Drop empty per-action entries so the input doesn't carry
-            // meaningless `{}` payloads. GQL `JSONObject` constrains values
-            // to `JsonValue`; our per-action map's inner values are
-            // `unknown` because each parameter type produces a different
-            // concrete value. They're all JSON-serializable in practice
-            // (string, number, boolean, string[]) and the server
-            // re-validates. Cast through unknown to satisfy the input type.
-            parameters:
-              Object.keys(parametersByActionId).length > 0
-                ? (parametersByActionId as unknown as JsonObject)
-                : undefined,
-            note: moderatorNote.trim() === '' ? undefined : moderatorNote.trim(),
+  const buttonOnClick = useCallback(async () => {
+    const roomAction = eligibleActions.find(
+      (action) =>
+        selectedActionIds.includes(action.id) &&
+        action.name.startsWith('concord_'),
+    );
+    let attempt: ReturnType<typeof beginRoomOperation> | undefined;
+    if (roomAction) {
+      if (!moderatorNote.trim() || moderatorNote.trim().length > 2048) {
+        setModalBody('Enter a room reason between 1 and 2048 characters.');
+        setShowModal(true);
+        return;
+      }
+      setPreparing(true);
+      try {
+        if (!roomActor?.me?.id || !roomActor.myOrg?.id)
+          throw new Error('Room session unavailable.');
+        if (selectedActionIds.length !== 1)
+          throw new Error('Select one room action.');
+        const claim = {
+          actionId: roomAction.id,
+          itemId: itemIdentifier.id,
+          itemTypeId: itemIdentifier.typeId,
+          note: moderatorNote.trim(),
+          parameters: (parametersByActionId[roomAction.id] ?? {}) as JsonObject,
+        };
+        const pending = await prepareRoomOperation(
+          itemIdentifier,
+          {
+            actorId: roomActor.me.id,
+            orgId: roomActor.myOrg.id,
           },
+          claim,
+        );
+        let operationId = pending.operationId;
+        if ('clientNonce' in pending) {
+          const response = await prepareReceipt({
+            context: { roomOperationAttempt: true },
+            variables: {
+              input: {
+                clientNonce: pending.clientNonce,
+                ...claim,
+              },
+            },
+          });
+          const status = response.data?.beginRoomOperation;
+          if (response.errors?.length || !status)
+            throw new Error('Room preparation response unavailable.');
+          operationId = status.operationId;
+          rememberRoomReceipt(itemIdentifier, pending.clientNonce, operationId);
+          if (
+            status.phase === 'retired' &&
+            status.recorded === false &&
+            status.acceptanceUnknown === false &&
+            !status.acceptedDecisionId &&
+            status.allowedNextActions.includes('replace')
+          ) {
+            completeRoomOperation(itemIdentifier, operationId);
+            setModalBody(
+              'This room request was retired without delivery. You can now choose a new action and reason. Retirement is not enforcement success.',
+            );
+            setShowModal(true);
+            return;
+          }
+          if (status.acceptedDecisionId && !status.acceptanceUnknown) {
+            completeRoomOperation(itemIdentifier, operationId);
+            setModalBody(
+              'This room request was already recorded. Check Room enforcement for verified delivery.',
+            );
+            setShowModal(true);
+            return;
+          }
+          if (
+            status.phase === 'retired' ||
+            status.phase === 'refused' ||
+            status.refusalCode ||
+            status.successorExecutionId ||
+            status.disposition !== 'none'
+          ) {
+            setModalBody(
+              `This room request cannot be sent (state: ${status.phase}; disposition: ${status.disposition}). Check Room enforcement or ask your moderation lead to reconcile it.`,
+            );
+            setShowModal(true);
+            return;
+          }
+        }
+        if (!operationId) throw new Error('Room receipt unavailable.');
+        attempt = beginRoomOperation(itemIdentifier, operationId);
+      } catch {
+        setModalBody(
+          'Could not prepare this room request. No delivery was started by this attempt. Re-enter the original action, reason and parameters in the original session and retry; changed inputs cannot replace the saved request.',
+        );
+        setShowModal(true);
+        return;
+      } finally {
+        setPreparing(false);
+      }
+    }
+    return bulkAction({
+      // A hidden transport retry would invalidate first-attempt rejection certainty.
+      context: { roomOperationAttempt: Boolean(attempt) },
+      onError: (error) => {
+        if (
+          attempt &&
+          error.graphQLErrors.some(
+            (entry) => entry.extensions?.roomAttemptOutcome === 'NOT_RECORDED',
+          )
+        ) {
+          setModalBody(
+            'This delivery attempt was not recorded. The original room request is still saved. Retry the original action and reason, or ask your moderation lead to reconcile it.',
+          );
+        } else if (attempt) {
+          setModalBody(
+            'Acceptance is unknown. The original room decision may still execute. Retry the original action and reason, or ask your moderation lead to reconcile it. Changing actions does not cancel it.',
+          );
+        } else {
+          setModalBody('Error submitting actions. Please try again.');
+        }
+        setShowModal(true);
+      },
+      variables: {
+        input: {
+          operationId: attempt?.operationId,
+          itemTypeId: itemIdentifier.typeId,
+          actionIds: selectedActionIds,
+          itemIds: [itemIdentifier.id],
+          policyIds: selectedPolicyIds,
+          // Drop empty per-action entries so the input doesn't carry
+          // meaningless `{}` payloads. GQL `JSONObject` constrains values
+          // to `JsonValue`; our per-action map's inner values are
+          // `unknown` because each parameter type produces a different
+          // concrete value. They're all JSON-serializable in practice
+          // (string, number, boolean, string[]) and the server
+          // re-validates. Cast through unknown to satisfy the input type.
+          parameters:
+            Object.keys(parametersByActionId).length > 0
+              ? (parametersByActionId as unknown as JsonObject)
+              : undefined,
+          note: moderatorNote.trim() === '' ? undefined : moderatorNote.trim(),
         },
-      }),
-    [
-      bulkAction,
-      itemIdentifier.id,
-      itemIdentifier.typeId,
-      selectedActionIds,
-      selectedPolicyIds,
-      parametersByActionId,
-      moderatorNote,
-    ],
-  );
+      },
+    }).then((response) => {
+      const results = response.data?.bulkExecuteActions?.results;
+      if (
+        attempt &&
+        !response.errors?.length &&
+        results?.length &&
+        results.every((result) => result.success)
+      )
+        completeRoomOperation(itemIdentifier, attempt.operationId);
+      return response;
+    });
+  }, [
+    bulkAction,
+    prepareReceipt,
+    roomActor,
+    eligibleActions,
+    itemIdentifier,
+    selectedActionIds,
+    selectedPolicyIds,
+    parametersByActionId,
+    moderatorNote,
+  ]);
 
   const modalOnClose = useCallback(() => setShowModal(false), []);
 
   if (eligibleActions.length === 0) {
-    return null;
+    return <ConcordEnforcementStatus itemIdentifier={itemIdentifier} />;
   }
 
   const activeParamsAction = paramsModal.open
     ? eligibleActionsById.get(paramsModal.actionId)
     : undefined;
+  const roomNoteRequired = selectedActionIds.some((id) =>
+    eligibleActionsById.get(id)?.name.startsWith('concord_'),
+  );
 
   return (
     <div className="flex flex-col">
+      <ConcordEnforcementStatus itemIdentifier={itemIdentifier} />
       <div className="flex flex-col items-start mb-2">
         <div className="text-base font-semibold">{title}</div>
       </div>
-      <div className="flex flex-row gap-4">
+      <div className="flex flex-row flex-wrap items-end gap-4">
         <div className="flex flex-col items-start">
           <div>
             <Select
-              className="w-80"
+              className="w-80 max-w-full"
               mode="multiple"
               maxTagCount={1}
               placeholder="Select action"
@@ -266,7 +424,7 @@ export default function ItemAction(props: {
         <div className="flex flex-col items-start">
           <div>
             <PolicyDropdown
-              className="w-80"
+              className="w-80 max-w-full"
               policies={policiesMemo}
               maxTagCount={1}
               onChange={policiesDropdownOnChange}
@@ -281,8 +439,13 @@ export default function ItemAction(props: {
           title="Submit Actions"
           size="small"
           onClick={buttonOnClick}
-          loading={loading}
-          disabled={selectedActionIds.length === 0}
+          loading={loading || preparing}
+          disabled={
+            loading ||
+            preparing ||
+            selectedActionIds.length === 0 ||
+            (roomNoteRequired && !moderatorNote.trim())
+          }
         />
       </div>
       {selectedParameterizedActions.length > 0 && (
@@ -317,13 +480,13 @@ export default function ItemAction(props: {
             htmlFor="item-action-moderator-note"
             className="mb-1 text-sm font-medium text-gray-700"
           >
-            Note (optional)
+            {roomNoteRequired ? 'Note (required)' : 'Note (optional)'}
           </label>
           <Input.TextArea
             id="item-action-moderator-note"
-            placeholder="Why are you taking this action? Sent to the action's webhook as `actorNote`."
+            placeholder="Why are you taking this action? This note will be recorded in the audit log and included in any configured webhook payload."
             rows={2}
-            maxLength={5000}
+            maxLength={roomNoteRequired ? 2048 : 5000}
             value={moderatorNote}
             onChange={(e) => setModeratorNote(e.target.value)}
           />

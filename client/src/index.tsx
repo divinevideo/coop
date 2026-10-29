@@ -10,7 +10,6 @@ import {
   StoreObject,
 } from '@apollo/client';
 import { KeyFieldsContext } from '@apollo/client/cache/inmemory/policies';
-import { RetryLink } from '@apollo/client/link/retry';
 import { createRoot } from 'react-dom/client';
 import { HelmetProvider } from 'react-helmet-async';
 import { QueryClient, QueryClientProvider } from 'react-query';
@@ -18,6 +17,7 @@ import stringify from 'safe-stable-stringify';
 
 import FrontendTracer from './FrontendTracer';
 import reportWebVitals from './reportWebVitals';
+import { requestRetryLink } from './requestRetryLink';
 import App from './webpages/App';
 
 if (
@@ -44,20 +44,12 @@ gql`
 `;
 
 const httpLink = new HttpLink({
-  uri:
-    import.meta.env.MODE === 'production'
-      ? '/api/v1/graphql'
-      : 'http://localhost:3000/api/v1/graphql',
-});
-
-const retryLink = new RetryLink({
-  delay: { initial: 300, max: 5000, jitter: true },
-  attempts: { max: 3, retryIf: (error) => Boolean(error) },
+  uri: '/api/v1/graphql',
 });
 
 // Apollo Client
 const client = new ApolloClient({
-  link: from([retryLink, httpLink]),
+  link: from([requestRetryLink(), httpLink]),
   cache: new InMemoryCache({
     typePolicies: {
       ConditionInputField: {

@@ -2,8 +2,8 @@
 import { sql, type Kysely } from 'kysely';
 import { type ReadonlyDeep } from 'type-fest';
 
-import { UserPermission } from '../../../models/types/permissioning.js';
 import { MONTH_MS } from '../../../utils/time.js';
+import { UserPermission } from '../../userManagementService/index.js';
 import { type ManualReviewToolServicePg } from '../dbTypes.js';
 import {
   type ManualReviewJob,
@@ -464,6 +464,7 @@ export default class DecisionAnalytics {
         'decision_components',
         'related_actions',
         'created_at',
+        'decision_reason',
         sql<string>`((job_payload->'payload'::text)->'item'::text) -> 'itemId'::text`.as(
           'item_id',
         ),
@@ -518,6 +519,7 @@ export default class DecisionAnalytics {
           type: 'RELATED_ACTION' as const,
         })),
         createdAt: decisionWithPayload.created_at,
+        decisionReason: decisionWithPayload.decision_reason,
         jobId: decisionWithPayload.job_id,
       },
     };

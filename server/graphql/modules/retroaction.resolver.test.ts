@@ -1,4 +1,7 @@
-import { UserRole } from '../../models/types/permissioning.js';
+import {
+  UserPermission,
+  UserRole,
+} from '../../services/userManagementService/index.js';
 import { resolvers } from './retroaction.js';
 
 describe('retroaction resolvers', () => {
@@ -12,6 +15,10 @@ describe('retroaction resolvers', () => {
           id: 'user-1',
           orgId: 'org-1',
           role: UserRole.MODERATOR,
+          getPermissions: () => [
+            UserPermission.VIEW_MRT,
+            UserPermission.VIEW_MRT_DATA,
+          ],
         }),
         services: {
           ModerationConfigService: { getRuleByIdAndOrg },
@@ -22,18 +29,21 @@ describe('retroaction resolvers', () => {
       };
 
       await expect(
-        (resolvers.Mutation as { runRetroaction: (...a: unknown[]) => Promise<unknown> })
-          .runRetroaction(
-            {},
-            {
-              input: {
-                ruleId: 'rule-1',
-                startAt: new Date(),
-                endAt: new Date(),
-              },
+        (
+          resolvers.Mutation as {
+            runRetroaction: (...a: unknown[]) => Promise<unknown>;
+          }
+        ).runRetroaction(
+          {},
+          {
+            input: {
+              ruleId: 'rule-1',
+              startAt: new Date(),
+              endAt: new Date(),
             },
-            ctx as never,
-          ),
+          },
+          ctx as never,
+        ),
       ).rejects.toThrow('User not authorized to run retroaction.');
 
       expect(getRuleByIdAndOrg).not.toHaveBeenCalled();

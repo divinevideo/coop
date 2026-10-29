@@ -1,3 +1,7 @@
+/* eslint-disable max-lines */
+import { type JsonObject } from 'type-fest';
+
+import { parseStoredParameters } from '../../services/moderationConfigService/index.js';
 import { isCoopErrorOfType } from '../../utils/errors.js';
 import { assertUnreachable } from '../../utils/misc.js';
 import {
@@ -11,9 +15,8 @@ import {
   type GQLMutationResolvers,
   type GQLQueryResolvers,
 } from '../generated.js';
-import { gqlErrorResult, gqlSuccessResult } from '../utils/gqlResult.js';
 import { unauthenticatedError } from '../utils/errors.js';
-import { parseStoredParameters } from '../../services/moderationConfigService/index.js';
+import { gqlErrorResult, gqlSuccessResult } from '../utils/gqlResult.js';
 
 const typeDefs = /* GraphQL */ `
   interface ActionBase {
@@ -25,6 +28,11 @@ const typeDefs = /* GraphQL */ `
     applyUserStrikes: Boolean
     itemTypes: [ItemType!]!
     parameters: [ActionParameter!]!
+    """
+    Configured parameter values for this action in the context of a rule or
+    strike threshold. Null when resolved outside of a rule context.
+    """
+    configuredParameters: JSONObject
   }
 
   enum ActionParameterType {
@@ -51,20 +59,30 @@ const typeDefs = /* GraphQL */ `
   webhook payload under the parameter's \`name\`.
   """
   type ActionParameter {
-    """Key under which the value is sent in the webhook payload."""
+    """
+    Key under which the value is sent in the webhook payload.
+    """
     name: String!
     displayName: String!
     description: String
     type: ActionParameterType!
     required: Boolean!
     options: [ActionParameterOption!]
-    """NUMBER only: inclusive minimum."""
+    """
+    NUMBER only: inclusive minimum.
+    """
     min: Float
-    """NUMBER only: inclusive maximum."""
+    """
+    NUMBER only: inclusive maximum.
+    """
     max: Float
-    """STRING only: inclusive maximum length in characters."""
+    """
+    STRING only: inclusive maximum length in characters.
+    """
     maxLength: Int
-    """Pre-filled value shown to the moderator. Shape matches \`type\`."""
+    """
+    Pre-filled value shown to the moderator. Shape matches \`type\`.
+    """
     defaultValue: JSON
   }
 
@@ -93,6 +111,7 @@ const typeDefs = /* GraphQL */ `
     callbackUrlBody: JSONObject
     applyUserStrikes: Boolean
     parameters: [ActionParameter!]!
+    configuredParameters: JSONObject
     """
     Deprecated alias for \`parameters\` retained for back-compat with the
     initial MRT-only parameter implementation. New consumers should read
@@ -117,6 +136,7 @@ const typeDefs = /* GraphQL */ `
     itemTypes: [ItemType!]!
     applyUserStrikes: Boolean
     parameters: [ActionParameter!]!
+    configuredParameters: JSONObject
   }
 
   type EnqueueToNcmecAction implements ActionBase {
@@ -128,6 +148,7 @@ const typeDefs = /* GraphQL */ `
     itemTypes: [ItemType!]!
     applyUserStrikes: Boolean
     parameters: [ActionParameter!]!
+    configuredParameters: JSONObject
   }
 
   type EnqueueAuthorToMrtAction implements ActionBase {
@@ -139,10 +160,11 @@ const typeDefs = /* GraphQL */ `
     itemTypes: [ItemType!]!
     applyUserStrikes: Boolean!
     parameters: [ActionParameter!]!
+    configuredParameters: JSONObject
   }
 
   union Action =
-      EnqueueToMrtAction
+    | EnqueueToMrtAction
     | EnqueueToNcmecAction
     | CustomAction
     | EnqueueAuthorToMrtAction
@@ -183,7 +205,7 @@ const typeDefs = /* GraphQL */ `
   }
 
   union MutateActionResponse =
-      MutateActionSuccessResponse
+    | MutateActionSuccessResponse
     | ActionNameExistsError
 
   type MutateActionSuccessResponse {
@@ -217,6 +239,7 @@ const typeDefs = /* GraphQL */ `
     execution audit log.
     """
     note: String
+    operationId: String
   }
 
   type ExecuteActionResponse {
@@ -272,9 +295,11 @@ function projectParameters(value: unknown): GQLActionParameter[] {
     name: p.name,
     displayName: p.displayName,
     description: p.description ?? null,
-    type: p.type as GQLActionParameter['type'],
+    type: p.type,
     required: p.required,
-    options: p.options ? p.options.map((o) => ({ value: o.value, label: o.label })) : null,
+    options: p.options
+      ? p.options.map((o) => ({ value: o.value, label: o.label }))
+      : null,
     min: p.min ?? null,
     max: p.max ?? null,
     maxLength: p.maxLength ?? null,
@@ -290,12 +315,26 @@ function projectParameters(value: unknown): GQLActionParameter[] {
 // defensively so the GraphQL projection works for all four action types.
 function readRawParameters(parent: unknown): unknown {
   if (typeof parent !== 'object' || parent === null) return null;
-  return (parent as { customMrtApiParams?: unknown }).customMrtApiParams ?? null;
+  return (
+    (parent as { customMrtApiParams?: unknown }).customMrtApiParams ?? null
+  );
+}
+
+// Populated by rule.ts resolvers when the action is resolved in a rule context.
+function readConfiguredParameters(parent: unknown): JsonObject | null {
+  if (typeof parent !== 'object' || parent === null) return null;
+  return (
+    (parent as { configuredParameters?: JsonObject }).configuredParameters ??
+    null
+  );
 }
 
 const CustomAction: GQLCustomActionResolvers = {
   parameters(parent) {
     return projectParameters(parent.customMrtApiParams);
+  },
+  configuredParameters(parent) {
+    return readConfiguredParameters(parent);
   },
   customMrtApiParams(parent) {
     return Array.isArray(parent.customMrtApiParams)
@@ -318,6 +357,9 @@ const EnqueueAuthorToMrtAction: GQLEnqueueAuthorToMrtActionResolvers = {
   parameters(parent) {
     return projectParameters(readRawParameters(parent));
   },
+  configuredParameters(parent) {
+    return readConfiguredParameters(parent);
+  },
   async itemTypes(action, _, context) {
     const user = context.getUser();
     if (user == null) {
@@ -334,6 +376,9 @@ const EnqueueToMrtAction: GQLEnqueueToMrtActionResolvers = {
   parameters(parent) {
     return projectParameters(readRawParameters(parent));
   },
+  configuredParameters(parent) {
+    return readConfiguredParameters(parent);
+  },
   async itemTypes(action, _, context) {
     const user = context.getUser();
     if (user == null) {
@@ -349,6 +394,9 @@ const EnqueueToMrtAction: GQLEnqueueToMrtActionResolvers = {
 const EnqueueToNcmecAction: GQLEnqueueToNcmecActionResolvers = {
   parameters(parent) {
     return projectParameters(readRawParameters(parent));
+  },
+  configuredParameters(parent) {
+    return readConfiguredParameters(parent);
   },
   async itemTypes(action, _, context) {
     const user = context.getUser();
@@ -443,12 +491,12 @@ const Mutation: GQLMutationResolvers = {
         actorEmail: email,
         // GraphQL `JSONObject` arrives as a plain object; the datasource
         // narrows + validates per-action against each spec.
-        actionIdToParameters:
-          (params.input.parameters ?? null) as Record<
-            string,
-            Record<string, unknown>
-          > | null,
+        actionIdToParameters: (params.input.parameters ?? null) as Record<
+          string,
+          Record<string, unknown>
+        > | null,
         actorNote: params.input.note ?? null,
+        operationId: params.input.operationId ?? null,
       });
 
     return {

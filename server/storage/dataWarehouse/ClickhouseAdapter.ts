@@ -14,6 +14,7 @@ import {
   type TransactionSettings,
 } from 'kysely';
 
+import { getClickhouseMemorySettings } from '../../plugins/warehouse/utils/clickhouseSettings.js';
 import { formatClickhouseQuery } from '../../plugins/warehouse/utils/clickhouseSql.js';
 import type {
   DataWarehousePoolSettings,
@@ -104,6 +105,7 @@ function createDialect(client: ClickHouseClient): Dialect {
     createAdapter(): DialectAdapter {
       return new PostgresAdapter();
     },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Kysely's Dialect interface hardcodes Kysely<any> for createIntrospector
     createIntrospector(db: Kysely<any>) {
       return new PostgresIntrospector(db);
     },
@@ -112,8 +114,7 @@ function createDialect(client: ClickHouseClient): Dialect {
 
 export class ClickhouseKyselyAdapter implements IDataWarehouseDialect {
   private readonly client: ClickHouseClient;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private readonly kysely: Kysely<any>;
+  private readonly kysely: Kysely<Record<string, unknown>>;
 
   constructor(
     connectionSettings: ClickhouseConnectionSettings,
@@ -133,16 +134,18 @@ export class ClickhouseKyselyAdapter implements IDataWarehouseDialect {
       database: connectionSettings.database,
       clickhouse_settings: {
         allow_experimental_object_type: 1,
+        ...getClickhouseMemorySettings(),
       },
     });
 
-    this.kysely = new Kysely({
+    this.kysely = new Kysely<Record<string, unknown>>({
       dialect: createDialect(this.client),
     });
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  getKyselyInstance(): Kysely<any> {
+  // The interface declares Kysely<any> but we implement with a concrete schema type;
+  // callers that need a specific schema cast the result themselves.
+  getKyselyInstance(): Kysely<Record<string, unknown>> {
     return this.kysely;
   }
 

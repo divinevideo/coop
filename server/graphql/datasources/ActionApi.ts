@@ -3,6 +3,13 @@ import pLimit from 'p-limit';
 import { v1 as uuidv1 } from 'uuid';
 
 import { inject, type Dependencies } from '../../iocContainer/index.js';
+import { roomAttemptNotRecorded } from '../../routes/concord/attemptOutcome.js';
+import {
+  isServerRoomOperationId,
+  isSourceOrderedRoomOperationId,
+  roomAction,
+  UUID,
+} from '../../routes/concord/service.js';
 import {
   parseStoredParameters,
   validateActionParameterValues,
@@ -27,6 +34,115 @@ class ActionAPI {
     private readonly itemInvestigationService: Dependencies['ItemInvestigationService'],
     private readonly getItemTypeEventuallyConsistent: Dependencies['getItemTypeEventuallyConsistent'],
   ) {}
+
+  async authorizeRoomRequest(input: {
+    orgId: string;
+    actorId: string;
+    token?: string;
+    origin?: string;
+    mutation: boolean;
+  }) {
+    return this.actionPublisher.authorizeRoomAccess(input);
+  }
+  async beginRoomOperation(
+    input: {
+      orgId: string;
+      actorId: string;
+      clientNonce: string;
+      actionId: string;
+      itemTypeId: string;
+      itemId: string;
+      note: string;
+      parameters?: Record<string, unknown>;
+    },
+    priorDecisionId?: string,
+  ) {
+    const action = await this.getGraphQLActionFromId({
+      orgId: input.orgId,
+      id: input.actionId,
+    });
+    const itemType = await this.getItemTypeEventuallyConsistent({
+      orgId: input.orgId,
+      typeSelector: { id: input.itemTypeId },
+    });
+    if (
+      !itemType ||
+      !['concord_message', 'concord_member'].includes(itemType.name) ||
+      !roomAction(action.name) ||
+      (priorDecisionId && action.name !== 'concord_unban_member')
+    )
+      throw new Error('Room action or item type unavailable');
+    const parameters =
+      this.#validateParametersForActions([action], {
+        [action.id]: input.parameters ?? {},
+      }).get(action.id) ?? {};
+    const item = priorDecisionId
+      ? undefined
+      : await this.itemInvestigationService.getItemByIdentifier({
+          orgId: input.orgId,
+          itemIdentifier: { id: input.itemId, typeId: input.itemTypeId },
+          latestSubmissionOnly: true,
+        });
+    const caseId = item?.latestSubmission?.data.case_id;
+    if (!priorDecisionId && typeof caseId !== 'string')
+      throw new Error('Room case unavailable');
+    const request = {
+      orgId: input.orgId,
+      actorId: input.actorId,
+      actionId: action.id,
+      actionName: action.name,
+      itemId: priorDecisionId ?? input.itemId,
+      itemTypeId: itemType.id,
+      itemTypeName: itemType.name,
+      ...(priorDecisionId ? { priorDecisionId } : { caseId: String(caseId) }),
+      note: input.note,
+      parameters,
+    };
+    const args = {
+      orgId: input.orgId,
+      actorId: input.actorId,
+      clientNonce: input.clientNonce,
+      request,
+    };
+    return priorDecisionId
+      ? this.actionPublisher.reverseRoomDecision(args)
+      : this.actionPublisher.beginRoomOperation(args);
+  }
+  async roomOperationStatus(input: {
+    orgId: string;
+    actorId: string;
+    operationId: string;
+  }) {
+    return this.actionPublisher.roomOperationStatus(input);
+  }
+  async retireRoomOperation(input: {
+    orgId: string;
+    actorId: string;
+    operationId: string;
+    reason: string;
+  }) {
+    return this.actionPublisher.retireRoomOperation(input);
+  }
+  async roomNeedsAttention(input: {
+    orgId: string;
+    actorId: string;
+    cursor?: string;
+    limit: number;
+  }) {
+    return this.actionPublisher.roomNeedsAttention(input);
+  }
+  async roomDisposition(
+    input: {
+      orgId: string;
+      actorId: string;
+      executionId: string;
+      manualReviewDecisionId?: string;
+      reason: string;
+    },
+    close: boolean,
+  ) {
+    return this.actionPublisher.roomDisposition(input, close);
+  }
 
   async getGraphQLActionFromId(opts: { id: string; orgId: string }) {
     const { id, orgId } = opts;
@@ -100,8 +216,7 @@ class ActionAPI {
         callbackUrlHeaders,
         callbackUrlBody,
         applyUserStrikes: applyUserStrikes ?? undefined,
-        parameters:
-          parameters === undefined ? undefined : (parameters ?? []),
+        parameters: parameters === undefined ? undefined : (parameters ?? []),
       },
       itemTypeIds: itemTypeIds ?? undefined,
     });
@@ -142,6 +257,7 @@ class ActionAPI {
      * `actorNote` and persisted in the audit log (PR 3).
      */
     actorNote?: string | null;
+    operationId?: string | null;
   }) {
     const {
       itemIds,
@@ -155,85 +271,147 @@ class ActionAPI {
       actorNote,
     } = opts;
 
-    validateActorNote(actorNote);
+    let mayHaveRecorded = false;
+    try {
+      validateActorNote(actorNote);
 
-    const [actions, policies, itemType] = await Promise.all([
-      this.moderationConfigService.getActions({
-        orgId,
-        ids: actionIds,
-        readFromReplica: false,
-      }),
-      this.moderationConfigService.getPoliciesByIds({
-        orgId,
-        ids: policyIds,
-        readFromReplica: false,
-      }),
-      this.getItemTypeEventuallyConsistent({
-        orgId,
-        typeSelector: { id: itemTypeId },
-      }),
-    ]);
-
-    if (itemType === undefined) {
-      throw new Error(`Item type ${itemTypeId} not found for org ${orgId}`);
-    }
-
-    // Validate moderator-supplied parameter values once per action up front;
-    // throws BadRequestError before any side-effecting publish if any value
-    // doesn't match its spec.
-    const validatedParameters = this.#validateParametersForActions(
-      actions,
-      actionIdToParameters ?? null,
-    );
-
-    const correlationId = toCorrelationId({
-      type: 'manual-action-run',
-      id: uuidv1(),
-    });
-    // Limit the number of concurrent requests to avoid overwhelming the
-    // custom action endpoints
-    const limit = pLimit(10);
-    return Promise.all(
-      itemIds.map(async (itemId) =>
-        limit(async () => {
-          const itemSubmission = (
-            await this.itemInvestigationService.getItemByIdentifier({
-              orgId,
-              itemIdentifier: {
-                id: itemId,
-                typeId: itemTypeId,
-              },
-              latestSubmissionOnly: true,
-            })
-          )?.latestSubmission;
-
-          const triggered = actions.map((action) => ({
-            action,
-            matchingRules: undefined as undefined,
-            ruleEnvironment: undefined as undefined,
-            policies,
-            customMrtApiParamDecisionPayload: validatedParameters.get(action.id),
-          }));
-
-          // If the item isn't found, pass it along to the action publisher
-          // anyway without the full submission. We lose some logging fidelity
-          // but it's better than refusing to submit, and the item may have
-          // never been submitted to us at all.
-          const targetItem = itemSubmission ?? {
-            itemId,
-            itemType: { id: itemType.id, kind: itemType.kind, name: itemType.name },
-          };
-          return this.actionPublisher.publishActions(triggered, {
-            orgId,
-            correlationId,
-            targetItem,
-            actorId,
-            actorEmail,
-            actorNote: actorNote ?? undefined,
-          });
+      const [actions, policies, itemType] = await Promise.all([
+        this.moderationConfigService.getActions({
+          orgId,
+          ids: actionIds,
+          readFromReplica: false,
         }),
-      ),
-    );
+        this.moderationConfigService.getPoliciesByIds({
+          orgId,
+          ids: policyIds,
+          readFromReplica: false,
+        }),
+        this.getItemTypeEventuallyConsistent({
+          orgId,
+          typeSelector: { id: itemTypeId },
+        }),
+      ]);
+
+      if (itemType === undefined) {
+        throw new Error(`Item type ${itemTypeId} not found for org ${orgId}`);
+      }
+
+      // Validate moderator-supplied parameter values once per action up front;
+      // throws BadRequestError before any side-effecting publish if any value
+      // doesn't match its spec.
+      const validatedParameters = this.#validateParametersForActions(
+        actions,
+        actionIdToParameters ?? null,
+      );
+
+      const isRoom = actions.some((action) =>
+        action.name.startsWith('concord_'),
+      );
+      if (
+        isRoom &&
+        (!opts.operationId ||
+          (!UUID.test(opts.operationId) &&
+            !isServerRoomOperationId(
+              opts.operationId,
+              roomAction(actions[0]?.name ?? ''),
+            ) &&
+            !isSourceOrderedRoomOperationId(
+              opts.operationId,
+              roomAction(actions[0]?.name ?? ''),
+            )) ||
+          actions.length !== 1 ||
+          actionIds.length !== 1 ||
+          itemIds.length !== 1)
+      ) {
+        throw new Error(
+          'Room actions require one item, one action and a persistent operation ID',
+        );
+      }
+      const correlationId = toCorrelationId({
+        type: 'manual-action-run',
+        id: isRoom ? opts.operationId! : uuidv1(),
+      });
+      // Limit the number of concurrent requests to avoid overwhelming the
+      // custom action endpoints
+      const limit = pLimit(10);
+      return await Promise.all(
+        itemIds.map(async (itemId) =>
+          limit(async () => {
+            const itemSubmission = (
+              await this.itemInvestigationService.getItemByIdentifier({
+                orgId,
+                itemIdentifier: {
+                  id: itemId,
+                  typeId: itemTypeId,
+                },
+                latestSubmissionOnly: true,
+              })
+            )?.latestSubmission;
+
+            const triggered = actions.map((action) => ({
+              action,
+              matchingRules: undefined as undefined,
+              ruleEnvironment: undefined as undefined,
+              policies,
+              customMrtApiParamDecisionPayload: validatedParameters.get(
+                action.id,
+              ),
+            }));
+
+            // If the item isn't found, pass it along to the action publisher
+            // anyway without the full submission. We lose some logging fidelity
+            // but it's better than refusing to submit, and the item may have
+            // never been submitted to us at all.
+            const targetItem = itemSubmission ?? {
+              itemId,
+              itemType: {
+                id: itemType.id,
+                kind: itemType.kind,
+                name: itemType.name,
+              },
+            };
+            const membership = actions.filter((action) =>
+              ['remove_message', 'ban_member', 'unban_member'].includes(
+                roomAction(action.name) ?? '',
+              ),
+            );
+            for (const action of membership) {
+              const caseId = itemSubmission?.data.case_id;
+              mayHaveRecorded = true;
+              await this.actionPublisher.recordManualRoomIntent(
+                {
+                  orgId,
+                  actionId: action.id,
+                  actionName: action.name,
+                  itemId,
+                  itemTypeId: itemType.id,
+                  itemTypeName: itemType.name,
+                  caseId: typeof caseId === 'string' ? caseId : '',
+                  correlationId: String(correlationId),
+                  actorId,
+                  note: actorNote ?? undefined,
+                  parameters: validatedParameters.get(action.id) ?? {},
+                },
+                'callbackUrl' in action ? action.callbackUrl : undefined,
+              );
+            }
+            mayHaveRecorded = true;
+            return this.actionPublisher.publishActions(triggered, {
+              orgId,
+              correlationId,
+              targetItem,
+              actorId,
+              actorEmail,
+              actorNote: actorNote ?? undefined,
+            });
+          }),
+        ),
+      );
+    } catch (error) {
+      if (opts.operationId && !mayHaveRecorded)
+        throw roomAttemptNotRecorded(error);
+      throw error;
+    }
   }
 
   /**
@@ -250,10 +428,15 @@ class ActionAPI {
     const out = new Map<string, Record<string, unknown> | undefined>();
     for (const action of actions) {
       const spec = parseStoredParameters(
-        action.actionType === 'CUSTOM_ACTION' ? action.customMrtApiParams : null,
+        action.actionType === 'CUSTOM_ACTION'
+          ? action.customMrtApiParams
+          : null,
       );
       const supplied = rawByActionId?.[action.id];
-      if (spec.length === 0 && (supplied === undefined || Object.keys(supplied).length === 0)) {
+      if (
+        spec.length === 0 &&
+        (supplied === undefined || Object.keys(supplied).length === 0)
+      ) {
         // No spec, no values — nothing to do for this action.
         continue;
       }
@@ -261,7 +444,10 @@ class ActionAPI {
       // keys, etc. Validation runs even when no values are supplied so that
       // missing-required-with-no-default is caught.
       const validated = validateActionParameterValues(spec, supplied ?? null);
-      out.set(action.id, Object.keys(validated).length > 0 ? validated : undefined);
+      out.set(
+        action.id,
+        Object.keys(validated).length > 0 ? validated : undefined,
+      );
     }
     return out;
   }
